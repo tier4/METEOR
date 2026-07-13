@@ -194,7 +194,7 @@ docs/                  # architecture / data / training / demo docs
 
 **"METEOR: From Raw Surround-View Recordings to a Seven-Task Driving Network
 without Human Labels or Human-Written Code"** — Dan Umeda.
-[PDF](paper/main.pdf) · [LaTeX source](paper/main.tex)
+[PDF](paper/main.pdf) · [LaTeX source](paper/main.tex) · [Talk slides](paper/METEOR_talk.pptx)
 
 ## Documentation
 
