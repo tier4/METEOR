@@ -19,3 +19,6 @@ comet_venv/
 # machine-local ops notes
 RESUME.md
 scan*.txt
+
+# paper: keep source, figures and the compiled PDF
+!paper/main.pdf
