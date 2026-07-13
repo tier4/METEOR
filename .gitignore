@@ -1,0 +1,21 @@
+# data / outputs / checkpoints (multi-TB, lives on local storage)
+out/
+*.pt
+*.pth
+*.onnx
+*.engine
+
+# media (README media under docs/media/ is tracked explicitly)
+*.mp4
+*.pdf
+*.pptx
+
+# python
+__pycache__/
+*.pyc
+.venv/
+comet_venv/
+
+# machine-local ops notes
+RESUME.md
+scan*.txt
