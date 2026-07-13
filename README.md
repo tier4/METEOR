@@ -4,7 +4,9 @@
 
 ### **M**ulti-task **E**stimation of **T**raffic **E**lements, **O**bjects & **R**oads
 
-*One camera-only network. Seven driving tasks. Zero human labels.*
+*One camera-only network. Seven driving tasks.*
+
+**Zero human labels. Zero human-written code.**
 
 [![Built on CoMET](https://img.shields.io/badge/built_on-CoMET_(Co--MLOps)-orange)]()
 [![Tasks](https://img.shields.io/badge/tasks-7-blueviolet)]()
@@ -13,6 +15,8 @@
 [![TensorRT](https://img.shields.io/badge/TensorRT-ready-76B900)]()
 [![PyTorch](https://img.shields.io/badge/PyTorch-2.x-EE4C2C)]()
 [![Labels](https://img.shields.io/badge/human_labels-0-success)]()
+[![Code](https://img.shields.io/badge/human_written_code-0-success)]()
+[![Author](https://img.shields.io/badge/authored_by-Claude_Fable_5-cc785c)]()
 
 <img src="docs/media/inference.gif" width="880" alt="METEOR multi-task inference"/>
 
@@ -50,6 +54,22 @@ From **8 cameras (768×432) + calibration + current speed**, a single forward pa
 
 All heads share one ResNet-34 + FPN image backbone and one **depth-gated IPM** BEV
 representation — adding a task costs **< 5 %** of total compute.
+
+## Fully automated, end to end
+
+This project is an experiment in **full automation of an ML system** — both of
+its ingredients are machine-made:
+
+- **No human labels.** Every supervision signal for all seven tasks is
+  distilled automatically from raw recordings by the CoMET-based autolabel
+  factory. Nobody drew a box, a mask, or a trajectory.
+- **No human-written code.** Every line in this repository — the models, the
+  GT extractors, the trainer, the demo renderers, the docs, the architecture
+  diagram, and this README — was written by **Claude (Fable 5, Anthropic)**
+  operating autonomously: humans set the goals and reviewed the results; the
+  agent designed, implemented, debugged, measured, and iterated. The rolling
+  training rounds themselves (data refresh, relaunch, metric-driven loss
+  fixes) run under the same agent loop.
 
 ## Architecture
 
@@ -171,5 +191,6 @@ docs/                  # architecture / data / training / demo docs
 
 <div align="center">
 <sub>METEOR — because it came from CoMET. ☄️<br/>
-Built on the CoMET autolabeling foundation of the <b>Co-MLOps</b> project.</sub>
+Built on the CoMET autolabeling foundation of the <b>Co-MLOps</b> project.<br/>
+Labels by machines. Code by <b>Claude Fable 5</b>. Direction by humans.</sub>
 </div>
