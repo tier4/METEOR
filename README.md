@@ -6,6 +6,7 @@
 
 *One camera-only network. Seven driving tasks. Zero human labels.*
 
+[![Built on CoMET](https://img.shields.io/badge/built_on-CoMET_(Co--MLOps)-orange)]()
 [![Tasks](https://img.shields.io/badge/tasks-7-blueviolet)]()
 [![Params](https://img.shields.io/badge/params-38.3M-blue)]()
 [![Compute](https://img.shields.io/badge/compute-3.1_TFLOPs-informational)]()
@@ -25,9 +26,15 @@ metric depth, BEV lane map, 3D occupancy, and an end-to-end driving path (green 
 ## What is METEOR?
 
 METEOR is a **surround-view, camera-only multi-task network** for autonomous driving,
-trained **entirely on auto-generated ground truth** (no human annotation) distilled from
-LiDAR, ego-motion and 2D panoptic labels of t4dataset-format recordings — the label
-factory born from the CoMET autolabeling project.
+trained **entirely on auto-generated ground truth — zero human annotation**.
+
+It is built on **CoMET — the autolabeling foundation of the Co-MLOps project**:
+CoMET's LiDAR × panoptic × ego-pose autolabels are distilled into every one of
+METEOR's seven supervision signals. The pipeline in this repository extends the
+CoMET foundation from BEV lane maps to depth, 2D/3D detection, occupancy and
+end-to-end driving targets — turning raw t4dataset-format recordings into a
+complete multi-task training set with no labeling cost. CoMET made the labels;
+METEOR is what the labels can train.
 
 From **8 cameras (768×432) + calibration + current speed**, a single forward pass predicts:
 
@@ -57,10 +64,11 @@ for the geometric projection. No transformers, no deformable attention:
 `conv / grid_sample / gather / maxpool / MLP` only, so the whole network exports to
 **TensorRT** as-is. Details in [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
 
-## Auto-label factory
+## The autolabel factory (powered by CoMET / Co-MLOps)
 
 Every supervision signal is distilled offline from raw recordings — LiDAR, ego-pose and
-2D panoptic masks — through a 10-stage, per-scene resumable pipeline:
+2D panoptic masks — by a 10-stage, per-scene resumable pipeline built on the
+**CoMET autolabeling foundation from the Co-MLOps project**:
 
 <div align="center">
 <img src="docs/media/groundtruth.gif" width="880" alt="auto-generated ground truth"/>
@@ -162,5 +170,6 @@ docs/                  # architecture / data / training / demo docs
 ---
 
 <div align="center">
-<sub>METEOR — because it came from CoMET. ☄️</sub>
+<sub>METEOR — because it came from CoMET. ☄️<br/>
+Built on the CoMET autolabeling foundation of the <b>Co-MLOps</b> project.</sub>
 </div>
