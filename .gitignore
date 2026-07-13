@@ -23,3 +23,4 @@ scan*.txt
 # paper: keep source, figures and the compiled PDF
 !paper/main.pdf
 !paper/METEOR_talk.pptx
+!out/METEOR_improvements.pptx
