@@ -57,6 +57,13 @@ From **8 cameras (768×432) + calibration + current speed**, a single forward pa
 All heads share one ResNet-34 + FPN image backbone and one **depth-gated IPM** BEV
 representation — adding a task costs **< 5 %** of total compute.
 
+> ### 🚀 Have Co-MLOps data? You can build this.
+> Everything here needs nothing but **raw Co-MLOps DRS recordings** (t4dataset
+> format). No annotation team, no labeling budget, no hand-written code:
+> point the autolabel factory at your scenes, run the trainer, and you get a
+> 7-task driving model — **from raw logs to a trained network in three
+> commands** (see [Quickstart](#quickstart)).
+
 ## Fully automated, end to end
 
 This project is an experiment in **full automation of an ML system** — both of
@@ -133,6 +140,8 @@ Trained on **~2,000 scenes / two vehicle platforms**, list growing continuously 
 autolabel factory converts more recordings (rolling training rounds).
 
 ## Quickstart
+
+From raw Co-MLOps recordings to a trained 7-task model — three commands:
 
 ```bash
 # 1) Convert raw scenes into training GT (10 stages, resumable, scene-parallel)
