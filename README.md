@@ -4,7 +4,7 @@
 
 ### **M**ulti-task **E**stimation of **T**raffic **E**lements, **O**bjects & **R**oads
 
-*One camera-only network. Seven driving tasks.*
+*Eight cameras (Co-MLOps DRS). One network. Seven driving tasks. No LiDAR at inference.*
 
 **Zero human labels. Zero human-written code.**
 
@@ -20,7 +20,7 @@
 
 <img src="docs/media/inference.gif" width="880" alt="METEOR multi-task inference"/>
 
-*Live inference — 8 cameras in, everything out: 2D segmentation, 2D & 3D detection,
+*Live inference — 8 DRS cameras in, everything out: 2D segmentation, 2D & 3D detection,
 metric depth, BEV lane map, 3D occupancy, and an end-to-end driving path (green ribbon).*
 
 </div>
@@ -29,8 +29,10 @@ metric depth, BEV lane map, 3D occupancy, and an end-to-end driving path (green 
 
 ## What is METEOR?
 
-METEOR is a **surround-view, camera-only multi-task network** for autonomous driving,
-trained **entirely on auto-generated ground truth — zero human annotation**.
+METEOR is a **surround-view multi-task network** for autonomous driving: it consumes
+the **8 cameras of the Co-MLOps Data Recording System (DRS)** — no LiDAR at
+inference — and is trained **entirely on auto-generated ground truth, zero human
+annotation** (LiDAR is used offline, by the label factory only).
 
 It is built on **CoMET — the autolabeling foundation of the Co-MLOps project**:
 CoMET's LiDAR × panoptic × ego-pose autolabels are distilled into every one of
