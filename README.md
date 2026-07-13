@@ -8,7 +8,8 @@
 
 **Zero human labels. Zero human-written code.**
 
-[![Built on CoMET](https://img.shields.io/badge/built_on-CoMET_(Co--MLOps)-orange)]()
+[![Built on CoMET](https://img.shields.io/badge/built_on-CoMET_(Co--MLOps)-orange)](https://co-mlops.tier4.jp/)
+[![GTC 2026](https://img.shields.io/badge/NVIDIA_GTC_2026-session_S81897-76B900)](https://www.nvidia.com/ja-jp/gtc/session-catalog/sessions/gtc26-s81897/)
 [![Tasks](https://img.shields.io/badge/tasks-7-blueviolet)]()
 [![Params](https://img.shields.io/badge/params-38.3M-blue)]()
 [![Compute](https://img.shields.io/badge/compute-3.1_TFLOPs-informational)]()
@@ -30,11 +31,11 @@ metric depth, BEV lane map, 3D occupancy, and an end-to-end driving path (green 
 ## What is METEOR?
 
 METEOR is a **surround-view multi-task network** for autonomous driving: it consumes
-the **8 cameras of the Co-MLOps Data Recording System (DRS)** — no LiDAR at
+the **8 cameras of the [Co-MLOps](https://co-mlops.tier4.jp/) Data Recording System (DRS)** — no LiDAR at
 inference — and is trained **entirely on auto-generated ground truth, zero human
 annotation** (LiDAR is used offline, by the label factory only).
 
-It is built on **CoMET — the autolabeling foundation of the Co-MLOps project**:
+It is built on **CoMET — the autolabeling foundation of the [Co-MLOps](https://co-mlops.tier4.jp/) project**:
 CoMET's LiDAR × panoptic × ego-pose autolabels are distilled into every one of
 METEOR's seven supervision signals. The pipeline in this repository extends the
 CoMET foundation from BEV lane maps to depth, 2D/3D detection, occupancy and
@@ -58,7 +59,7 @@ All heads share one ResNet-34 + FPN image backbone and one **depth-gated IPM** B
 representation — adding a task costs **< 5 %** of total compute.
 
 > ### 🚀 Have Co-MLOps data? You can build this.
-> Everything here needs nothing but **raw Co-MLOps DRS recordings** (t4dataset
+> Everything here needs nothing but **raw [Co-MLOps](https://co-mlops.tier4.jp/) DRS recordings** (t4dataset
 > format). No annotation team, no labeling budget, no hand-written code:
 > point the autolabel factory at your scenes, run the trainer, and you get a
 > 7-task driving model — **from raw logs to a trained network in three
@@ -93,7 +94,7 @@ for the geometric projection. No transformers, no deformable attention:
 `conv / grid_sample / gather / maxpool / MLP` only, so the whole network exports to
 **TensorRT** as-is. Details in [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
 
-## The autolabel factory (powered by CoMET / Co-MLOps)
+## The autolabel factory (powered by CoMET / [Co-MLOps](https://co-mlops.tier4.jp/))
 
 Every supervision signal is distilled offline from raw recordings — LiDAR, ego-pose and
 2D panoptic masks — by a 10-stage, per-scene resumable pipeline built on the
@@ -202,6 +203,7 @@ docs/                  # architecture / data / training / demo docs
 
 <div align="center">
 <sub>METEOR — because it came from CoMET. ☄️<br/>
-Built on the CoMET autolabeling foundation of the <b>Co-MLOps</b> project.<br/>
+Built on the CoMET autolabeling foundation of the <a href="https://co-mlops.tier4.jp/"><b>Co-MLOps</b></a> project
+· presented at <a href="https://www.nvidia.com/ja-jp/gtc/session-catalog/sessions/gtc26-s81897/">NVIDIA GTC 2026 (S81897)</a>.<br/>
 Labels by machines. Code by <b>Claude Fable 5</b>. Direction by humans.</sub>
 </div>
