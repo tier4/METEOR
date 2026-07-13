@@ -50,17 +50,22 @@ converted recordings, `--init-ckpt` from the previous best, retrain all tasks
 jointly. GT extractors run concurrently; the dataset tolerates missing
 modalities (ignore fallback), so new supervision streams in mid-round.
 
-| Round | Model | Change | BEV mIoU | Notes |
-|---|---|---|---|---|
-| r2 | v16 | 4-task baseline (12-cls seg) | 0.283 | |
-| r3 | v16 | 21-class CSV seg taxonomy | 0.285 | |
-| r4 | v16 | +DTSET data | 0.286 | |
-| r5 | v17 | +10-class 2D detection | 0.286 | |
-| r6 | v16 | lane/ego GT fix | 0.286 | 2D-seg lane IoU 0.371 |
-| r7 | v18 | +E2E head | **0.287** | first ADE 0.95 m |
-| r8 | v19 | capacity re-balance, KMAX 96 | **0.292** | 2D-seg mIoU 0.451 |
-| r9 | v20 | +occupancy, curve-weighted E2E | 0.290 | curve ADE 2.31→0.72 m |
-| r10 | v20 | small-object / near-VRU / side-cam weights | (running) | |
+The cadence is deliberately aggressive — **nine rounds (and four new task
+heads) shipped in the first three days** — while the same loop is designed to
+run for months: the data factory keeps converting recordings, every round
+folds them in, and heads/losses evolve without ever restarting from scratch.
+
+| Round | Date | Model | Change | BEV mIoU | Notes |
+|---|---|---|---|---|---|
+| r2 | 2026-07-11 | v16 | 4-task baseline (12-cls seg) | 0.283 | |
+| r3 | 2026-07-12 | v16 | 21-class CSV seg taxonomy | 0.285 | |
+| r4 | 2026-07-12 | v16 | +DTSET data | 0.286 | |
+| r5 | 2026-07-12 | v17 | +10-class 2D detection | 0.286 | |
+| r6 | 2026-07-12 | v16 | lane/ego GT fix | 0.286 | 2D-seg lane IoU 0.371 |
+| r7 | 2026-07-12 | v18 | +E2E head | **0.287** | first ADE 0.95 m |
+| r8 | 2026-07-12→13 | v19 | capacity re-balance, KMAX 96 | **0.292** | 2D-seg mIoU 0.451 |
+| r9 | 2026-07-13 | v20 | +occupancy, curve-weighted E2E | 0.290 | curve ADE 2.31→0.72 m |
+| r10 | 2026-07-13 | v20 | small-object / near-VRU / side-cam weights | (running) | |
 
 ## Validation metrics (printed every epoch)
 
