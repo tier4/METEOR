@@ -190,6 +190,12 @@ fastlabel_2510_instance.csv        # 2D det taxonomy (id, name, colour)
 docs/                  # architecture / data / training / demo docs
 ```
 
+## Paper
+
+**"METEOR: From Raw Surround-View Recordings to a Seven-Task Driving Network
+without Human Labels or Human-Written Code"** — Dan Umeda.
+[PDF](paper/main.pdf) · [LaTeX source](paper/main.tex)
+
 ## Documentation
 
 | Doc | Contents |
