@@ -108,31 +108,113 @@ reduced to specification and review.
 \end{enumerate}
 
 \section{Related Work}
-\textbf{Camera-to-BEV perception.} Lifting multi-camera features to BEV is
-commonly done by depth-distribution splatting (LSS~\citep{philion2020lss},
-BEVDepth~\citep{li2023bevdepth}) or by attention
-(BEVFormer~\citep{li2022bevformer}, TPVFormer~\citep{huang2023tpvformer}).
-\meteor{} instead uses a \emph{pull-based} formulation: BEV grid points are
-projected into the cameras and sample features weighted by the predicted
-depth probability at their geometric range. This inverts LSS-style splatting
-(gather instead of scatter) and avoids attention entirely, which keeps the
-graph exportable to TensorRT without plugins.
 
-\textbf{Multi-task and end-to-end driving.} UniAD~\citep{hu2023uniad} showed
-that planning benefits from jointly trained perception; MapTR~\citep{liao2023maptr}
-popularised vectorised lane learning; CenterPoint~\citep{yin2021centerpoint}
-and CenterNet~\citep{zhou2019objects} anchor our detection heads;
-Occ3D~\citep{tian2023occ3d} defines the occupancy task we target. Conditional
-imitation~\citep{codevilla2018cil} underlies our E2E head, conditioned on
-current speed. \meteor{} differs in breadth (seven tasks in one pass) and in
-its supervision source (no human labels at any stage).
+\textbf{Backbones and dense prediction.} Our encoder follows the standard
+lineage of convolutional backbones~\citep{simonyan2015vgg,he2016resnet,tan2019efficientnet,liu2022convnext}
+with batch normalisation~\citep{ioffe2015bn} and multi-scale fusion by FPN~\citep{lin2017fpn}; transformer
+encoders~\citep{dosovitskiy2021vit,liu2021swin} and high-resolution
+networks~\citep{wang2020hrnet} are attractive but conflict with our strict
+deployment constraint. Dense prediction heads descend from
+FCN~\citep{long2015fcn} and its successors~\citep{ronneberger2015unet,zhao2017pspnet,chen2018deeplabv3plus,xie2021segformer},
+with efficiency-oriented designs~\citep{yu2018bisenet,romera2018erfnet}
+closest to our encoder--decoder segmentation head. Panoptic
+labels~\citep{kirillov2019panoptic,cheng2020panopticdeeplab} in COCO RLE
+format~\citep{lin2014coco} are the raw material of our factory, and the
+class systems echo urban-scene benchmarks~\citep{cordts2016cityscapes,neuhold2017mapillary}.
 
-\textbf{Auto-labeling.} Offboard auto-labeling with strong LiDAR detectors is
-well established~\citep{qi2021offboard}. Our factory differs in that it needs
-no trained detector for most tasks: lanes, depth, occupancy, and E2E targets
-come from geometry (LiDAR accumulation, ego-motion, ray casting) fused with
-2D panoptic pseudo-labels, and 3D boxes are only \emph{filtered}, not
-generated, by learned components.
+\textbf{2D object detection.} Two-stage~\citep{ren2015fasterrcnn,he2017maskrcnn}
+and one-stage~\citep{liu2016ssd,redmon2016yolo,redmon2018yolov3,lin2017focal,tian2019fcos,zhang2020atss}
+detectors are both well explored; keypoint-based
+formulations~\citep{law2018cornernet,zhou2019objects} and set
+prediction~\citep{carion2020detr,zhu2021deformabledetr} removed anchors and
+NMS respectively. Our 2D head is a three-scale CenterNet~\citep{zhou2019objects}:
+YOLO-style multi-scale assignment~\citep{redmon2018yolov3} with
+heatmap decoding that reduces to a max-pool, which survives TensorRT export.
+
+\textbf{Lane and map perception.} Image-space lane detectors evolved from
+spatial message passing~\citep{pan2018scnn} through row-anchor and line-proposal
+methods~\citep{qin2020ultrafast,tabelini2021laneatt,liu2021condlanenet,zheng2022clrnet}
+and polynomial regression~\citep{tabelini2020polylanenet}; 3D lane
+benchmarks~\citep{garnett20193dlanenet,guo2020genlanenet,chen2022persformer}
+moved the task to metric space. Online HD-map construction rasterises or
+vectorises BEV lanes~\citep{li2022hdmapnet,liu2023vectormapnet,liao2023maptr,liao2023maptrv2,ding2023pivotnet,yuan2024streammapnet};
+our factory produces exactly such vectorised lane GT---but offline, from
+LiDAR accumulation rather than human annotation, in the spirit of classic
+skeleton-and-simplify cartography~\citep{zhang1984thinning,douglas1973dp}.
+
+\textbf{Camera-to-BEV lifting and 3D detection.} Splatting a predicted depth
+distribution~\citep{philion2020lss} underlies a large family of camera-BEV
+detectors~\citep{huang2021bevdet,huang2022bevdet4d,li2023bevdepth,park2023solofusion};
+query- and attention-based alternatives include
+DETR3D~\citep{wang2021detr3d}, PETR~\citep{liu2022petr,liu2023petrv2},
+BEVFormer~\citep{li2022bevformer}, sparse recurrent
+variants~\citep{lin2022sparse4d,wang2023streampetr}, and cross-view
+transformers~\citep{zhou2022cvt}; simpler bilinear-sampling baselines are
+surprisingly strong~\citep{harley2023simplebev,xie2022m2bev,li2023fastbev}.
+Monocular baselines~\citep{wang2021fcos3d,reading2021caddn} established
+camera-only 3D detection. Our depth-gated IPM is a pull-based hybrid: like
+classic IPM~\citep{mallot1991ipm,bertozzi1998gold} it samples at geometric
+ground intersections (including fisheye models~\citep{kannala2006generic}),
+but the sample is gated by the predicted depth probability at the ray
+range---LSS run backwards, with \texttt{gather} instead of scatter. LiDAR
+detectors~\citep{zhou2018voxelnet,yan2018second,lang2019pointpillars,shi2019pointrcnn,shi2020pvrcnn,yin2021centerpoint}
+and fusion methods~\citep{bai2022transfusion,liu2023bevfusion} inform our
+CenterPoint-style BEV head, which we supervise with camera-confirmed LiDAR
+annotations only.
+
+\textbf{Occupancy.} Semantic scene completion began indoors~\citep{song2017sscnet}
+and on LiDAR~\citep{behley2019semantickitti}; camera-based 3D occupancy is
+now a benchmark task~\citep{cao2022monoscene,huang2023tpvformer,zhang2023occformer,wei2023surroundocc,li2023voxformer,wang2023openoccupancy,tian2023occ3d,li2023fbocc}.
+Our contribution is on the label side: multi-sweep labeled-LiDAR
+voxelisation with dynamic-object de-smearing and dense ray-carved free
+space, produced without any human input.
+
+\textbf{Depth estimation.} Supervised monocular depth spans direct
+regression~\citep{eigen2014depth}, ordinal and bin
+formulations~\citep{fu2018dorn,bhat2021adabins,lee2019bts}, self-supervised
+photometric training~\citep{godard2019monodepth2}, and large-scale
+generalist models~\citep{ranftl2022midas,yang2024depthanything}. Our depth GT
+densification is closer to classical completion~\citep{ku2018ipbasic,ma2018sparsetodense},
+but segment-aware: interpolation runs inside merged panoptic road segments.
+
+\textbf{End-to-end driving.} From ALVINN~\citep{pomerleau1988alvinn} and
+PilotNet~\citep{bojarski2016pilotnet} through conditional
+imitation~\citep{codevilla2018cil,codevilla2019cilrs}, driving-by-planning
+hybrids~\citep{zeng2019nmp,bansal2019chauffeurnet}, simulator-centric
+agents~\citep{dosovitskiy2017carla,chen2020lbc,prakash2021transfuser,shao2022interfuser,wu2022tcp,hu2022mile},
+and BEV-planning stacks~\citep{hu2022stp3,hu2023uniad,jiang2023vad},
+imitation from ego-motion is a long-standing recipe. Our E2E head is
+deliberately minimal (speed-conditioned regression on the shared BEV
+feature); its interest lies in the free supervision and in the documented
+imbalance corrections, evaluated with curve-conditioned metrics on real
+recordings~\citep{caesar2020nuscenes,caesar2021nuplan}.
+
+\textbf{Datasets and auto-labeling.} Public driving corpora~\citep{geiger2012kitti,caesar2020nuscenes,sun2020waymo,wilson2021argoverse2,yu2020bdd100k,mao2021once}
+standardised the schema our recordings follow. Offboard
+auto-labeling~\citep{qi2021offboard,yang2021auto4d} distills strong
+detectors into labels; the broader semi-/self-supervised
+toolbox~\citep{lee2013pseudolabel,tarvainen2017meanteacher,sohn2020fixmatch,xie2020noisystudent,hinton2015kd,he2022mae,oquab2023dinov2}
+motivates training on machine-generated targets. Our factory is
+detector-free for five of seven tasks and covers modalities (lanes, depth,
+occupancy, driving) that offboard detection pipelines do not.
+
+\textbf{Multi-task learning.} Sharing one trunk across tasks is
+classical~\citep{caruana1997mtl,kokkinos2017ubernet,zamir2018taskonomy};
+loss balancing has been addressed by uncertainty
+weighting~\citep{kendall2018uncertainty}, gradient
+normalisation~\citep{chen2018gradnorm}, and gradient
+surgery~\citep{yu2020pcgrad}. We use fixed hand-tuned weights corrected by
+measurement (Sec.~\ref{sec:fixes}); with seven tasks and rolling data we
+found interpretable static weights easier to operate than adaptive schemes.
+
+\textbf{LLM agents for engineering.} Code generation has progressed from
+benchmark-level synthesis~\citep{chen2021codex,li2022alphacode} to
+tool-using agents~\citep{yao2023react} evaluated on real repository
+tasks~\citep{jimenez2024swebench} with rapidly improving frontier
+models~\citep{openai2023gpt4}. This project is, to our knowledge, an early
+data point on a full ML \emph{system} (not a patch or a script) built
+end-to-end by such an agent, including its own measurement loop
+(Sec.~\ref{sec:agent}).
 
 \section{The Autolabel Factory}
 \label{sec:factory}
@@ -146,13 +228,13 @@ the repository documentation.
 
 \subsection{BEV lane ground truth}
 LiDAR points from every keyframe are projected into all cameras (pinhole and
-equidistant fisheye) and take road-surface classes from the panoptic masks;
+equidistant fisheye~\citep{kannala2006generic}) and take road-surface classes from the panoptic masks;
 thin classes (lane line, stop line, road edge, marking) are only accepted
 within 15\,m, where the pixel-to-ground error is sub-cell. Ego-poses
 accumulate the labeled points into a global 0.1\,m grid over the whole scene,
 which is rasterised with hit-count priorities and a 20\,m observation-distance
-mask. The raster is then \emph{vectorised}---skeletonisation, spur pruning,
-Douglas-Peucker simplification, and dash-gap linking---and per-frame GT crops
+mask. The raster is then \emph{vectorised}---skeletonisation~\citep{zhang1984thinning}, spur pruning,
+Douglas-Peucker simplification~\citep{douglas1973dp}, and dash-gap linking---and per-frame GT crops
 ($\pm$80$\times$$\pm$50\,m at 0.2\,m) are re-rendered hybrid-style: area
 classes from the raster, line classes re-drawn from the vectors at fixed
 width. Two guards proved essential: enclosed road holes ($\le$400 cells,
@@ -162,7 +244,7 @@ intersections from being wiped.
 
 \subsection{Dense metric depth}
 Per camera, LiDAR points splat a sparse min-depth image at stride 4. Depth is
-densified by linear interpolation \emph{over the union of road and
+densified---in the spirit of classical completion~\citep{ku2018ipbasic,ma2018sparsetodense}---by linear interpolation \emph{over the union of road and
 road-paint panoptic segments}---interpolating paint separately leaves holes
 around every lane line---followed by a geometric ground-plane fill restricted
 to rays within 50$^\circ$ of downward (a guard against fisheye-calibration
@@ -219,7 +301,7 @@ Three train-time filters removed systematic label noise: scene-end trimming
 (the last 10 frames lack forward accumulation), a per-frame GT-coverage
 filter (labeled fraction $\ge$3\% in the $\pm$30\,m band and $\ge$0.5\% in
 the 30--80\,m band; long-stationary frames fail this), and indoor/underground
-scene rejection via panoptic sky statistics, because NDT pose drift makes
+scene rejection via panoptic sky statistics, because NDT~\citep{biber2003ndt} pose drift makes
 kinematic filters unreliable there.
 
 \begin{figure*}[t]
@@ -305,10 +387,10 @@ Total & 38.31\,M & $\sim$3118 & \\
 \subsection{Multi-task loss}
 The total loss is a weighted sum over tasks: BEV lanes (class-weighted
 cross-entropy with trained background, Lov\'asz-softmax~\citep{berman2018lovasz},
-boundary re-weighting, Tversky~\citep{salehi2017tversky} on line classes, Dice
-on crosswalks, and far-row weighting), depth (label-smoothed bin
+boundary re-weighting, Tversky~\citep{salehi2017tversky} on line classes, Dice~\citep{milletari2016vnet}
+on crosswalks, and far-row weighting), depth (label-smoothed~\citep{szegedy2016inception} bin
 cross-entropy plus an L1 penalty on expected metric depth), 3D boxes
-(Gaussian focal~\citep{lin2017focal,zhou2019objects} + centre L1), 2D
+(Gaussian focal~\citep{lin2017focal,zhou2019objects} + centre L1; IoU-based box losses~\citep{rezatofighi2019giou} were unnecessary at our grid resolution), 2D
 segmentation and detection (class- and camera-weighted variants), occupancy
 (class-weighted cross-entropy ignoring unknown voxels), and E2E (below). Aux
 losses return a graph-preserving zero on all-ignore batches---during rolling
@@ -344,7 +426,7 @@ Data: $\sim$2{,}000 scenes from two vehicle platforms (1{,}120 from an
 initial corpus; a second 5{,}282-scene corpus is converted progressively and
 folded in round by round). Validation is one held-out recording session (273
 scenes) never used for training. Training: 7$\times$ data-parallel, batch 2
-per GPU, AdamW, cosine schedule, $10^{-4}$ peak LR, 46k samples per epoch.
+per GPU, AdamW~\citep{kingma2015adam,loshchilov2019adamw}, cosine schedule~\citep{loshchilov2017sgdr}, $10^{-4}$ peak LR, 46k samples per epoch.
 All numbers below are single-model, single-pass; no test-time augmentation.
 
 \subsection{Main results}
@@ -465,101 +547,157 @@ foundation of the Co-MLOps project. Presented at NVIDIA GTC 2026 (session
 S81897).
 
 \bibliographystyle{unsrtnat}
-\begin{thebibliography}{20}\small
+\begin{thebibliography}{120}\footnotesize
 
-\bibitem{philion2020lss}
-J.~Philion and S.~Fidler.
-\newblock Lift, splat, shoot: Encoding images from arbitrary camera rigs by
-implicitly unprojecting to 3d.
-\newblock In \emph{ECCV}, 2020.
-
-\bibitem{li2023bevdepth}
-Y.~Li et~al.
-\newblock BEVDepth: Acquisition of reliable depth for multi-view 3d object
-detection.
-\newblock In \emph{AAAI}, 2023.
-
-\bibitem{li2022bevformer}
-Z.~Li et~al.
-\newblock BEVFormer: Learning bird's-eye-view representation from
-multi-camera images via spatiotemporal transformers.
-\newblock In \emph{ECCV}, 2022.
-
-\bibitem{huang2023tpvformer}
-Y.~Huang et~al.
-\newblock Tri-perspective view for vision-based 3d semantic occupancy
-prediction.
-\newblock In \emph{CVPR}, 2023.
-
-\bibitem{hu2023uniad}
-Y.~Hu et~al.
-\newblock Planning-oriented autonomous driving.
-\newblock In \emph{CVPR}, 2023.
-
-\bibitem{liao2023maptr}
-B.~Liao et~al.
-\newblock MapTR: Structured modeling and learning for online vectorized hd
-map construction.
-\newblock In \emph{ICLR}, 2023.
-
-\bibitem{yin2021centerpoint}
-T.~Yin, X.~Zhou, and P.~Kr\"ahenb\"uhl.
-\newblock Center-based 3d object detection and tracking.
-\newblock In \emph{CVPR}, 2021.
-
-\bibitem{zhou2019objects}
-X.~Zhou, D.~Wang, and P.~Kr\"ahenb\"uhl.
-\newblock Objects as points.
-\newblock \emph{arXiv:1904.07850}, 2019.
-
-\bibitem{tian2023occ3d}
-X.~Tian et~al.
-\newblock Occ3D: A large-scale 3d occupancy prediction benchmark for
-autonomous driving.
-\newblock In \emph{NeurIPS}, 2023.
-
-\bibitem{codevilla2018cil}
-F.~Codevilla et~al.
-\newblock End-to-end driving via conditional imitation learning.
-\newblock In \emph{ICRA}, 2018.
-
-\bibitem{qi2021offboard}
-C.~R. Qi et~al.
-\newblock Offboard 3d object detection from point cloud sequences.
-\newblock In \emph{CVPR}, 2021.
-
-\bibitem{caesar2020nuscenes}
-H.~Caesar et~al.
-\newblock nuScenes: A multimodal dataset for autonomous driving.
-\newblock In \emph{CVPR}, 2020.
-
-\bibitem{he2016resnet}
-K.~He, X.~Zhang, S.~Ren, and J.~Sun.
-\newblock Deep residual learning for image recognition.
-\newblock In \emph{CVPR}, 2016.
-
-\bibitem{lin2017fpn}
-T.-Y. Lin et~al.
-\newblock Feature pyramid networks for object detection.
-\newblock In \emph{CVPR}, 2017.
-
-\bibitem{lin2017focal}
-T.-Y. Lin et~al.
-\newblock Focal loss for dense object detection.
-\newblock In \emph{ICCV}, 2017.
-
-\bibitem{berman2018lovasz}
-M.~Berman, A.~Rannen~Triki, and M.~B. Blaschko.
-\newblock The Lov\'asz-softmax loss: A tractable surrogate for the
-optimization of the intersection-over-union measure in neural networks.
-\newblock In \emph{CVPR}, 2018.
-
-\bibitem{salehi2017tversky}
-S.~S.~M. Salehi, D.~Erdogmus, and A.~Gholipour.
-\newblock Tversky loss function for image segmentation using 3d fully
-convolutional deep networks.
-\newblock In \emph{MLMI}, 2017.
+\bibitem{simonyan2015vgg} K.~Simonyan and A.~Zisserman. Very deep convolutional networks for large-scale image recognition. In \emph{ICLR}, 2015.
+\bibitem{he2016resnet} K.~He, X.~Zhang, S.~Ren, and J.~Sun. Deep residual learning for image recognition. In \emph{CVPR}, 2016.
+\bibitem{tan2019efficientnet} M.~Tan and Q.~Le. EfficientNet: Rethinking model scaling for convolutional neural networks. In \emph{ICML}, 2019.
+\bibitem{liu2022convnext} Z.~Liu et~al. A ConvNet for the 2020s. In \emph{CVPR}, 2022.
+\bibitem{dosovitskiy2021vit} A.~Dosovitskiy et~al. An image is worth 16x16 words: Transformers for image recognition at scale. In \emph{ICLR}, 2021.
+\bibitem{liu2021swin} Z.~Liu et~al. Swin Transformer: Hierarchical vision transformer using shifted windows. In \emph{ICCV}, 2021.
+\bibitem{wang2020hrnet} J.~Wang et~al. Deep high-resolution representation learning for visual recognition. \emph{IEEE TPAMI}, 2020.
+\bibitem{lin2017fpn} T.-Y. Lin et~al. Feature pyramid networks for object detection. In \emph{CVPR}, 2017.
+\bibitem{ioffe2015bn} S.~Ioffe and C.~Szegedy. Batch normalization: Accelerating deep network training by reducing internal covariate shift. In \emph{ICML}, 2015.
+\bibitem{long2015fcn} J.~Long, E.~Shelhamer, and T.~Darrell. Fully convolutional networks for semantic segmentation. In \emph{CVPR}, 2015.
+\bibitem{ronneberger2015unet} O.~Ronneberger, P.~Fischer, and T.~Brox. U-Net: Convolutional networks for biomedical image segmentation. In \emph{MICCAI}, 2015.
+\bibitem{zhao2017pspnet} H.~Zhao et~al. Pyramid scene parsing network. In \emph{CVPR}, 2017.
+\bibitem{chen2018deeplabv3plus} L.-C. Chen et~al. Encoder-decoder with atrous separable convolution for semantic image segmentation. In \emph{ECCV}, 2018.
+\bibitem{xie2021segformer} E.~Xie et~al. SegFormer: Simple and efficient design for semantic segmentation with transformers. In \emph{NeurIPS}, 2021.
+\bibitem{yu2018bisenet} C.~Yu et~al. BiSeNet: Bilateral segmentation network for real-time semantic segmentation. In \emph{ECCV}, 2018.
+\bibitem{romera2018erfnet} E.~Romera et~al. ERFNet: Efficient residual factorized ConvNet for real-time semantic segmentation. \emph{IEEE T-ITS}, 2018.
+\bibitem{kirillov2019panoptic} A.~Kirillov et~al. Panoptic segmentation. In \emph{CVPR}, 2019.
+\bibitem{cheng2020panopticdeeplab} B.~Cheng et~al. Panoptic-DeepLab: A simple, strong, and fast baseline for bottom-up panoptic segmentation. In \emph{CVPR}, 2020.
+\bibitem{lin2014coco} T.-Y. Lin et~al. Microsoft COCO: Common objects in context. In \emph{ECCV}, 2014.
+\bibitem{cordts2016cityscapes} M.~Cordts et~al. The Cityscapes dataset for semantic urban scene understanding. In \emph{CVPR}, 2016.
+\bibitem{neuhold2017mapillary} G.~Neuhold et~al. The Mapillary Vistas dataset for semantic understanding of street scenes. In \emph{ICCV}, 2017.
+\bibitem{ren2015fasterrcnn} S.~Ren, K.~He, R.~Girshick, and J.~Sun. Faster R-CNN: Towards real-time object detection with region proposal networks. In \emph{NeurIPS}, 2015.
+\bibitem{he2017maskrcnn} K.~He, G.~Gkioxari, P.~Doll\'ar, and R.~Girshick. Mask R-CNN. In \emph{ICCV}, 2017.
+\bibitem{liu2016ssd} W.~Liu et~al. SSD: Single shot multibox detector. In \emph{ECCV}, 2016.
+\bibitem{redmon2016yolo} J.~Redmon et~al. You only look once: Unified, real-time object detection. In \emph{CVPR}, 2016.
+\bibitem{redmon2018yolov3} J.~Redmon and A.~Farhadi. YOLOv3: An incremental improvement. \emph{arXiv:1804.02767}, 2018.
+\bibitem{lin2017focal} T.-Y. Lin et~al. Focal loss for dense object detection. In \emph{ICCV}, 2017.
+\bibitem{tian2019fcos} Z.~Tian et~al. FCOS: Fully convolutional one-stage object detection. In \emph{ICCV}, 2019.
+\bibitem{zhang2020atss} S.~Zhang et~al. Bridging the gap between anchor-based and anchor-free detection via adaptive training sample selection. In \emph{CVPR}, 2020.
+\bibitem{law2018cornernet} H.~Law and J.~Deng. CornerNet: Detecting objects as paired keypoints. In \emph{ECCV}, 2018.
+\bibitem{zhou2019objects} X.~Zhou, D.~Wang, and P.~Kr\"ahenb\"uhl. Objects as points. \emph{arXiv:1904.07850}, 2019.
+\bibitem{carion2020detr} N.~Carion et~al. End-to-end object detection with transformers. In \emph{ECCV}, 2020.
+\bibitem{zhu2021deformabledetr} X.~Zhu et~al. Deformable DETR: Deformable transformers for end-to-end object detection. In \emph{ICLR}, 2021.
+\bibitem{pan2018scnn} X.~Pan et~al. Spatial as deep: Spatial CNN for traffic scene understanding. In \emph{AAAI}, 2018.
+\bibitem{qin2020ultrafast} Z.~Qin, H.~Wang, and X.~Li. Ultra fast structure-aware deep lane detection. In \emph{ECCV}, 2020.
+\bibitem{tabelini2021laneatt} L.~Tabelini et~al. Keep your eyes on the lane: Real-time attention-guided lane detection. In \emph{CVPR}, 2021.
+\bibitem{liu2021condlanenet} L.~Liu et~al. CondLaneNet: A top-to-down lane detection framework based on conditional convolution. In \emph{ICCV}, 2021.
+\bibitem{zheng2022clrnet} T.~Zheng et~al. CLRNet: Cross layer refinement network for lane detection. In \emph{CVPR}, 2022.
+\bibitem{tabelini2020polylanenet} L.~Tabelini et~al. PolyLaneNet: Lane estimation via deep polynomial regression. In \emph{ICPR}, 2020.
+\bibitem{garnett20193dlanenet} N.~Garnett et~al. 3D-LaneNet: End-to-end 3d multiple lane detection. In \emph{ICCV}, 2019.
+\bibitem{guo2020genlanenet} Y.~Guo et~al. Gen-LaneNet: A generalized and scalable approach for 3d lane detection. In \emph{ECCV}, 2020.
+\bibitem{chen2022persformer} L.~Chen et~al. PersFormer: 3d lane detection via perspective transformer and the OpenLane benchmark. In \emph{ECCV}, 2022.
+\bibitem{li2022hdmapnet} Q.~Li et~al. HDMapNet: An online hd map construction and evaluation framework. In \emph{ICRA}, 2022.
+\bibitem{liu2023vectormapnet} Y.~Liu et~al. VectorMapNet: End-to-end vectorized hd map learning. In \emph{ICML}, 2023.
+\bibitem{liao2023maptr} B.~Liao et~al. MapTR: Structured modeling and learning for online vectorized hd map construction. In \emph{ICLR}, 2023.
+\bibitem{liao2023maptrv2} B.~Liao et~al. MapTRv2: An end-to-end framework for online vectorized hd map construction. \emph{arXiv:2308.05736}, 2023.
+\bibitem{ding2023pivotnet} W.~Ding et~al. PivotNet: Vectorized pivot learning for end-to-end hd map construction. In \emph{ICCV}, 2023.
+\bibitem{yuan2024streammapnet} T.~Yuan et~al. StreamMapNet: Streaming mapping network for vectorized online hd map construction. In \emph{WACV}, 2024.
+\bibitem{philion2020lss} J.~Philion and S.~Fidler. Lift, splat, shoot: Encoding images from arbitrary camera rigs by implicitly unprojecting to 3d. In \emph{ECCV}, 2020.
+\bibitem{huang2021bevdet} J.~Huang et~al. BEVDet: High-performance multi-camera 3d object detection in bird-eye-view. \emph{arXiv:2112.11790}, 2021.
+\bibitem{huang2022bevdet4d} J.~Huang and G.~Huang. BEVDet4D: Exploit temporal cues in multi-camera 3d object detection. \emph{arXiv:2203.17054}, 2022.
+\bibitem{li2023bevdepth} Y.~Li et~al. BEVDepth: Acquisition of reliable depth for multi-view 3d object detection. In \emph{AAAI}, 2023.
+\bibitem{park2023solofusion} J.~Park et~al. Time will tell: New outlooks and a baseline for temporal multi-view 3d object detection. In \emph{ICLR}, 2023.
+\bibitem{wang2021detr3d} Y.~Wang et~al. DETR3D: 3d object detection from multi-view images via 3d-to-2d queries. In \emph{CoRL}, 2021.
+\bibitem{liu2022petr} Y.~Liu et~al. PETR: Position embedding transformation for multi-view 3d object detection. In \emph{ECCV}, 2022.
+\bibitem{liu2023petrv2} Y.~Liu et~al. PETRv2: A unified framework for 3d perception from multi-camera images. In \emph{ICCV}, 2023.
+\bibitem{li2022bevformer} Z.~Li et~al. BEVFormer: Learning bird's-eye-view representation from multi-camera images via spatiotemporal transformers. In \emph{ECCV}, 2022.
+\bibitem{lin2022sparse4d} X.~Lin et~al. Sparse4D: Multi-view 3d object detection with sparse spatial-temporal fusion. \emph{arXiv:2211.10581}, 2022.
+\bibitem{wang2023streampetr} S.~Wang et~al. Exploring object-centric temporal modeling for efficient multi-view 3d object detection. In \emph{ICCV}, 2023.
+\bibitem{zhou2022cvt} B.~Zhou and P.~Kr\"ahenb\"uhl. Cross-view transformers for real-time map-view semantic segmentation. In \emph{CVPR}, 2022.
+\bibitem{harley2023simplebev} A.~W. Harley et~al. Simple-BEV: What really matters for multi-sensor bev perception? In \emph{ICRA}, 2023.
+\bibitem{xie2022m2bev} E.~Xie et~al. M$^2$BEV: Multi-camera joint 3d detection and segmentation with unified bird's-eye view representation. \emph{arXiv:2204.05088}, 2022.
+\bibitem{li2023fastbev} Y.~Li et~al. Fast-BEV: A fast and strong bird's-eye view perception baseline. \emph{arXiv:2301.12511}, 2023.
+\bibitem{wang2021fcos3d} T.~Wang et~al. FCOS3D: Fully convolutional one-stage monocular 3d object detection. In \emph{ICCV Workshops}, 2021.
+\bibitem{reading2021caddn} C.~Reading et~al. Categorical depth distribution network for monocular 3d object detection. In \emph{CVPR}, 2021.
+\bibitem{mallot1991ipm} H.~A. Mallot et~al. Inverse perspective mapping simplifies optical flow computation and obstacle detection. \emph{Biological Cybernetics}, 1991.
+\bibitem{bertozzi1998gold} M.~Bertozzi and A.~Broggi. GOLD: A parallel real-time stereo vision system for generic obstacle and lane detection. \emph{IEEE Trans.\ Image Processing}, 1998.
+\bibitem{kannala2006generic} J.~Kannala and S.~S. Brandt. A generic camera model and calibration method for conventional, wide-angle, and fish-eye lenses. \emph{IEEE TPAMI}, 2006.
+\bibitem{zhou2018voxelnet} Y.~Zhou and O.~Tuzel. VoxelNet: End-to-end learning for point cloud based 3d object detection. In \emph{CVPR}, 2018.
+\bibitem{yan2018second} Y.~Yan, Y.~Mao, and B.~Li. SECOND: Sparsely embedded convolutional detection. \emph{Sensors}, 2018.
+\bibitem{lang2019pointpillars} A.~H. Lang et~al. PointPillars: Fast encoders for object detection from point clouds. In \emph{CVPR}, 2019.
+\bibitem{shi2019pointrcnn} S.~Shi, X.~Wang, and H.~Li. PointRCNN: 3d object proposal generation and detection from point cloud. In \emph{CVPR}, 2019.
+\bibitem{shi2020pvrcnn} S.~Shi et~al. PV-RCNN: Point-voxel feature set abstraction for 3d object detection. In \emph{CVPR}, 2020.
+\bibitem{yin2021centerpoint} T.~Yin, X.~Zhou, and P.~Kr\"ahenb\"uhl. Center-based 3d object detection and tracking. In \emph{CVPR}, 2021.
+\bibitem{bai2022transfusion} X.~Bai et~al. TransFusion: Robust lidar-camera fusion for 3d object detection with transformers. In \emph{CVPR}, 2022.
+\bibitem{liu2023bevfusion} Z.~Liu et~al. BEVFusion: Multi-task multi-sensor fusion with unified bird's-eye view representation. In \emph{ICRA}, 2023.
+\bibitem{song2017sscnet} S.~Song et~al. Semantic scene completion from a single depth image. In \emph{CVPR}, 2017.
+\bibitem{behley2019semantickitti} J.~Behley et~al. SemanticKITTI: A dataset for semantic scene understanding of lidar sequences. In \emph{ICCV}, 2019.
+\bibitem{cao2022monoscene} A.-Q. Cao and R.~de~Charette. MonoScene: Monocular 3d semantic scene completion. In \emph{CVPR}, 2022.
+\bibitem{huang2023tpvformer} Y.~Huang et~al. Tri-perspective view for vision-based 3d semantic occupancy prediction. In \emph{CVPR}, 2023.
+\bibitem{zhang2023occformer} Y.~Zhang, Z.~Zhu, and D.~Du. OccFormer: Dual-path transformer for vision-based 3d semantic occupancy prediction. In \emph{ICCV}, 2023.
+\bibitem{wei2023surroundocc} Y.~Wei et~al. SurroundOcc: Multi-camera 3d occupancy prediction for autonomous driving. In \emph{ICCV}, 2023.
+\bibitem{li2023voxformer} Y.~Li et~al. VoxFormer: Sparse voxel transformer for camera-based 3d semantic scene completion. In \emph{CVPR}, 2023.
+\bibitem{wang2023openoccupancy} X.~Wang et~al. OpenOccupancy: A large scale benchmark for surrounding semantic occupancy perception. In \emph{ICCV}, 2023.
+\bibitem{tian2023occ3d} X.~Tian et~al. Occ3D: A large-scale 3d occupancy prediction benchmark for autonomous driving. In \emph{NeurIPS}, 2023.
+\bibitem{li2023fbocc} Z.~Li et~al. FB-OCC: 3d occupancy prediction based on forward-backward view transformation. \emph{arXiv:2307.01492}, 2023.
+\bibitem{eigen2014depth} D.~Eigen, C.~Puhrsch, and R.~Fergus. Depth map prediction from a single image using a multi-scale deep network. In \emph{NeurIPS}, 2014.
+\bibitem{fu2018dorn} H.~Fu et~al. Deep ordinal regression network for monocular depth estimation. In \emph{CVPR}, 2018.
+\bibitem{lee2019bts} J.~H. Lee et~al. From big to small: Multi-scale local planar guidance for monocular depth estimation. \emph{arXiv:1907.10326}, 2019.
+\bibitem{bhat2021adabins} S.~F. Bhat, I.~Alhashim, and P.~Wonka. AdaBins: Depth estimation using adaptive bins. In \emph{CVPR}, 2021.
+\bibitem{godard2019monodepth2} C.~Godard et~al. Digging into self-supervised monocular depth estimation. In \emph{ICCV}, 2019.
+\bibitem{ranftl2022midas} R.~Ranftl et~al. Towards robust monocular depth estimation: Mixing datasets for zero-shot cross-dataset transfer. \emph{IEEE TPAMI}, 2022.
+\bibitem{yang2024depthanything} L.~Yang et~al. Depth Anything: Unleashing the power of large-scale unlabeled data. In \emph{CVPR}, 2024.
+\bibitem{ku2018ipbasic} J.~Ku, A.~Harakeh, and S.~L. Waslander. In defense of classical image processing: Fast depth completion on the CPU. In \emph{CRV}, 2018.
+\bibitem{ma2018sparsetodense} F.~Ma and S.~Karaman. Sparse-to-dense: Depth prediction from sparse depth samples and a single image. In \emph{ICRA}, 2018.
+\bibitem{pomerleau1988alvinn} D.~A. Pomerleau. ALVINN: An autonomous land vehicle in a neural network. In \emph{NeurIPS}, 1988.
+\bibitem{bojarski2016pilotnet} M.~Bojarski et~al. End to end learning for self-driving cars. \emph{arXiv:1604.07316}, 2016.
+\bibitem{codevilla2018cil} F.~Codevilla et~al. End-to-end driving via conditional imitation learning. In \emph{ICRA}, 2018.
+\bibitem{codevilla2019cilrs} F.~Codevilla et~al. Exploring the limitations of behavior cloning for autonomous driving. In \emph{ICCV}, 2019.
+\bibitem{bansal2019chauffeurnet} M.~Bansal, A.~Krizhevsky, and A.~Ogale. ChauffeurNet: Learning to drive by imitating the best and synthesizing the worst. In \emph{RSS}, 2019.
+\bibitem{zeng2019nmp} W.~Zeng et~al. End-to-end interpretable neural motion planner. In \emph{CVPR}, 2019.
+\bibitem{dosovitskiy2017carla} A.~Dosovitskiy et~al. CARLA: An open urban driving simulator. In \emph{CoRL}, 2017.
+\bibitem{chen2020lbc} D.~Chen et~al. Learning by cheating. In \emph{CoRL}, 2020.
+\bibitem{prakash2021transfuser} A.~Prakash, K.~Chitta, and A.~Geiger. Multi-modal fusion transformer for end-to-end autonomous driving. In \emph{CVPR}, 2021.
+\bibitem{shao2022interfuser} H.~Shao et~al. Safety-enhanced autonomous driving using interpretable sensor fusion transformer. In \emph{CoRL}, 2022.
+\bibitem{wu2022tcp} P.~Wu et~al. Trajectory-guided control prediction for end-to-end autonomous driving: A simple yet strong baseline. In \emph{NeurIPS}, 2022.
+\bibitem{hu2022mile} A.~Hu et~al. Model-based imitation learning for urban driving. In \emph{NeurIPS}, 2022.
+\bibitem{hu2022stp3} S.~Hu et~al. ST-P3: End-to-end vision-based autonomous driving via spatial-temporal feature learning. In \emph{ECCV}, 2022.
+\bibitem{hu2023uniad} Y.~Hu et~al. Planning-oriented autonomous driving. In \emph{CVPR}, 2023.
+\bibitem{jiang2023vad} B.~Jiang et~al. VAD: Vectorized scene representation for efficient autonomous driving. In \emph{ICCV}, 2023.
+\bibitem{geiger2012kitti} A.~Geiger, P.~Lenz, and R.~Urtasun. Are we ready for autonomous driving? The KITTI vision benchmark suite. In \emph{CVPR}, 2012.
+\bibitem{caesar2020nuscenes} H.~Caesar et~al. nuScenes: A multimodal dataset for autonomous driving. In \emph{CVPR}, 2020.
+\bibitem{caesar2021nuplan} H.~Caesar et~al. nuPlan: A closed-loop ml-based planning benchmark for autonomous vehicles. \emph{arXiv:2106.11810}, 2021.
+\bibitem{sun2020waymo} P.~Sun et~al. Scalability in perception for autonomous driving: Waymo open dataset. In \emph{CVPR}, 2020.
+\bibitem{wilson2021argoverse2} B.~Wilson et~al. Argoverse 2: Next generation datasets for self-driving perception and forecasting. In \emph{NeurIPS Datasets and Benchmarks}, 2021.
+\bibitem{yu2020bdd100k} F.~Yu et~al. BDD100K: A diverse driving dataset for heterogeneous multitask learning. In \emph{CVPR}, 2020.
+\bibitem{mao2021once} J.~Mao et~al. One million scenes for autonomous driving: ONCE dataset. In \emph{NeurIPS Datasets and Benchmarks}, 2021.
+\bibitem{qi2021offboard} C.~R. Qi et~al. Offboard 3d object detection from point cloud sequences. In \emph{CVPR}, 2021.
+\bibitem{yang2021auto4d} B.~Yang et~al. Auto4D: Learning to label 4d objects from sequential point clouds. \emph{arXiv:2101.06586}, 2021.
+\bibitem{lee2013pseudolabel} D.-H. Lee. Pseudo-label: The simple and efficient semi-supervised learning method for deep neural networks. In \emph{ICML Workshops}, 2013.
+\bibitem{tarvainen2017meanteacher} A.~Tarvainen and H.~Valpola. Mean teachers are better role models: Weight-averaged consistency targets improve semi-supervised deep learning results. In \emph{NeurIPS}, 2017.
+\bibitem{sohn2020fixmatch} K.~Sohn et~al. FixMatch: Simplifying semi-supervised learning with consistency and confidence. In \emph{NeurIPS}, 2020.
+\bibitem{xie2020noisystudent} Q.~Xie et~al. Self-training with noisy student improves ImageNet classification. In \emph{CVPR}, 2020.
+\bibitem{hinton2015kd} G.~Hinton, O.~Vinyals, and J.~Dean. Distilling the knowledge in a neural network. \emph{arXiv:1503.02531}, 2015.
+\bibitem{he2022mae} K.~He et~al. Masked autoencoders are scalable vision learners. In \emph{CVPR}, 2022.
+\bibitem{oquab2023dinov2} M.~Oquab et~al. DINOv2: Learning robust visual features without supervision. \emph{arXiv:2304.07193}, 2023.
+\bibitem{caruana1997mtl} R.~Caruana. Multitask learning. \emph{Machine Learning}, 28(1), 1997.
+\bibitem{kokkinos2017ubernet} I.~Kokkinos. UberNet: Training a universal convolutional neural network for low-, mid-, and high-level vision using diverse datasets and limited memory. In \emph{CVPR}, 2017.
+\bibitem{zamir2018taskonomy} A.~R. Zamir et~al. Taskonomy: Disentangling task transfer learning. In \emph{CVPR}, 2018.
+\bibitem{kendall2018uncertainty} A.~Kendall, Y.~Gal, and R.~Cipolla. Multi-task learning using uncertainty to weigh losses for scene geometry and semantics. In \emph{CVPR}, 2018.
+\bibitem{chen2018gradnorm} Z.~Chen et~al. GradNorm: Gradient normalization for adaptive loss balancing in deep multitask networks. In \emph{ICML}, 2018.
+\bibitem{yu2020pcgrad} T.~Yu et~al. Gradient surgery for multi-task learning. In \emph{NeurIPS}, 2020.
+\bibitem{kingma2015adam} D.~P. Kingma and J.~Ba. Adam: A method for stochastic optimization. In \emph{ICLR}, 2015.
+\bibitem{loshchilov2019adamw} I.~Loshchilov and F.~Hutter. Decoupled weight decay regularization. In \emph{ICLR}, 2019.
+\bibitem{loshchilov2017sgdr} I.~Loshchilov and F.~Hutter. SGDR: Stochastic gradient descent with warm restarts. In \emph{ICLR}, 2017.
+\bibitem{szegedy2016inception} C.~Szegedy et~al. Rethinking the Inception architecture for computer vision. In \emph{CVPR}, 2016.
+\bibitem{micikevicius2018amp} P.~Micikevicius et~al. Mixed precision training. In \emph{ICLR}, 2018.
+\bibitem{berman2018lovasz} M.~Berman, A.~Rannen~Triki, and M.~B. Blaschko. The Lov\'asz-softmax loss: A tractable surrogate for the optimization of the intersection-over-union measure in neural networks. In \emph{CVPR}, 2018.
+\bibitem{salehi2017tversky} S.~S. M. Salehi, D.~Erdogmus, and A.~Gholipour. Tversky loss function for image segmentation using 3d fully convolutional deep networks. In \emph{MLMI}, 2017.
+\bibitem{milletari2016vnet} F.~Milletari, N.~Navab, and S.-A. Ahmadi. V-Net: Fully convolutional neural networks for volumetric medical image segmentation. In \emph{3DV}, 2016.
+\bibitem{rezatofighi2019giou} H.~Rezatofighi et~al. Generalized intersection over union: A metric and a loss for bounding box regression. In \emph{CVPR}, 2019.
+\bibitem{biber2003ndt} P.~Biber and W.~Stra{\ss}er. The normal distributions transform: A new approach to laser scan matching. In \emph{IROS}, 2003.
+\bibitem{douglas1973dp} D.~H. Douglas and T.~K. Peucker. Algorithms for the reduction of the number of points required to represent a digitized line or its caricature. \emph{Cartographica}, 1973.
+\bibitem{zhang1984thinning} T.~Y. Zhang and C.~Y. Suen. A fast parallel algorithm for thinning digital patterns. \emph{Communications of the ACM}, 1984.
+\bibitem{chen2021codex} M.~Chen et~al. Evaluating large language models trained on code. \emph{arXiv:2107.03374}, 2021.
+\bibitem{li2022alphacode} Y.~Li et~al. Competition-level code generation with AlphaCode. \emph{Science}, 378(6624), 2022.
+\bibitem{yao2023react} S.~Yao et~al. ReAct: Synergizing reasoning and acting in language models. In \emph{ICLR}, 2023.
+\bibitem{jimenez2024swebench} C.~E. Jimenez et~al. SWE-bench: Can language models resolve real-world GitHub issues? In \emph{ICLR}, 2024.
+\bibitem{openai2023gpt4} OpenAI. GPT-4 technical report. \emph{arXiv:2303.08774}, 2023.
 
 \end{thebibliography}
-
 \end{document}
