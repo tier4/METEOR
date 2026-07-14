@@ -214,6 +214,9 @@ python3 deploy/export_onnx.py --ckpt ckpt.pt --out meteor_v26.onnx --check --fp1
 trtexec --onnx=meteor_v26.onnx --saveEngine=meteor_v26_fp16.engine --fp16
 ```
 
+Measured: **~70 ms/frame** (fp16, all 8 cameras, all 8 tasks, single engine —
+on a GPU shared with a running training job).
+
 See [deploy/README.md](deploy/README.md). Pre-exported ONNX weights are attached
 to [release tags](../../tags) (fp16, ~84 MB) — not tracked in the repo.
 

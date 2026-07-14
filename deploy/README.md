@@ -35,8 +35,10 @@ trtexec --onnx=out/meteor_v26.onnx \
         --fp16 --memPoolSize=workspace:8192
 ```
 
-Verified on TensorRT 8.6 (single build pass, no plugins, INT64→INT32
-weight cast warning is benign).
+Verified on TensorRT 8.6: single build pass, no plugins (INT64→INT32
+weight cast warning is benign). Measured **14.4 qps ≈ 70 ms/frame** for the
+full 8-camera / 8-task graph in fp16 — on a GPU concurrently running a
+training job, so treat it as a lower bound.
 
 ## 3. Run
 
