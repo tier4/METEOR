@@ -50,8 +50,8 @@ converted recordings, `--init-ckpt` from the previous best, retrain all tasks
 jointly. GT extractors run concurrently; the dataset tolerates missing
 modalities (ignore fallback), so new supervision streams in mid-round.
 
-The cadence is deliberately aggressive — **nine rounds (and four new task
-heads) shipped in the first three days** — while the same loop is designed to
+The cadence is deliberately aggressive — **sixteen rounds (and six new task
+heads) shipped in the first five days** — while the same loop is designed to
 run for months: the data factory keeps converting recordings, every round
 folds them in, and heads/losses evolve without ever restarting from scratch.
 
@@ -65,7 +65,13 @@ folds them in, and heads/losses evolve without ever restarting from scratch.
 | r7 | 2026-07-12 | v18 | +E2E head | **0.287** | first ADE 0.95 m |
 | r8 | 2026-07-12→13 | v19 | capacity re-balance, KMAX 96 | **0.292** | 2D-seg mIoU 0.451 |
 | r9 | 2026-07-13 | v20 | +occupancy, curve-weighted E2E | 0.290 | curve ADE 2.31→0.72 m |
-| r10 | 2026-07-13 | v20 | small-object / near-VRU / side-cam weights | (running) | |
+| r10 | 2026-07-13 | v20 | small-object / near-VRU / side-cam weights | 0.289 | 2D-seg mIoU 0.466 |
+| r11 | 2026-07-13 | v21 | +one-shot agent forecasting | 0.288 | agentADE 2.17 m |
+| r12 | 2026-07-13→14 | v22 | +streaming temporal BEV | 0.276 | ADEc 0.65 m, agentADE 1.76 m |
+| r13 | 2026-07-14 | v23 | LaneDecED, det tower, tfuse zero-init, 8-ep fast-decay LR | 0.275 | E2E ADE 0.63 m (best) |
+| r14 | 2026-07-14 | v25 | task routing: geometry on RAW BEV, motion on FUSED | 0.275 | val2d 0.466 |
+| r15 | 2026-07-14 | v26 | +stationary flag; near-range-first 3D det (VRU GT relax, far damp) | 0.285 | VRU R 0.08→0.25, Rn veh 0.68 |
+| r16 | 2026-07-14→15 | v26 | yaw pkg (3×3 reg targets, yaw-weighted loss); box/ego re-prioritised | (running) | yaw 8.3° baseline |
 
 ## Validation metrics (printed every epoch)
 
@@ -74,6 +80,11 @@ folds them in, and heads/losses evolve without ever restarting from scratch.
 - `[valE2E ep]` — trajectory ADE, **ADEc** (curve subset |lat@3s| > 2 m), FDE,
   steering MAE, accel MAE, brake accuracy
 - `[valOCC ep]` — occupancy IoU (free / vehicle / ped / road / veg / building)
+- `[val3D ep]` — 3D det P/R per class + **R50** (< 50 m) + **Rn**
+  (near corridor: < 30 m, |lat| < 12 m) + centre error + **yaw axis error /
+  direction-flip rate** on matched boxes
+- `[valTraj ep]` — agent-forecast ADE/FDE at GT centres + **statAcc**
+  (learned parked/stopped flag vs GT |disp@3s| < 0.5 m)
 
 ## Operational notes (hard-won)
 

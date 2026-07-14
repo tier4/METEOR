@@ -1,4 +1,4 @@
-# METEOR Architecture (v20)
+# METEOR Architecture (v26)
 
 One shared image backbone, one BEV representation, seven task heads.
 Every operator is TensorRT-exportable (`conv / grid_sample / gather / maxpool /
@@ -53,11 +53,16 @@ The fused stride-4 feature `f [B·8, 160, 108, 192]` feeds four image-space head
 | BEV lane decoder | 1.16 M | 933 | 30 % |
 | 2D seg head | 4.18 M | 219 | 7 % |
 | 2D det head | 2.85 M | 219 | 7 % |
-| 3D det head | 0.41 M | 82 | 3 % |
+| 3D det head (s4 tower) | 2.06 M | 121 | 4 % |
 | Occupancy head | 0.70 M | 55 | 2 % |
 | E2E head | 4.04 M | 37 | 1 % |
+| Temporal fuse (tfuse) | 0.18 M | 42 | 1 % |
+| Agent traj + stationary | 0.41 M | 26 | <1 % |
 | Context + IPM | 0.02 M | 6 | <1 % |
-| **Total** | **38.31 M** | **~3118** | |
+| **Total (v26)** | **43.50 M** | **~3100** | |
+
+*(BEV lane decoder is now the encoder–decoder `LaneDecED`: 4.10 M params at
+~0.8× the FLOPs of the flat stack it replaced — same design rule below.)*
 
 Two design rules fall out of this table:
 
@@ -72,4 +77,21 @@ Two design rules fall out of this table:
 
 `v8` depth-gated IPM (TRT-verified) → `v13d/v14d` stride-4 big depth decoder →
 `v16` +oriented 3D boxes → `v17` +2D detection → `v18` +E2E → `v19` capacity
-re-balance (encoder–decoder seg, 3-scale det, big E2E) → **`v20` +occupancy = METEOR**.
+re-balance (encoder–decoder seg, 3-scale det, big E2E) → `v20` +occupancy →
+`v21` +one-shot agent forecasting → `v22` +streaming temporal BEV (prev-frame
+BEV ego-motion-warped and residually fused; TRT-safe host-side recurrence) →
+`v23` LaneDecED + s4 det tower + zero-init fusion → `v24/v25` task routing
+(geometry heads on the RAW single-frame BEV, motion heads on the FUSED temporal
+BEV — verified by prev-BEV perturbation) → **`v26` +learned parked/stopped flag
++ near-range-first detection supervision = METEOR**.
+
+### Streaming temporal BEV (v22+)
+
+`fused = bev + tfuse(concat(bev, warp(prev_bev, theta)))` where `theta` encodes
+the relative ego pose between consecutive frames. At deployment `prev_bev` and
+`theta` are ordinary engine inputs and the current raw BEV is an ordinary
+output — the recurrence lives on the host (see `deploy/`), the graph stays
+static. The last BN of `tfuse` is zero-initialised so fusion starts as an
+identity. 3D detection regresses per-cell `(offset, log-size, sin/cos yaw)`
+supervised on the full 3×3 neighbourhood of every GT centre (the decode reads
+the heatmap peak, which is frequently 1 cell off the true centre).
