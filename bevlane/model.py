@@ -669,13 +669,7 @@ class DepthSegIPMNetV16(DepthSegIPMNetV14):
         self.reg_head = nn.Conv2d(128, 6, 1)
         nn.init.constant_(self.hm_head.bias, -2.19)   # focal init (p~0.1)
 
-    def forward(self, imgs, K, T_cam_ego):
-        B, N, _, H, W = imgs.shape
-        f = self.image_feats(imgs)
-        seg2d = self.seg_head(f)
-        dlog = self.depth_head(self.depth_up(f))
-        dprob = dlog.softmax(1)
-        ctx = self.ctx(f)
+    def project_bev(self, dprob, ctx, K, T_cam_ego, B, N, H, W):
         Cc = ctx.shape[1]
         pts = self.bev_pts
         G2 = pts.shape[0]
@@ -704,12 +698,45 @@ class DepthSegIPMNetV16(DepthSegIPMNetV14):
         wgt = wgt * valid.unsqueeze(1).to(wgt.dtype)
         num = (ctx_s.view(B, N, Cc, G2) * wgt.view(B, N, 1, G2)).sum(1)
         den = wgt.view(B, N, 1, G2).sum(1).clamp(min=1e-4)
-        bev = (num / den).view(B, Cc, BEV_H, BEV_W)
-        self._last_bev = bev           # reused by the v18 ego head
-        det = self.det_stem(bev)
+        return (num / den).view(B, Cc, BEV_H, BEV_W)
+
+    def compute_bev(self, imgs, K, T_cam_ego):
+        """Images -> raw (pre-fusion) BEV feature; used for the temporal
+        previous-frame pass and for streaming deployment."""
+        B, N, _, H, W = imgs.shape
+        f = self.image_feats(imgs)
+        dprob = self.depth_head(self.depth_up(f)).softmax(1)
+        return self.project_bev(dprob, self.ctx(f), K, T_cam_ego, B, N, H, W)
+
+    def temporal_fuse(self, bev):
+        return bev                      # identity below v22
+
+    def lane_input(self):
+        return self._fused_bev          # v24 reroutes to the raw BEV
+
+    def occ_input(self):
+        return self._fused_bev
+
+    def det_input(self):
+        return self._fused_bev          # v25 reroutes to the raw BEV
+
+    def forward(self, imgs, K, T_cam_ego):
+        B, N, _, H, W = imgs.shape
+        f = self.image_feats(imgs)
+        seg2d = self.seg_head(f)
+        dlog = self.depth_head(self.depth_up(f))
+        dprob = dlog.softmax(1)
+        ctx = self.ctx(f)
+        bev = self.project_bev(dprob, ctx, K, T_cam_ego, B, N, H, W)
+        self._last_bev = bev
+        bev = self.temporal_fuse(bev)
+        self._fused_bev = bev          # consumed by ego / occ / traj heads
+        det = self.det_stem(self.det_input())
+        self._det_feat = det
+        lane_bev = self.lane_input()
         fh2, fw2 = dlog.shape[-2:]
         sh, sw = seg2d.shape[-2:]
-        return (self.dec(bev), dlog.view(B, N, self.D, fh2, fw2),
+        return (self.dec(lane_bev), dlog.view(B, N, self.D, fh2, fw2),
                 seg2d.view(B, N, seg2d.shape[1], sh, sw),
                 self.hm_head(det), self.reg_head(det))
 
@@ -726,6 +753,11 @@ class DepthSegIPMNetV16(DepthSegIPMNetV14):
         msk = torch.zeros(B, 1, DET_H, DET_W, device=device, dtype=dtype)
         ys = torch.arange(DET_H, device=device, dtype=dtype)
         xs = torch.arange(DET_W, device=device, dtype=dtype)
+        # two passes: neighbours first, centres last (centres always win) --
+        # decode reads reg at the heatmap PEAK cell, which can sit 1 cell off
+        # the GT centre, so the 3x3 neighbourhood must carry valid targets
+        # (per-cell offsets; size/yaw shared) or yaw/size come out untrained
+        centres = []
         for bi in range(B):
             for k in range(int(nbox[bi])):
                 cls, xe, ye, l, w, yaw = boxes[bi, k].tolist()
@@ -734,16 +766,28 @@ class DepthSegIPMNetV16(DepthSegIPMNetV14):
                 ri, ci = int(r), int(c)
                 if not (0 <= ri < DET_H and 0 <= ci < DET_W):
                     continue
-                rad = max(1.5, 0.6 * max(l, w) / DET_RES / 2)
+                rad = max(2.0, 0.7 * max(l, w) / DET_RES / 2)
                 g = torch.exp(-(((ys - r) ** 2).view(-1, 1)
                                 + ((xs - c) ** 2).view(1, -1)) / (2 * rad ** 2))
                 ch = 0 if cls < 1.5 else 1
                 hm[bi, ch] = torch.maximum(hm[bi, ch], g)
-                reg[bi, :, ri, ci] = torch.tensor(
-                    [r - ri, c - ci, math.log(max(l, .1)),
-                     math.log(max(w, .1)), math.sin(yaw),
-                     math.cos(yaw)], device=device, dtype=dtype)
-                msk[bi, 0, ri, ci] = 1
+                ll, lw = math.log(max(l, .1)), math.log(max(w, .1))
+                sy, cy = math.sin(yaw), math.cos(yaw)
+                for dr in (-1, 0, 1):
+                    for dc in (-1, 0, 1):
+                        r2, c2 = ri + dr, ci + dc
+                        if dr == dc == 0                                 or not (0 <= r2 < DET_H and 0 <= c2 < DET_W):
+                            continue
+                        reg[bi, :, r2, c2] = torch.tensor(
+                            [r - r2, c - c2, ll, lw, sy, cy],
+                            device=device, dtype=dtype)
+                        msk[bi, 0, r2, c2] = 1
+                centres.append((bi, ri, ci,
+                                torch.tensor([r - ri, c - ci, ll, lw, sy, cy],
+                                             device=device, dtype=dtype)))
+        for bi, ri, ci, t in centres:
+            reg[bi, :, ri, ci] = t
+            msk[bi, 0, ri, ci] = 1
         return hm, reg, msk
 
     def boxdet_loss(self, hm, reg, boxes, nbox):
@@ -760,13 +804,28 @@ class DepthSegIPMNetV16(DepthSegIPMNetV14):
             cc = torch.arange(DET_W, device=hm.device).view(1, -1)
             xe = 80.0 - rr * DET_RES
             ye = 50.0 - cc * DET_RES
-            near = 1.0 + ((xe ** 2 + ye ** 2) < 20.0 ** 2).float()
-            cw = torch.tensor([1.0, 2.5], device=hm.device).view(2, 1, 1)
-            self._det_posw = (near.unsqueeze(0) * cw).unsqueeze(0)
+            r = (xe ** 2 + ye ** 2).sqrt()
+            # near range must not miss: x2 inside 20 m, x3 inside 12 m
+            near = 1.0 + (r < 20.0).float() + (r < 12.0).float()
+            cw = torch.tensor([2.0, 5.0], device=hm.device).view(2, 1, 1)
+            # far positives are unresolvable at 768x432 (a 60 m pedestrian is
+            # ~10 px); full-weight unlearnable positives push the focal loss
+            # to suppress confidence everywhere -> damp them instead
+            damp = torch.stack([torch.where(r > 50.0, 0.3, 1.0),
+                                torch.where(r > 40.0, 0.2, 1.0)])
+            # laterally distant objects are out of scope -> nearly ignore
+            damp = damp * torch.where(ye.abs() > 15.0, 0.2, 1.0)
+            self._det_posw = (near.unsqueeze(0) * cw * damp).unsqueeze(0)
         floss = -(pos * self._det_posw * (1 - p) ** 2 * p.log()
                   + (1 - pos) * neg_w * p ** 2 * (1 - p).log()).sum() \
             / (pos * self._det_posw).sum().clamp(min=1)
-        rloss = (torch.abs(reg.float() - reg_t) * m).sum() / m.sum().clamp(min=1) / 6
+        # yaw channels (sin/cos) x3: orientation error is the weakest output
+        if getattr(self, "_reg_cw", None) is None \
+                or self._reg_cw.device != hm.device:
+            self._reg_cw = torch.tensor([1., 1., 1., 1., 3., 3.],
+                                        device=hm.device).view(1, 6, 1, 1)
+        rloss = (torch.abs(reg.float() - reg_t) * m * self._reg_cw).sum() \
+            / m.sum().clamp(min=1) / 10
         return floss + rloss
 
     @staticmethod
@@ -949,7 +1008,7 @@ class DepthSegIPMNetV18(DepthSegIPMNetV17):
     def forward(self, imgs, K, T_cam_ego, v0=None):
         B = imgs.shape[0]
         out = super().forward(imgs, K, T_cam_ego)
-        g = self.ego_stem(self._last_bev).flatten(1)        # [B,96]
+        g = self.ego_stem(self._fused_bev).flatten(1)       # [B,96]
         if v0 is None:
             v0 = torch.zeros(B, device=imgs.device, dtype=g.dtype)
         ego = self.ego_mlp(torch.cat([g, v0.view(B, 1).to(g.dtype)], 1))
@@ -1159,7 +1218,7 @@ class DepthSegIPMNetV20(DepthSegIPMNetV19):
 
     def forward(self, imgs, K, T_cam_ego, v0=None):
         out = super().forward(imgs, K, T_cam_ego, v0)
-        crop = self._last_bev[:, :, 200:600, 50:450]
+        crop = self.occ_input()[:, :, 200:600, 50:450]
         o = self.occ_head(self.occ_stem(crop))
         B = o.shape[0]
         return out + (o.view(B, OCC_C, OCC_Z, o.shape[-2], o.shape[-1]),)
@@ -1180,9 +1239,265 @@ class DepthSegIPMNetV20(DepthSegIPMNetV19):
                                ignore_index=255)
 
 
+TRAJ_H = 6                     # agent-forecast waypoints @0.5 s
+
+
+class DepthSegIPMNetV21(DepthSegIPMNetV20):
+    """v21: + one-shot agent trajectory forecasting.
+
+    A 1x1 conv on the shared 3D-detection stem regresses, at every BEV
+    detection cell, the agent's future offsets for 6 x 0.5 s horizons
+    (metres, current ego frame). Constant cost in the number of agents
+    (+0.05M params). forward -> v20 outputs + (traj [B,12,400,250],).
+    """
+    def __init__(self, *a, **k):
+        super().__init__(*a, **k)
+        self.traj_head = nn.Conv2d(128, TRAJ_H * 2, 1)
+
+    def traj_feat(self):
+        return self._det_feat           # v25: separate stem on the fused BEV
+
+    def forward(self, imgs, K, T_cam_ego, v0=None):
+        out = super().forward(imgs, K, T_cam_ego, v0)
+        return out + (self.traj_head(self.traj_feat()),)
+
+    @staticmethod
+    def build_traj_targets(boxes, nbox, traj, tvalid, device):
+        """-> (t [B,12,h,w], m [B,12,h,w]) at box-centre cells."""
+        Bn = boxes.shape[0]
+        t = torch.zeros(Bn, TRAJ_H * 2, DET_H, DET_W, device=device)
+        m = torch.zeros(Bn, TRAJ_H * 2, DET_H, DET_W, device=device)
+        for bi in range(Bn):
+            for k in range(int(nbox[bi])):
+                cls, xe, ye = boxes[bi, k, 0], boxes[bi, k, 1], boxes[bi, k, 2]
+                if boxes[bi, k, 3] <= 0:
+                    continue
+                ri = int((80.0 - float(xe)) / DET_RES)
+                ci = int((50.0 - float(ye)) / DET_RES)
+                if not (0 <= ri < DET_H and 0 <= ci < DET_W):
+                    continue
+                t[bi, :, ri, ci] = traj[bi, k].reshape(-1)
+                m[bi, :, ri, ci] = tvalid[bi, k].repeat_interleave(2)
+        return t, m
+
+    def traj_loss(self, tr_pred, boxes, nbox, traj, tvalid):
+        t, m = self.build_traj_targets(boxes, nbox, traj, tvalid,
+                                       tr_pred.device)
+        if m.sum() == 0:
+            return tr_pred.sum() * 0.0
+        return (torch.abs(tr_pred.float() - t) * m).sum() / m.sum()
+
+
+def make_warp_theta(rel):
+    """rel [B,3] = (tx, ty, dyaw): current-frame BEV point p_c maps to the
+    previous frame as p_p = R(dyaw) p_c + t. Returns affine theta [B,2,3]
+    for F.affine_grid on the 800x500 BEV (row=(80-x)/0.2, col=(50-y)/0.2),
+    so grid_sample pulls the previous feature into the current frame."""
+    B = rel.shape[0]
+    a = 0.1 * (BEV_H - 1)              # x = (80-a) - a*v
+    b = 0.1 * (BEV_W - 1)              # y = (50-b) - b*u
+    cd, sd = torch.cos(rel[:, 2]), torch.sin(rel[:, 2])
+    tx, ty = rel[:, 0], rel[:, 1]
+    Cx = cd * (80 - a) - sd * (50 - b) + tx
+    Cy = sd * (80 - a) + cd * (50 - b) + ty
+    th = torch.zeros(B, 2, 3, device=rel.device, dtype=rel.dtype)
+    th[:, 0, 0] = cd                   # u_p = cd*u + (a*sd/b)*v + ...
+    th[:, 0, 1] = a * sd / b
+    th[:, 0, 2] = ((50 - b) - Cy) / b
+    th[:, 1, 0] = -(b / a) * sd        # v_p = -(b*sd/a)*u + cd*v + ...
+    th[:, 1, 1] = cd
+    th[:, 1, 2] = ((80 - a) - Cx) / a
+    return th
+
+
+class DepthSegIPMNetV22(DepthSegIPMNetV21):
+    """v22: streaming temporal BEV (TensorRT-safe).
+
+    The previous frame's raw BEV feature, ego-motion-warped into the current
+    frame (affine_grid + grid_sample), is fused residually with the current
+    BEV. At deployment prev_bev / warp theta are graph INPUTS and the raw
+    current BEV is an extra OUTPUT -> static feed-forward graph, no RNN.
+    Improves velocity observability for E2E and agent forecasting.
+    forward(imgs, K, T, v0, prev_bev, warp_theta) -> v21 outputs.
+    """
+    def __init__(self, *a, **k):
+        super().__init__(*a, **k)
+        self.tfuse = nn.Sequential(
+            nn.Conv2d(192, 96, 1, bias=False), nn.BatchNorm2d(96),
+            nn.ReLU(inplace=True), ConvBlock(96, 96))
+        self._prev = (None, None)
+
+    def forward(self, imgs, K, T_cam_ego, v0=None, prev_bev=None,
+                warp_theta=None):
+        self._prev = (prev_bev, warp_theta)
+        return super().forward(imgs, K, T_cam_ego, v0)
+
+    def temporal_fuse(self, bev):
+        pb, th = self._prev
+        if pb is None:
+            pb = torch.zeros_like(bev)
+            warped = pb
+        else:
+            grid = F.affine_grid(th.to(bev.dtype), list(bev.shape),
+                                 align_corners=False)
+            warped = F.grid_sample(pb.to(bev.dtype), grid,
+                                   align_corners=False)
+        return bev + self.tfuse(torch.cat([bev, warped], 1))
+
+
+class LaneDecED(nn.Module):
+    """Encoder-decoder BEV lane decoder: params at s2/s4 of the BEV, thin
+    structures preserved by a full-resolution skip. ~4.1M params at ~0.8x
+    the FLOPs of the flat full-res stack it replaces."""
+    def __init__(self, cin, n_cls):
+        super().__init__()
+        self.skip = ConvBlock(cin, 64)
+        self.d1 = nn.Sequential(
+            nn.Conv2d(cin, 192, 3, stride=2, padding=1, bias=False),
+            nn.BatchNorm2d(192), nn.ReLU(inplace=True), ConvBlock(192, 192))
+        self.d2 = nn.Sequential(
+            nn.Conv2d(192, 320, 3, stride=2, padding=1, bias=False),
+            nn.BatchNorm2d(320), nn.ReLU(inplace=True), ConvBlock(320, 320))
+        self.u1 = nn.Conv2d(320, 192, 1)
+        self.m1 = ConvBlock(192, 192)
+        self.u2 = nn.Conv2d(192, 64, 1)
+        self.out = nn.Sequential(
+            nn.Conv2d(64, 64, 3, padding=1, bias=False),
+            nn.BatchNorm2d(64), nn.ReLU(inplace=True),
+            nn.Conv2d(64, n_cls, 1))
+
+    def forward(self, x):
+        s = self.skip(x)
+        x1 = self.d1(x)
+        x2 = self.d2(x1)
+        y1 = self.m1(x1 + F.interpolate(self.u1(x2), size=x1.shape[-2:],
+                                        mode="bilinear", align_corners=False))
+        y0 = s + F.interpolate(self.u2(y1), size=s.shape[-2:],
+                               mode="bilinear", align_corners=False)
+        return self.out(y0)
+
+
+class DepthSegIPMNetV23(DepthSegIPMNetV22):
+    """v23: BEV-priority capacity round.
+
+    - tfuse last BN zero-initialised -> temporal fusion starts as identity
+      and cannot perturb the pretrained BEV (fixes the v22 mIoU dip).
+    - BEV lane decoder -> encoder-decoder (LaneDecED, 1.16M -> ~4.1M params
+      at ~0.8x FLOPs).
+    - 3D det stem gains an s4 256ch tower fused back at s2 (+1.9M).
+    """
+    def __init__(self, *a, **k):
+        super().__init__(*a, **k)
+        n_cls = self.dec[-1].out_channels
+        self.dec = LaneDecED(96, n_cls)
+        # stronger det stem: old (conv s2 96->128 + ConvBlock) + s4 tower
+        self.det_d8 = nn.Sequential(
+            nn.Conv2d(128, 256, 3, stride=2, padding=1, bias=False),
+            nn.BatchNorm2d(256), nn.ReLU(inplace=True), ConvBlock(256, 256))
+        self.det_u = nn.Conv2d(256, 128, 1)
+        self.det_m = nn.Sequential(
+            nn.Conv2d(128, 128, 3, padding=1, bias=False),
+            nn.BatchNorm2d(128), nn.ReLU(inplace=True))
+        base_stem = self.det_stem
+
+        class _DetStemED(nn.Module):
+            def __init__(self, stem, d8, u, m):
+                super().__init__()
+                self.stem, self.d8, self.u, self.m = stem, d8, u, m
+
+            def forward(self, x):
+                d4 = self.stem(x)
+                d8 = self.d8(d4)
+                return self.m(d4 + F.interpolate(
+                    self.u(d8), size=d4.shape[-2:], mode="bilinear",
+                    align_corners=False))
+
+        self.det_stem = _DetStemED(base_stem, self.det_d8, self.det_u,
+                                   self.det_m)
+        # identity-start temporal fusion: zero the last BN of tfuse
+        last_bn = self.tfuse[-1][-2]
+        nn.init.zeros_(last_bn.weight)
+        nn.init.zeros_(last_bn.bias)
+
+
+class DepthSegIPMNetV24(DepthSegIPMNetV23):
+    """v24: task-routed temporal BEV.
+
+    Static tasks (BEV lanes, occupancy) read the RAW BEV — isolated from
+    warp noise and moving-object ghosts of the temporal fusion — while
+    motion tasks (3D det, agent forecast, E2E) keep the FUSED BEV where
+    velocity cues live. Protects the top-priority mIoU without giving up
+    the temporal gains."""
+
+    def lane_input(self):
+        return self._last_bev
+
+    def occ_input(self):
+        return self._last_bev
+
+
+class DepthSegIPMNetV25(DepthSegIPMNetV24):
+    """v25: BEV-geometry group on the RAW BEV (lanes + 3D boxes + occupancy
+    — BEV seg and 3D detection share geometry), motion group on the FUSED
+    BEV (E2E; agent forecasting via its own light stem keeps velocity)."""
+    def __init__(self, *a, **k):
+        super().__init__(*a, **k)
+        self.traj_stem = nn.Sequential(
+            nn.Conv2d(96, 128, 3, stride=2, padding=1, bias=False),
+            nn.BatchNorm2d(128), nn.ReLU(inplace=True), ConvBlock(128, 128))
+
+    def det_input(self):
+        return self._last_bev           # 3D det joins the BEV-geometry group
+
+    def traj_feat(self):
+        return self.traj_stem(self._fused_bev)
+
+
+class DepthSegIPMNetV26(DepthSegIPMNetV25):
+    """v26: + explicit stationary-flag supervision for detected agents.
+
+    A 1x1 conv on the (raw-BEV) detection stem predicts a per-cell
+    stationary logit; supervised with BCE at GT box centres where the
+    3 s future exists (label = |GT displacement@3s| < 0.5 m). Replaces the
+    threshold-on-forecast heuristic for parked/stopped colouring.
+    forward -> v25 outputs + (stat [B,1,400,250],)."""
+    def __init__(self, *a, **k):
+        super().__init__(*a, **k)
+        self.stat_head = nn.Conv2d(128, 1, 1)
+        nn.init.zeros_(self.stat_head.bias)
+
+    def forward(self, imgs, K, T_cam_ego, v0=None, prev_bev=None,
+                warp_theta=None):
+        out = super().forward(imgs, K, T_cam_ego, v0, prev_bev, warp_theta)
+        return out + (self.stat_head(self._det_feat),)
+
+    @staticmethod
+    def stat_loss(stat, boxes, nbox, traj, tvalid):
+        """BCE at GT centres; label = stationary (|d3s| < 0.5 m)."""
+        B = boxes.shape[0]
+        num = stat.sum() * 0.0
+        den = 0
+        for b in range(B):
+            for k in range(int(nbox[b])):
+                if boxes[b, k, 3] <= 0 or tvalid[b, k, 5] < 0.5:
+                    continue
+                ri = int((80.0 - float(boxes[b, k, 1])) / DET_RES)
+                ci = int((50.0 - float(boxes[b, k, 2])) / DET_RES)
+                if not (0 <= ri < DET_H and 0 <= ci < DET_W):
+                    continue
+                lbl = (traj[b, k, 5].norm() < 0.5).float()
+                num = num + F.binary_cross_entropy_with_logits(
+                    stat[b, 0, ri, ci].float().clamp(-15, 15), lbl)
+                den += 1
+        return num / max(den, 1)
+
+
 MODELS = {"v1": IPMSegNet, "v2": IPMSegNetV2, "v3s": IPMSegNetV3,
           "lss": LSSDepthNet, "v8": DepthGatedIPMNet, "v13": DepthSegIPMNet,
           "v13d": DepthSegIPMNetS4, "v14d": DepthSegIPMNetV14,
           "v15": DepthSegIPMNetV15, "v16": DepthSegIPMNetV16,
           "v17": DepthSegIPMNetV17, "v18": DepthSegIPMNetV18,
-          "v19": DepthSegIPMNetV19, "v20": DepthSegIPMNetV20}
+          "v19": DepthSegIPMNetV19, "v20": DepthSegIPMNetV20,
+          "v21": DepthSegIPMNetV21, "v22": DepthSegIPMNetV22,
+          "v23": DepthSegIPMNetV23, "v24": DepthSegIPMNetV24,
+          "v25": DepthSegIPMNetV25, "v26": DepthSegIPMNetV26}

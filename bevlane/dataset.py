@@ -22,7 +22,8 @@ class BevLaneDataset(Dataset):
                  with_seg2d=False, depth_hw=None, with_box=False,
                  with_boxdet=False, trim_start=0, trim_end=0,
                  min_cov_core=0.0, min_cov_fwd=0.0, seg2d_key="seg2d",
-                 with_bbox2d=False, with_ego=False, with_occ=False):
+                 with_bbox2d=False, with_ego=False, with_occ=False,
+                 with_agenttraj=False, with_temporal=False):
         self.root = root
         self.gt_key = gt_key
         self.dontcare_sidewalk = dontcare_sidewalk
@@ -32,6 +33,9 @@ class BevLaneDataset(Dataset):
         self.depth_hw = depth_hw     # (H,W): resize all depth to this (mixed-res safe)
         self.with_box = with_box
         self.with_boxdet = with_boxdet
+        self.with_agenttraj = with_agenttraj
+        self.with_temporal = with_temporal
+        self._byfi = {}
         self.with_bbox2d = with_bbox2d
         self.with_ego = with_ego
         self.with_occ = with_occ
@@ -68,6 +72,8 @@ class BevLaneDataset(Dataset):
                 frames = frames[:max_per_scene]
             for f in frames:
                 self.items.append((s, f))
+            if with_temporal:
+                self._byfi[s] = {fr["frame"]: fr for fr in m["frames"]}
 
     def __len__(self):
         return len(self.items)
@@ -153,6 +159,20 @@ class BevLaneDataset(Dataset):
             pad[:nb] = bp[:nb]
             out.append(torch.from_numpy(pad))
             out.append(torch.tensor(nb, dtype=torch.int64))
+        if self.with_agenttraj:
+            # boxes for the 3D det loss + per-instance future offsets
+            try:
+                z = np.load(os.path.join(self.root, s, f["agent_traj"]))
+                ab, an = z["boxes"], int(z["count"])
+                at, av = z["traj"], z["tvalid"]
+            except Exception:                 # not extracted yet
+                ab = np.zeros((64, 6), np.float32); an = 0
+                at = np.zeros((64, 6, 2), np.float32)
+                av = np.zeros((64, 6), np.float32)
+            out.append(torch.from_numpy(ab.astype(np.float32)))
+            out.append(torch.tensor(an, dtype=torch.int64))
+            out.append(torch.from_numpy(at.astype(np.float32)))
+            out.append(torch.from_numpy(av.astype(np.float32)))
         if self.with_bbox2d:
             K2 = 96
             try:
@@ -195,6 +215,42 @@ class BevLaneDataset(Dataset):
             except Exception:                 # not extracted yet -> all ignore
                 oc = np.full((16, 200, 200), 255, np.uint8)
             out.append(torch.from_numpy(oc.astype(np.int64)))
+        if self.with_temporal:
+            # previous frame (0.4 s back): images + relative 2D pose
+            pimgs = np.zeros((len(CAMS), 3, 432, 768), np.float32)
+            rel = np.zeros(3, np.float32)
+            pv = np.zeros(1, np.float32)
+            fp = self._byfi.get(s, {}).get(f["frame"] - 2)
+            if s not in self._ego_cache:
+                try:
+                    z = np.load(os.path.join(self.root, s, "ego_motion.npz"))
+                    self._ego_cache[s] = {k: z[k] for k in z.files}
+                except Exception:
+                    self._ego_cache[s] = None
+            z = self._ego_cache[s]
+            if fp is not None and z is not None and "pose" in z                     and f["frame"] < len(z["pose"]):
+                ok = True
+                tmp = []
+                for c in CAMS:
+                    im = cv2.imread(os.path.join(self.root, s,
+                                                 fp["imgs"].get(c, "_")))
+                    if im is None:
+                        ok = False
+                        break
+                    im = im[:, :, ::-1].astype(np.float32) / 255.0
+                    tmp.append(((im - MEAN) / STD).transpose(2, 0, 1))
+                pc_, pp_ = z["pose"][f["frame"]], z["pose"][fp["frame"]]
+                if ok and (abs(pc_).sum() > 0) and (abs(pp_).sum() > 0):
+                    pimgs = np.stack(tmp)
+                    dy = float(pc_[2] - pp_[2])
+                    cp, sp = np.cos(pp_[2]), np.sin(pp_[2])
+                    dx0, dy0 = pc_[0] - pp_[0], pc_[1] - pp_[1]
+                    rel[:] = (cp * dx0 + sp * dy0,
+                              -sp * dx0 + cp * dy0, dy)
+                    pv[0] = 1.0
+            out.append(torch.from_numpy(np.ascontiguousarray(pimgs)))
+            out.append(torch.from_numpy(rel))
+            out.append(torch.from_numpy(pv))
         # clone -> each tensor owns fresh, resizable storage (from_numpy storage
         # is not resizable, which breaks the shared-memory DataLoader collate)
         return tuple(t.clone() for t in out)

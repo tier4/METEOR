@@ -59,6 +59,8 @@ def convert_scene(scene):
              "--stride", "2", "--workers", "1"],
             [PY, "bevlane/extract_occ.py", "--scenes", scene,
              "--stride", "2", "--workers", "1"],
+            [PY, "bevlane/extract_agent_traj.py", "--scenes", scene,
+             "--stride", "2", "--workers", "1"],
         ]
         for st in stages:
             rc, out = run(st)

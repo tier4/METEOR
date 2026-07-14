@@ -21,7 +21,7 @@ torch.multiprocessing.set_sharing_strategy("file_system")
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from bevlane.dataset import BevLaneDataset  # noqa: E402
-from bevlane.model import MODELS, N_CLASSES  # noqa: E402
+from bevlane.model import MODELS, N_CLASSES, make_warp_theta  # noqa: E402
 
 CLASS_NAMES = ["unlabeled", "road", "sidewalk", "crosswalk", "laneline",
                "stopline", "road_edge", "marking", "parking"]
@@ -173,7 +173,21 @@ def evaluate_seg2d(model, loader, device, n_cls, max_batches=40):
 
 
 @torch.no_grad()
-def evaluate_ego(model, loader, device, ego_idx, max_batches=40):
+def _temporal_inputs(model, batch, device, tmp_idx):
+    if tmp_idx is None:
+        return None, None
+    pi = batch[tmp_idx].to(device, non_blocking=True)
+    rel = batch[tmp_idx + 1].to(device)
+    pv = batch[tmp_idx + 2].to(device)
+    K = batch[1].to(device)
+    Tc = batch[2].to(device)
+    with torch.no_grad():
+        pb = model.compute_bev(pi, K, Tc) * pv.view(-1, 1, 1, 1)
+    return pb, make_warp_theta(rel)
+
+
+def evaluate_ego(model, loader, device, ego_idx, max_batches=40,
+                 tmp_idx=None):
     """E2E head metrics: trajectory ADE/FDE [m], steer MAE [rad],
     accel MAE [m/s^2], brake accuracy. Valid frames only."""
     model.eval()
@@ -184,8 +198,10 @@ def evaluate_ego(model, loader, device, ego_idx, max_batches=40):
             break
         imgs, K, Tc = (t.to(device, non_blocking=True) for t in batch[:3])
         eg = batch[ego_idx].to(device, non_blocking=True)
+        pb, th = _temporal_inputs(model, batch, device, tmp_idx)
         with torch.autocast("cuda", torch.float16):
-            out = model(imgs, K, Tc, eg[:, 12])
+            out = model(imgs, K, Tc, eg[:, 12], pb, th) if th is not None \
+                else model(imgs, K, Tc, eg[:, 12])
         if not (isinstance(out, tuple) and len(out) >= 8):
             break
         p = out[7].float()
@@ -238,6 +254,133 @@ def evaluate_occ(model, loader, device, occ_idx, max_batches=25):
 
 
 @torch.no_grad()
+def evaluate_traj(model, loader, device, tj_idx, max_batches=40,
+                  tmp_idx=None):
+    _STAT = [0, 0]
+    """Agent-forecast ADE/FDE [m] sampled at GT box centres (valid wps)."""
+    model.eval()
+    n = ade = fde = nf = 0.0
+    for bi, batch in enumerate(loader):
+        if bi >= max_batches:
+            break
+        imgs, K, Tc = (t.to(device, non_blocking=True) for t in batch[:3])
+        bx = batch[tj_idx].to(device)
+        nb = batch[tj_idx + 1]
+        tj = batch[tj_idx + 2].to(device)
+        tv = batch[tj_idx + 3].to(device)
+        pb, th = _temporal_inputs(model, batch, device, tmp_idx)
+        with torch.autocast("cuda", torch.float16):
+            out = model(imgs, K, Tc, None, pb, th) if th is not None \
+                else model(imgs, K, Tc)
+        if not (isinstance(out, tuple) and len(out) >= 10):
+            break
+        tp = out[9].float()
+        stat = out[10].float() if len(out) >= 11 else None
+        for b in range(bx.shape[0]):
+            for k in range(int(nb[b])):
+                ri = int((80.0 - float(bx[b, k, 1])) / 0.4)
+                ci = int((50.0 - float(bx[b, k, 2])) / 0.4)
+                if not (0 <= ri < tp.shape[-2] and 0 <= ci < tp.shape[-1]):
+                    continue
+                p = tp[b, :, ri, ci].view(6, 2)
+                d = (p - tj[b, k]).norm(dim=1)
+                v = tv[b, k]
+                if v.sum() == 0:
+                    continue
+                ade += float((d * v).sum() / v.sum()); n += 1
+                if v[5] > 0:
+                    fde += float(d[5]); nf += 1
+                    if stat is not None:
+                        pred_s = float(stat[b, 0, ri, ci]) > 0
+                        gt_s = float(tj[b, k, 5].norm()) < 0.5
+                        _STAT[0] += int(pred_s == gt_s); _STAT[1] += 1
+    model.train()
+    if n == 0:
+        return None
+    r = {"ade": ade / n, "fde": fde / max(nf, 1)}
+    if _STAT[1]:
+        r["stat_acc"] = _STAT[0] / _STAT[1]
+    return r
+
+
+@torch.no_grad()
+def evaluate_det3d(model, loader, device, bx_idx, max_batches=30,
+                   tmp_idx=None, thresh=0.3, match_m=2.0):
+    """BEV 3D detection: per-class precision/recall (centre match <2 m) and
+    mean centre error on matched pairs."""
+    model.eval()
+    tp = [0, 0]
+    fp = [0, 0]
+    fn = [0, 0]
+    cerr = [0.0, 0.0]
+    yerr = [0.0, 0.0]
+    yflip = [0, 0]
+    tp50 = [0, 0]
+    fn50 = [0, 0]
+    tpn = [0, 0]
+    fnn = [0, 0]
+    for bi, batch in enumerate(loader):
+        if bi >= max_batches:
+            break
+        imgs, K, Tc = (t.to(device, non_blocking=True) for t in batch[:3])
+        bx = batch[bx_idx]
+        nb = batch[bx_idx + 1]
+        pb, th = _temporal_inputs(model, batch, device, tmp_idx)
+        with torch.autocast("cuda", torch.float16):
+            out = model(imgs, K, Tc, None, pb, th) if th is not None \
+                else model(imgs, K, Tc)
+        dets = model.decode_boxes(out[3].float(), out[4].float(),
+                                  thresh=thresh, topk=64)
+        for b in range(bx.shape[0]):
+            gt = [(0 if bx[b, k, 0] < 1.5 else 1,
+                   float(bx[b, k, 1]), float(bx[b, k, 2]),
+                   float(bx[b, k, 5]))
+                  for k in range(int(nb[b])) if bx[b, k, 3] > 0]
+            used = [False] * len(gt)
+            for cls, sc, xe, ye, l, w, yaw in sorted(dets[b],
+                                                     key=lambda d: -d[1]):
+                best, bd = -1, match_m
+                for gi, (gc, gx, gy, gyaw) in enumerate(gt):
+                    if used[gi] or gc != cls:
+                        continue
+                    d = ((gx - xe) ** 2 + (gy - ye) ** 2) ** 0.5
+                    if d < bd:
+                        best, bd = gi, d
+                if best >= 0:
+                    used[best] = True
+                    tp[cls] += 1
+                    cerr[cls] += bd
+                    dy = abs((yaw - gt[best][3] + np.pi) % (2 * np.pi) - np.pi)
+                    yflip[cls] += dy > np.pi / 2
+                    yerr[cls] += min(dy, np.pi - dy)   # axis error
+                    gx, gy = gt[best][1], gt[best][2]
+                    if gx * gx + gy * gy < 50.0 ** 2:
+                        tp50[cls] += 1
+                    if gx * gx + gy * gy < 30.0 ** 2 and abs(gy) < 12.0:
+                        tpn[cls] += 1
+                else:
+                    fp[cls] += 1
+            for gi, (gc, gx, gy, _) in enumerate(gt):
+                if not used[gi]:
+                    fn[gc] += 1
+                    if gx * gx + gy * gy < 50.0 ** 2:
+                        fn50[gc] += 1
+                    if gx * gx + gy * gy < 30.0 ** 2 and abs(gy) < 12.0:
+                        fnn[gc] += 1
+    model.train()
+    r = {}
+    for c, nm in ((0, "veh"), (1, "vru")):
+        p_ = tp[c] / max(tp[c] + fp[c], 1)
+        rc = tp[c] / max(tp[c] + fn[c], 1)
+        r[nm] = (p_, rc, cerr[c] / max(tp[c], 1))
+        r[nm + "_yaw"] = np.degrees(yerr[c] / max(tp[c], 1))
+        r[nm + "_flip"] = yflip[c] / max(tp[c], 1)
+        r[nm + "50"] = tp50[c] / max(tp50[c] + fn50[c], 1)
+        r[nm + "n"] = tpn[c] / max(tpn[c] + fnn[c], 1)
+    return r
+
+
+@torch.no_grad()
 def class_pr(model, loader, device, cls, max_batches=40):
     """Precision/recall + pred/GT area ratio for a class (labeled cells only)."""
     model.eval()
@@ -275,7 +418,7 @@ def main():
     ap.add_argument("--workers", type=int, default=6)
     ap.add_argument("--out", default="out/bevlane_ckpt")
     ap.add_argument("--limit-train", type=int, default=None)
-    ap.add_argument("--model", default="v1", choices=["v1", "v2", "v3s", "lss", "v8", "v13", "v13d", "v14d", "v15", "v16", "v17", "v18", "v19", "v20"])
+    ap.add_argument("--model", default="v1", choices=["v1", "v2", "v3s", "lss", "v8", "v13", "v13d", "v14d", "v15", "v16", "v17", "v18", "v19", "v20", "v21", "v22", "v23", "v24", "v25", "v26"])
     ap.add_argument("--depth-w", type=float, default=0.3)
     ap.add_argument("--seg2d-w", type=float, default=0.5)
     ap.add_argument("--seg2d-key", default="seg2d",
@@ -290,6 +433,8 @@ def main():
                     help="E2E ego head loss weight: traj/steer/accel/brake (v18)")
     ap.add_argument("--occ-w", type=float, default=0.0,
                     help="3D semantic occupancy loss weight (v20)")
+    ap.add_argument("--traj-w", type=float, default=0.0,
+                    help="agent trajectory forecast loss weight (v21)")
     ap.add_argument("--aug", action="store_true")
     ap.add_argument("--dice-w", type=float, default=0.0)
     ap.add_argument("--far-w", type=float, default=0.0,
@@ -333,25 +478,29 @@ def main():
         os.makedirs(args.out, exist_ok=True)
 
     train_s, val_s = split_scenes(args.root)
-    use_depth = args.model in ("lss", "v8", "v13", "v13d", "v14d", "v15", "v16", "v17", "v18", "v19", "v20") and args.depth_w > 0
-    use_seg2d = args.model in ("v13", "v13d", "v14d", "v15", "v16", "v17", "v18", "v19", "v20") and args.seg2d_w > 0
+    use_depth = args.model in ("lss", "v8", "v13", "v13d", "v14d", "v15", "v16", "v17", "v18", "v19", "v20", "v21", "v22", "v23", "v24", "v25", "v26") and args.depth_w > 0
+    use_seg2d = args.model in ("v13", "v13d", "v14d", "v15", "v16", "v17", "v18", "v19", "v20", "v21", "v22", "v23", "v24", "v25", "v26") and args.seg2d_w > 0
     use_box = args.model == "v15" and args.box_w > 0
-    use_boxdet = args.model in ("v16", "v17", "v18", "v19", "v20") and args.box_w > 0
-    use_bbox2d = args.model in ("v17", "v18", "v19", "v20") and args.bbox2d_w > 0
-    use_ego = args.model in ("v18", "v19", "v20") and args.ego_w > 0
-    use_occ = args.model == "v20" and args.occ_w > 0
+    use_boxdet = args.model in ("v16", "v17", "v18", "v19", "v20", "v21", "v22", "v23", "v24", "v25", "v26") and args.box_w > 0
+    use_bbox2d = args.model in ("v17", "v18", "v19", "v20", "v21", "v22", "v23", "v24", "v25", "v26") and args.bbox2d_w > 0
+    use_ego = args.model in ("v18", "v19", "v20", "v21", "v22", "v23", "v24", "v25", "v26") and args.ego_w > 0
+    use_occ = args.model in ("v20", "v21", "v22", "v23", "v24", "v25", "v26") and args.occ_w > 0
+    use_traj = args.model in ("v21", "v22", "v23", "v24", "v25", "v26") and args.traj_w > 0
+    use_temporal = args.model in ("v22", "v23", "v24", "v25", "v26")
     if args.train_list:                       # restrict train to a scene list
         keep = set(open(args.train_list).read().split())
         train_s = [s for s in train_s if s in keep]
     # v13d depth GT is stride-4 of 768 (108x192); resize any mixed-res depth
-    depth_hw = (108, 192) if args.model in ("v13d", "v14d", "v15", "v16", "v17", "v18", "v19", "v20") else None
+    depth_hw = (108, 192) if args.model in ("v13d", "v14d", "v15", "v16", "v17", "v18", "v19", "v20", "v21", "v22", "v23", "v24", "v25", "v26") else None
     tr = BevLaneDataset(args.root, train_s, gt_key=args.gt_key,
                         dontcare_sidewalk=args.dontcare_sidewalk,
                         with_depth=use_depth, augment=args.aug,
                         with_seg2d=use_seg2d, depth_hw=depth_hw,
-                        with_box=use_box, with_boxdet=use_boxdet,
+                        with_box=use_box,
+                        with_boxdet=use_boxdet and not use_traj,
+                        with_agenttraj=use_traj,
                         with_bbox2d=use_bbox2d, with_ego=use_ego,
-                        with_occ=use_occ,
+                        with_occ=use_occ, with_temporal=use_temporal,
                         trim_start=3, trim_end=args.trim_end,
                         min_cov_core=args.min_cov_core,
                         min_cov_fwd=args.min_cov_fwd,
@@ -365,7 +514,8 @@ def main():
                             dontcare_sidewalk=args.dontcare_sidewalk,
                             with_depth=False, with_seg2d=use_seg2d,
                             seg2d_key=args.seg2d_key, with_ego=use_ego,
-                            with_occ=use_occ,
+                            with_occ=use_occ, with_agenttraj=use_traj,
+                            with_temporal=use_temporal,
                             trim_start=3, trim_end=args.trim_end)
         print(f"train {len(tr)} samples / {len(train_s)} scenes; "
               f"val {len(va)} samples / {len(val_s)} scenes; "
@@ -387,7 +537,7 @@ def main():
                     drop_last=True, **dl_kw)
 
     mkw = {"n_seg": args.n_seg2d} \
-        if args.model in ("v13", "v13d", "v14d", "v15", "v16", "v17", "v18", "v19", "v20") else {}
+        if args.model in ("v13", "v13d", "v14d", "v15", "v16", "v17", "v18", "v19", "v20", "v21", "v22", "v23", "v24", "v25", "v26") else {}
     model = MODELS[args.model](**mkw).to(device)
     if args.init_ckpt:
         sd = torch.load(args.init_ckpt, map_location="cpu")["model"]
@@ -402,7 +552,7 @@ def main():
         model = torch.nn.parallel.DistributedDataParallel(
             model, device_ids=[local],
             find_unused_parameters=(args.seg_w == 0 or
-                                    (args.model in ("v13", "v13d", "v14d", "v15", "v16", "v17", "v18", "v19", "v20") and not use_seg2d)))
+                                    (args.model in ("v13", "v13d", "v14d", "v15", "v16", "v17", "v18", "v19", "v20", "v21", "v22", "v23", "v24", "v25", "v26") and not use_seg2d)))
     opt = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-4)
     total_steps = len(dl) * args.epochs
     sched = torch.optim.lr_scheduler.OneCycleLR(opt, max_lr=lr,
@@ -432,23 +582,51 @@ def main():
             bi += 1 if use_seg2d else 0
             box_gt = batch[bi] if use_box else None
             bi += 1 if use_box else 0
-            det_boxes = batch[bi] if use_boxdet else None
-            det_n = batch[bi + 1] if use_boxdet else None
-            bi += 2 if use_boxdet else 0
+            if use_traj:
+                det_boxes, det_n = batch[bi], batch[bi + 1]
+                traj_gt, tvalid_gt = batch[bi + 2], batch[bi + 3]
+                bi += 4
+            else:
+                det_boxes = batch[bi] if use_boxdet else None
+                det_n = batch[bi + 1] if use_boxdet else None
+                bi += 2 if use_boxdet else 0
+                traj_gt = tvalid_gt = None
             bb2d = batch[bi] if use_bbox2d else None
             nb2d = batch[bi + 1] if use_bbox2d else None
             bi += 2 if use_bbox2d else 0
             ego_gt = batch[bi] if use_ego else None
             bi += 1 if use_ego else 0
             occ_gt = batch[bi] if use_occ else None
+            bi += 1 if use_occ else 0
+            if use_temporal:
+                prev_imgs, rel_pose, prev_valid = (batch[bi], batch[bi + 1],
+                                                   batch[bi + 2])
+            else:
+                prev_imgs = rel_pose = prev_valid = None
+            if use_temporal:
+                # prev-frame BEV in its OWN autocast region: computing it
+                # inside the main region caches detached fp16 weight casts
+                # and silently cuts gradients to the whole backbone
+                net00 = model.module if ddp else model
+                with torch.no_grad(), torch.autocast("cuda", torch.float16):
+                    pb = net00.compute_bev(prev_imgs, K, Tc) \
+                        * prev_valid.view(-1, 1, 1, 1)
+                pb = pb.float()
+                theta = make_warp_theta(rel_pose)
             with torch.autocast("cuda", torch.float16):
                 # v18+ is conditioned on the current speed (ego_gt col 12)
-                out = model(imgs, K, Tc, ego_gt[:, 12]) if use_ego \
-                    else model(imgs, K, Tc)
+                if use_temporal:
+                    out = model(imgs, K, Tc,
+                                ego_gt[:, 12] if use_ego else None, pb, theta)
+                elif use_ego:
+                    out = model(imgs, K, Tc, ego_gt[:, 12])
+                else:
+                    out = model(imgs, K, Tc)
                 net0 = model.module if ddp else model
                 # robustly unpack: v15 -> 4-tuple, v13* -> 3, lss/v8 -> 2
                 logits, dlog, seg2d, boxl, hm, rg = out, None, None, None, None, None
                 hm2d, rg2d, ego_pred, occ_pred = None, None, None, None
+                traj_pred = None
                 if isinstance(out, tuple):
                     logits = out[0]
                     dlog = out[1] if len(out) > 1 else None
@@ -459,7 +637,8 @@ def main():
                             hm2d, rg2d = out[5], out[6]
                         if len(out) >= 8:        # v18+: E2E ego head
                             ego_pred = out[7]
-                        occ_pred = out[8] if len(out) == 9 else None
+                        occ_pred = out[8] if len(out) >= 9 else None
+                        traj_pred = out[9] if len(out) >= 10 else None
                     elif len(out) > 3:
                         boxl = out[3]
                 loss = 0.0
@@ -478,6 +657,12 @@ def main():
                 if hm is not None and use_boxdet:
                     loss = loss + args.box_w * net0.boxdet_loss(hm, rg, det_boxes,
                                                                 det_n)
+                if traj_pred is not None and use_traj:
+                    loss = loss + args.traj_w * net0.traj_loss(
+                        traj_pred, det_boxes, det_n, traj_gt, tvalid_gt)
+                    if len(out) >= 11:      # v26 stationary-flag head
+                        loss = loss + args.traj_w * net0.stat_loss(
+                            out[10], det_boxes, det_n, traj_gt, tvalid_gt)
                 if hm2d is not None and use_bbox2d:
                     loss = loss + args.bbox2d_w * net0.bbox2d_loss(
                         hm2d, rg2d, bb2d, nb2d)
@@ -535,15 +720,39 @@ def main():
                                      for c in key if c in s2), flush=True)
             if use_occ:
                 oc = evaluate_occ(net, dv, device,
-                                  4 + int(use_seg2d) + int(use_ego))
+                                  4 + int(use_seg2d) + 4 * int(use_traj)
+                                  + int(use_ego))
                 if oc:
                     onm = {0: "free", 2: "veh", 4: "ped", 5: "road",
                            7: "veg", 8: "bldg", 9: "pole"}
                     print(f"[valOCC ep{ep}] mIoU={np.mean(list(oc.values())):.3f} "
                           + " ".join(f"{onm[c]}={oc[c]:.3f}"
                                      for c in onm if c in oc), flush=True)
+            vtmp = (4 + int(use_seg2d) + 4 * int(use_traj) + int(use_ego)
+                    + int(use_occ)) if use_temporal else None
+            if use_traj and use_boxdet:
+                d3 = evaluate_det3d(net, dv, device, 4 + int(use_seg2d),
+                                    tmp_idx=vtmp)
+                print(f"[val3D ep{ep}] "
+                      f"veh P={d3['veh'][0]:.2f} R={d3['veh'][1]:.2f} "
+                      f"R50={d3['veh50']:.2f} Rn={d3['vehn']:.2f} "
+                      f"err={d3['veh'][2]:.2f}m "
+                      f"yaw={d3['veh_yaw']:.1f}deg flip={d3['veh_flip']:.2f} | "
+                      f"vru P={d3['vru'][0]:.2f} R={d3['vru'][1]:.2f} "
+                      f"R50={d3['vru50']:.2f} Rn={d3['vrun']:.2f} "
+                      f"err={d3['vru'][2]:.2f}m", flush=True)
+            if use_traj:
+                tj = evaluate_traj(net, dv, device, 4 + int(use_seg2d),
+                                   tmp_idx=vtmp)
+                if tj:
+                    ss = (f" statAcc={tj['stat_acc']:.2f}"
+                          if "stat_acc" in tj else "")
+                    print(f"[valTraj ep{ep}] agentADE={tj['ade']:.2f}m "
+                          f"agentFDE={tj['fde']:.2f}m" + ss, flush=True)
             if use_ego:
-                eg = evaluate_ego(net, dv, device, 4 + int(use_seg2d))
+                eg = evaluate_ego(net, dv, device,
+                                  4 + int(use_seg2d) + 4 * int(use_traj),
+                                  tmp_idx=vtmp)
                 if eg:
                     print(f"[valE2E ep{ep}] ADE={eg['ade']:.2f}m "
                           f"ADEc={eg['ade_c']:.2f}m "
@@ -552,8 +761,13 @@ def main():
                           flush=True)
             torch.save({"model": net.state_dict(), "epoch": ep, "ious": ious},
                        os.path.join(args.out, "last.pt"))
-            if miou > best:
-                best = miou
+            # composite best: BEV mIoU minus a small penalty for E2E curve
+            # error, so "best" never selects a pre-curve-convergence epoch
+            score = miou
+            if use_ego and eg and eg.get("ade_c") == eg.get("ade_c"):
+                score = miou - 0.01 * min(eg["ade_c"], 5.0)
+            if score > best:
+                best = score
                 torch.save({"model": net.state_dict(), "epoch": ep, "ious": ious},
                            os.path.join(args.out, "best.pt"))
         if ddp:

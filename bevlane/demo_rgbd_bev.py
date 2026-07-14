@@ -24,11 +24,15 @@ from bevlane.dataset import CAMS, BevLaneDataset  # noqa: E402
 from bevlane.extract_bbox2d import DET10_PAL  # noqa: E402
 from bevlane.demo_occ_gt import iso_render  # noqa: E402
 from bevlane.extract_occ import OCC_PAL  # noqa: E402
+from bevlane.model import make_warp_theta  # noqa: E402
 from bevlane.model import (DepthGatedIPMNet, DepthSegIPMNet,  # noqa: E402
                            DepthSegIPMNetS4, DepthSegIPMNetV14,
                            DepthSegIPMNetV15, DepthSegIPMNetV16,
                            DepthSegIPMNetV17, DepthSegIPMNetV18,
-                           DepthSegIPMNetV19, DepthSegIPMNetV20)
+                           DepthSegIPMNetV19, DepthSegIPMNetV20,
+                           DepthSegIPMNetV21, DepthSegIPMNetV22,
+                           DepthSegIPMNetV23, DepthSegIPMNetV25,
+                           DepthSegIPMNetV26)
 
 DET10_ABBR = ["obs", "car", "trk", "bus", "bcy", "mcy", "ped", "pnt", "tl", "ts"]
 
@@ -203,6 +207,9 @@ def label(img, txt, color=(255, 255, 255)):
     cv2.putText(img, txt, (6, 20), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1, cv2.LINE_AA)
 
 
+_BEVQ = {}
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--ckpt", default="out/bevlane_ckpt_v12/best.pt")
@@ -210,7 +217,7 @@ def main():
     ap.add_argument("--out", default="out/demo_rgbd_bev.mp4")
     ap.add_argument("--fps", type=int, default=15)
     ap.add_argument("--no-thin", action="store_true")
-    ap.add_argument("--model", default="v8", choices=["v8", "v13", "v13d", "v14d", "v15", "v16", "v17", "v18", "v19", "v20"],
+    ap.add_argument("--model", default="v8", choices=["v8", "v13", "v13d", "v14d", "v15", "v16", "v17", "v18", "v19", "v20", "v21", "v22", "v23", "v24", "v25", "v26"],
                     help="v8=DepthGatedIPMNet(512) / v13=DepthSegIPMNet(768) / v13d=stride-4 depth")
     ap.add_argument("--show-seg2d", action="store_true",
                     help="alpha-blend predicted 2D seg over RGB panels")
@@ -230,9 +237,14 @@ def main():
             "v17": DepthSegIPMNetV17,
             "v18": DepthSegIPMNetV18,
             "v19": DepthSegIPMNetV19,
-            "v20": DepthSegIPMNetV20}.get(args.model, DepthGatedIPMNet)
+            "v20": DepthSegIPMNetV20,
+            "v21": DepthSegIPMNetV21,
+            "v22": DepthSegIPMNetV22,
+            "v23": DepthSegIPMNetV23,
+            "v25": DepthSegIPMNetV25,
+            "v26": DepthSegIPMNetV26}.get(args.model, DepthGatedIPMNet)
     mkw = {"n_seg": args.n_seg2d} if args.model in (
-        "v13", "v13d", "v14d", "v15", "v16", "v17", "v18", "v19", "v20") else {}
+        "v13", "v13d", "v14d", "v15", "v16", "v17", "v18", "v19", "v20", "v21", "v22", "v23", "v25", "v26") else {}
     m = mcls(**mkw).cuda().eval()
     if args.n_seg2d == 21:      # csv taxonomy: Cityscapes-like colours (BGR)
         from bevlane.extract_seg2d import SEG21_PAL
@@ -240,7 +252,7 @@ def main():
         SEG2D_PAL[:21] = SEG21_PAL[:, ::-1]
     m.load_state_dict(torch.load(args.ckpt, map_location="cpu")["model"])
     dbins = torch.arange(m.D) * m.D_STEP + m.D_MIN
-    infer_hw = args.infer_hw or ("none" if args.model in ("v13", "v13d", "v14d", "v15", "v16", "v17", "v18", "v19", "v20") else "288x512")
+    infer_hw = args.infer_hw or ("none" if args.model in ("v13", "v13d", "v14d", "v15", "v16", "v17", "v18", "v19", "v20", "v21", "v22", "v23", "v25", "v26") else "288x512")
     ih, iw = (None, None) if infer_hw == "none" else \
         (int(infer_hw.split("x")[0]), int(infer_hw.split("x")[1]))
 
@@ -275,17 +287,51 @@ def main():
                 imgs_m = imgs
             s_pre, f_pre = ds.items[i]
             v0_t = None
-            if args.model in ("v18", "v19", "v20"):  # speed conditioning from GT
+            if args.model in ("v18", "v19", "v20", "v21", "v22", "v23", "v25", "v26"):  # v0
                 try:
                     z = np.load(os.path.join("out/bevlane", s_pre,
                                              "ego_motion.npz"))
                     v0_t = torch.tensor([float(z["v0"][f_pre["frame"]])])
                 except Exception:
                     v0_t = torch.zeros(1)
+            pb = th = None
+            if args.model in ("v22", "v23", "v25", "v26"):
+                fi_cur = f_pre["frame"]
+                if _BEVQ.get("scene") != s_pre:
+                    _BEVQ.clear(); _BEVQ["scene"] = s_pre
+                prev = _BEVQ.get(fi_cur - 2)
+                try:
+                    zp = np.load(os.path.join("out/bevlane", s_pre,
+                                              "ego_motion.npz"))["pose"]
+                    pc_, pp_ = zp[fi_cur], zp[fi_cur - 2]
+                    if prev is not None and abs(pc_).sum() > 0 \
+                            and abs(pp_).sum() > 0:
+                        dy = float(pc_[2] - pp_[2])
+                        cp, sp = np.cos(pp_[2]), np.sin(pp_[2])
+                        rel = torch.tensor([[cp * (pc_[0] - pp_[0])
+                                             + sp * (pc_[1] - pp_[1]),
+                                             -sp * (pc_[0] - pp_[0])
+                                             + cp * (pc_[1] - pp_[1]), dy]],
+                                           dtype=torch.float32).cuda()
+                        pb, th = prev, make_warp_theta(rel)
+                except Exception:
+                    pass
             with torch.no_grad(), torch.autocast("cuda", torch.float16):
-                out = (m(imgs_m[None].cuda(), K[None].cuda(), T[None].cuda(),
-                         v0_t.cuda()) if v0_t is not None else
-                       m(imgs_m[None].cuda(), K[None].cuda(), T[None].cuda()))
+                if args.model in ("v22", "v23", "v25", "v26"):
+                    out = m(imgs_m[None].cuda(), K[None].cuda(),
+                            T[None].cuda(),
+                            v0_t.cuda() if v0_t is not None else None, pb, th)
+                    _BEVQ[f_pre["frame"]] = m._last_bev.detach().float()
+                    for kk in [k for k in _BEVQ
+                               if isinstance(k, int)
+                               and k < f_pre["frame"] - 2]:
+                        _BEVQ.pop(kk)
+                else:
+                    out = (m(imgs_m[None].cuda(), K[None].cuda(),
+                             T[None].cuda(), v0_t.cuda())
+                           if v0_t is not None else
+                           m(imgs_m[None].cuda(), K[None].cuda(),
+                             T[None].cuda()))
             seg, dlog = out[0], out[1]        # v13 returns (seg, depth, seg2d)
             pred = seg.argmax(1)[0].cpu().numpy().astype(np.uint8)
             if not args.no_thin:
@@ -298,13 +344,17 @@ def main():
             if args.show_seg2d and isinstance(out, tuple) and len(out) > 2:
                 seg2d_pred = out[2].argmax(2)[0].cpu().numpy().astype(np.uint8)
             det_boxes = None
-            if args.model in ("v16", "v17", "v18", "v19", "v20") and len(out) > 4:
+            if args.model in ("v16", "v17", "v18", "v19", "v20", "v21", "v22", "v23", "v25", "v26") and len(out) > 4:
                 det_boxes = m.decode_boxes(out[3].float(), out[4].float(),
                                            thresh=0.25, topk=64)[0]
             ego_pred = out[7][0].float().cpu().numpy() \
-                if args.model in ("v18", "v19", "v20") and len(out) >= 8 else None
+                if args.model in ("v18", "v19", "v20", "v21", "v22", "v23", "v25", "v26") and len(out) >= 8 else None
+            traj_map = out[9][0].float().cpu() \
+                if args.model in ("v21", "v22", "v23", "v25", "v26") and len(out) >= 10 else None
+            stat_map = out[10][0, 0].float().cpu() \
+                if args.model == "v26" and len(out) >= 11 else None
             occ_pred = None
-            if args.model == "v20" and len(out) == 9:
+            if args.model in ("v20", "v21", "v22", "v23", "v25", "v26") and len(out) >= 9:
                 op = out[8][0].float().softmax(0)      # [C,Z,H,W]
                 conf = 1.0 - op[0]                      # P(occupied)
                 cls = (op[1:].argmax(0) + 1).to(torch.uint8)
@@ -317,7 +367,7 @@ def main():
                                        torch.zeros_like(cls)) \
                     .cpu().numpy().astype(np.uint8)
             boxes2d = None
-            if args.model in ("v17", "v18", "v19", "v20") and len(out) >= 7:
+            if args.model in ("v17", "v18", "v19", "v20", "v21", "v22", "v23", "v25", "v26") and len(out) >= 7:
                 if isinstance(out[5], (list, tuple)):   # v19 multi-scale
                     boxes2d = m.decode_boxes2d_ms(
                         [t[0].float() for t in out[5]],
@@ -399,7 +449,23 @@ def main():
                         px_ = xe + lx*cb - wy*sb
                         py_ = ye + lx*sb + wy*cb
                         cor.append([int((25.0 - py_) * sx2), int((60.0 - px_) * sy2)])
-                    col = (0, 215, 255) if cls == 0 else (255, 0, 255)
+                    # v26: learned stationary flag; fallback: forecast<1m/3s
+                    stationary = False
+                    rr0 = int((80.0 - xe) / 0.4)
+                    cc0 = int((50.0 - ye) / 0.4)
+                    if stat_map is not None:
+                        if 0 <= rr0 < stat_map.shape[-2] \
+                                and 0 <= cc0 < stat_map.shape[-1]:
+                            stationary = float(stat_map[rr0, cc0]) > 0
+                    elif traj_map is not None:
+                        if 0 <= rr0 < traj_map.shape[-2] \
+                                and 0 <= cc0 < traj_map.shape[-1]:
+                            w6 = traj_map[:, rr0, cc0].view(6, 2)
+                            stationary = float(w6[5].norm()) < 1.0
+                    if stationary:
+                        col = (160, 160, 160)          # parked / stopped
+                    else:
+                        col = (0, 215, 255) if cls == 0 else (255, 0, 255)
                     cv2.polylines(bev, [np.array(cor, np.int32).reshape(-1, 1, 2)],
                                   True, col, 2)
                     # heading tick from centre to front edge
@@ -407,6 +473,25 @@ def main():
                     fxp = int((25.0 - (ye + (l/2)*sb)) * sx2)
                     fyp = int((60.0 - (xe + (l/2)*cb)) * sy2)
                     cv2.line(bev, (cxp, cyp), (fxp, fyp), col, 2)
+                    if traj_map is not None:      # predicted 3 s agent future
+                        rr = int((80.0 - xe) / 0.4)
+                        cc2 = int((50.0 - ye) / 0.4)
+                        if 0 <= rr < traj_map.shape[-2] \
+                                and 0 <= cc2 < traj_map.shape[-1]:
+                            wps = traj_map[:, rr, cc2].view(6, 2).numpy()
+                            pts = [(cxp, cyp)]
+                            for dx, dy in wps:
+                                fx, fy = xe + dx, ye + dy
+                                if abs(fx) > 60 or abs(fy) > 25:
+                                    break
+                                pts.append((int((25.0 - fy) * sx2),
+                                            int((60.0 - fx) * sy2)))
+                            if len(pts) > 1:
+                                cv2.polylines(
+                                    bev,
+                                    [np.array(pts, np.int32).reshape(-1, 1, 2)],
+                                    False, col, 1, cv2.LINE_AA)
+                                cv2.circle(bev, pts[-1], 3, col, -1)
             if ego_pred is not None:            # E2E: trajectory + controls
                 sy2 = BH2 / 120.0
                 sx2 = BW2 / 50.0
@@ -441,8 +526,11 @@ def main():
                                 cv2.FONT_HERSHEY_SIMPLEX, 0.52,
                                 (0, 80, 255) if "BRAKE" in txt else (0, 255, 0),
                                 1, cv2.LINE_AA)
+            cv2.putText(bev, "gray box = stationary",
+                        (6, 44), cv2.FONT_HERSHEY_SIMPLEX, 0.42,
+                        (170, 170, 170), 1, cv2.LINE_AA)
             cv2.putText(bev, "pred BEV+bbox+E2E +-25x+-60m"
-                        if args.model in ("v18", "v19", "v20") else
+                        if args.model in ("v18", "v19", "v20", "v21", "v22", "v23", "v25", "v26") else
                         ("pred BEV+bbox +-25x+-60m" if args.model in ("v15", "v16", "v17")
                          else "pred BEV +-25x+-60m"), (6, 24),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 255), 2, cv2.LINE_AA)

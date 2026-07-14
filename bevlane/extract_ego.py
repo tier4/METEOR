@@ -115,8 +115,19 @@ def process_scene(args):
             wp[fj, :, 0] = c * dx + sn * dy          # fwd
             wp[fj, :, 1] = -sn * dx + c * dy         # left
             vd[fj] = 1.0
+        # global 2D pose per frame (x, y, yaw) for temporal BEV warping
+        gp = np.zeros((F, 3), np.float32)
+        for fr2 in man["frames"]:
+            fj2 = fr2["frame"]
+            s2 = strided[fj2]
+            ri2 = tok2raw.get(s2["token"])
+            if ri2 is None or ri2 not in pose_idx:
+                continue
+            i2 = pose_idx[ri2]
+            gp[fj2] = (x[i2], y[i2], yaw[i2])
         np.savez_compressed(os.path.join(out_dir, "ego_motion.npz"),
-                            wp=wp, v0=v0, acc=ac, steer=st, brake=br, valid=vd)
+                            wp=wp, v0=v0, acc=ac, steer=st, brake=br, valid=vd,
+                            pose=gp)
         man["ego_motion"] = "ego_motion.npz"
         json.dump(man, open(mf, "w"))
         return f"[ok] {scene} valid={int(vd.sum())}/{F}"

@@ -126,6 +126,35 @@ def main():
                         col = (0, 215, 255) if cls < 1.5 else (255, 0, 255)
                         cv2.polylines(bev, [np.array(cor, np.int32).reshape(-1, 1, 2)],
                                       True, col, 2)
+                # ---- agent trajectory GT (future 3 s per box) ----
+                atp = f"{root}/" + f.get("agent_traj", "_")
+                if os.path.exists(atp):
+                    try:
+                        z2 = np.load(atp)
+                        for k in range(int(z2["count"])):
+                            cls, xe, ye = z2["boxes"][k][:3]
+                            if abs(xe) > 60 or abs(ye) > 25:
+                                continue
+                            pts = [(int((25 - ye) * sx2),
+                                    int((60 - xe) * sy2))]
+                            for h in range(6):
+                                if z2["tvalid"][k, h] < 0.5:
+                                    break
+                                fx = xe + z2["traj"][k, h, 0]
+                                fy = ye + z2["traj"][k, h, 1]
+                                if abs(fx) > 60 or abs(fy) > 25:
+                                    break
+                                pts.append((int((25 - fy) * sx2),
+                                            int((60 - fx) * sy2)))
+                            if len(pts) > 1:
+                                col = (255, 255, 0) if cls < 1.5                                     else (255, 0, 255)
+                                cv2.polylines(
+                                    bev,
+                                    [np.array(pts, np.int32).reshape(-1, 1, 2)],
+                                    False, col, 1, cv2.LINE_AA)
+                                cv2.circle(bev, pts[-1], 3, col, -1)
+                    except Exception:
+                        pass
                 # ---- E2E GT ----
                 if ego is not None and fi < len(ego["v0"]) \
                         and ego["valid"][fi] == 0:
@@ -153,7 +182,7 @@ def main():
                                     cv2.FONT_HERSHEY_SIMPLEX, 0.52,
                                     (0, 80, 255) if txt == "BRAKE" else (0, 255, 0),
                                     1, cv2.LINE_AA)
-                cv2.putText(bev, "GT BEV + 3D box + E2E traj", (6, 24),
+                cv2.putText(bev, "GT BEV + 3D box + agent traj + E2E", (6, 24),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 255), 2,
                             cv2.LINE_AA)
                 frame[40:40 + BH2, VW - BW2 - 8:VW - 8] = bev

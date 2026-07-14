@@ -83,7 +83,8 @@ def box_corners_ego(tr, size, rot, te, Re):
     return (pm - np.asarray(te)) @ Re          # Re passed as Re^T-ready
 
 
-def visible_in_any_cam(corners_ego, cls, frame, cams, ann2d_by_sd, sd_size):
+def visible_in_any_cam(corners_ego, cls, frame, cams, ann2d_by_sd, sd_size,
+                       thresh=0.3):
     """Project the box into each camera; visible iff a same-class 2D ann box
     overlaps the projection (2D segmentation sees the object)."""
     for ch, (K, T_cam_ego) in cams.items():
@@ -115,7 +116,7 @@ def visible_in_any_cam(corners_ego, cls, frame, cams, ann2d_by_sd, sd_size):
             iy = max(0, min(y2, ay2) - max(y1, ay1))
             inter = ix * iy
             aa = max((ax2 - ax1) * (ay2 - ay1), 1e-3)
-            if inter / min(pa, aa) > 0.3:
+            if inter / min(pa, aa) > thresh:
                 return True
     return False
 
