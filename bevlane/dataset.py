@@ -23,7 +23,8 @@ class BevLaneDataset(Dataset):
                  with_boxdet=False, trim_start=0, trim_end=0,
                  min_cov_core=0.0, min_cov_fwd=0.0, seg2d_key="seg2d",
                  with_bbox2d=False, with_ego=False, with_occ=False,
-                 with_agenttraj=False, with_temporal=False, with_tl=False):
+                 with_agenttraj=False, with_temporal=False, with_tl=False,
+                 with_risk=False):
         self.root = root
         self.gt_key = gt_key
         self.dontcare_sidewalk = dontcare_sidewalk
@@ -40,6 +41,7 @@ class BevLaneDataset(Dataset):
         self.with_ego = with_ego
         self.with_occ = with_occ
         self.with_tl = with_tl
+        self.with_risk = with_risk
         self._tl_cache = {}
         self._ego_cache = {}
         self.augment = augment
@@ -231,6 +233,18 @@ class BevLaneDataset(Dataset):
             if z is not None and fi < len(z):
                 t = int(z[fi])
             out.append(torch.tensor(t, dtype=torch.int64))
+        if self.with_risk:
+            # [400,250] float32 risk in [0,1]; all -1 when not extracted yet
+            r = np.full((400, 250), -1.0, np.float32)
+            try:
+                z = np.load(os.path.join(self.root, s, "risk_map.npz"))
+                arr = z["risk"]
+                fi = f["frame"]
+                if fi < len(arr):
+                    r = arr[fi].astype(np.float32) / 255.0
+            except Exception:
+                pass
+            out.append(torch.from_numpy(r))
         if self.with_temporal:
             # previous frame (0.4 s back): images + relative 2D pose
             pimgs = np.zeros((len(CAMS), 3, 432, 768), np.float32)

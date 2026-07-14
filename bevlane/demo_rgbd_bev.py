@@ -32,7 +32,8 @@ from bevlane.model import (DepthGatedIPMNet, DepthSegIPMNet,  # noqa: E402
                            DepthSegIPMNetV19, DepthSegIPMNetV20,
                            DepthSegIPMNetV21, DepthSegIPMNetV22,
                            DepthSegIPMNetV23, DepthSegIPMNetV25,
-                           DepthSegIPMNetV26, DepthSegIPMNetV27)
+                           DepthSegIPMNetV26, DepthSegIPMNetV27,
+                           DepthSegIPMNetV28)
 
 DET10_ABBR = ["obs", "car", "trk", "bus", "bcy", "mcy", "ped", "pnt", "tl", "ts"]
 
@@ -217,7 +218,7 @@ def main():
     ap.add_argument("--out", default="out/demo_rgbd_bev.mp4")
     ap.add_argument("--fps", type=int, default=15)
     ap.add_argument("--no-thin", action="store_true")
-    ap.add_argument("--model", default="v8", choices=["v8", "v13", "v13d", "v14d", "v15", "v16", "v17", "v18", "v19", "v20", "v21", "v22", "v23", "v24", "v25", "v26", "v27"],
+    ap.add_argument("--model", default="v8", choices=["v8", "v13", "v13d", "v14d", "v15", "v16", "v17", "v18", "v19", "v20", "v21", "v22", "v23", "v24", "v25", "v26", "v27", "v28"],
                     help="v8=DepthGatedIPMNet(512) / v13=DepthSegIPMNet(768) / v13d=stride-4 depth")
     ap.add_argument("--show-seg2d", action="store_true",
                     help="alpha-blend predicted 2D seg over RGB panels")
@@ -243,9 +244,10 @@ def main():
             "v23": DepthSegIPMNetV23,
             "v25": DepthSegIPMNetV25,
             "v26": DepthSegIPMNetV26,
-            "v27": DepthSegIPMNetV27}.get(args.model, DepthGatedIPMNet)
+            "v27": DepthSegIPMNetV27,
+            "v28": DepthSegIPMNetV28}.get(args.model, DepthGatedIPMNet)
     mkw = {"n_seg": args.n_seg2d} if args.model in (
-        "v13", "v13d", "v14d", "v15", "v16", "v17", "v18", "v19", "v20", "v21", "v22", "v23", "v25", "v26", "v27") else {}
+        "v13", "v13d", "v14d", "v15", "v16", "v17", "v18", "v19", "v20", "v21", "v22", "v23", "v25", "v26", "v27", "v28") else {}
     m = mcls(**mkw).cuda().eval()
     if args.n_seg2d == 21:      # csv taxonomy: Cityscapes-like colours (BGR)
         from bevlane.extract_seg2d import SEG21_PAL
@@ -253,7 +255,7 @@ def main():
         SEG2D_PAL[:21] = SEG21_PAL[:, ::-1]
     m.load_state_dict(torch.load(args.ckpt, map_location="cpu")["model"])
     dbins = torch.arange(m.D) * m.D_STEP + m.D_MIN
-    infer_hw = args.infer_hw or ("none" if args.model in ("v13", "v13d", "v14d", "v15", "v16", "v17", "v18", "v19", "v20", "v21", "v22", "v23", "v25", "v26", "v27") else "288x512")
+    infer_hw = args.infer_hw or ("none" if args.model in ("v13", "v13d", "v14d", "v15", "v16", "v17", "v18", "v19", "v20", "v21", "v22", "v23", "v25", "v26", "v27", "v28") else "288x512")
     ih, iw = (None, None) if infer_hw == "none" else \
         (int(infer_hw.split("x")[0]), int(infer_hw.split("x")[1]))
 
@@ -288,7 +290,7 @@ def main():
                 imgs_m = imgs
             s_pre, f_pre = ds.items[i]
             v0_t = None
-            if args.model in ("v18", "v19", "v20", "v21", "v22", "v23", "v25", "v26", "v27"):  # v0
+            if args.model in ("v18", "v19", "v20", "v21", "v22", "v23", "v25", "v26", "v27", "v28"):  # v0
                 try:
                     z = np.load(os.path.join("out/bevlane", s_pre,
                                              "ego_motion.npz"))
@@ -296,7 +298,7 @@ def main():
                 except Exception:
                     v0_t = torch.zeros(1)
             pb = th = None
-            if args.model in ("v22", "v23", "v25", "v26", "v27"):
+            if args.model in ("v22", "v23", "v25", "v26", "v27", "v28"):
                 fi_cur = f_pre["frame"]
                 if _BEVQ.get("scene") != s_pre:
                     _BEVQ.clear(); _BEVQ["scene"] = s_pre
@@ -318,7 +320,7 @@ def main():
                 except Exception:
                     pass
             with torch.no_grad(), torch.autocast("cuda", torch.float16):
-                if args.model in ("v22", "v23", "v25", "v26", "v27"):
+                if args.model in ("v22", "v23", "v25", "v26", "v27", "v28"):
                     out = m(imgs_m[None].cuda(), K[None].cuda(),
                             T[None].cuda(),
                             v0_t.cuda() if v0_t is not None else None, pb, th)
@@ -345,22 +347,24 @@ def main():
             if args.show_seg2d and isinstance(out, tuple) and len(out) > 2:
                 seg2d_pred = out[2].argmax(2)[0].cpu().numpy().astype(np.uint8)
             det_boxes = None
-            if args.model in ("v16", "v17", "v18", "v19", "v20", "v21", "v22", "v23", "v25", "v26", "v27") and len(out) > 4:
+            if args.model in ("v16", "v17", "v18", "v19", "v20", "v21", "v22", "v23", "v25", "v26", "v27", "v28") and len(out) > 4:
                 det_boxes = [d for d in m.decode_boxes(
                     out[3].float(), out[4].float(), thresh=0.25, topk=64)[0]
                     if d[1] > (0.45 if d[0] == 0 else 0.25)]
             ego_pred = out[7][0].float().cpu().numpy() \
-                if args.model in ("v18", "v19", "v20", "v21", "v22", "v23", "v25", "v26", "v27") and len(out) >= 8 else None
+                if args.model in ("v18", "v19", "v20", "v21", "v22", "v23", "v25", "v26", "v27", "v28") and len(out) >= 8 else None
             traj_map = out[9][0].float().cpu() \
-                if args.model in ("v21", "v22", "v23", "v25", "v26", "v27") and len(out) >= 10 else None
+                if args.model in ("v21", "v22", "v23", "v25", "v26", "v27", "v28") and len(out) >= 10 else None
             stat_map = out[10][0, 0].float().cpu() \
-                if args.model in ("v26", "v27") and len(out) >= 11 else None
+                if args.model in ("v26", "v27", "v28") and len(out) >= 11 else None
+            risk_map = out[12][0, 0].float().sigmoid().cpu().numpy() \
+                if args.model == "v28" and len(out) >= 13 else None
             tl_state = None
-            if args.model == "v27" and len(out) >= 12:
+            if args.model in ("v27", "v28") and len(out) >= 12:
                 p_tl = out[11][0].float().softmax(0)
                 tl_state = (int(p_tl.argmax()), float(p_tl.max()))
             occ_pred = None
-            if args.model in ("v20", "v21", "v22", "v23", "v25", "v26", "v27") and len(out) >= 9:
+            if args.model in ("v20", "v21", "v22", "v23", "v25", "v26", "v27", "v28") and len(out) >= 9:
                 op = out[8][0].float().softmax(0)      # [C,Z,H,W]
                 conf = 1.0 - op[0]                      # P(occupied)
                 cls = (op[1:].argmax(0) + 1).to(torch.uint8)
@@ -373,7 +377,7 @@ def main():
                                        torch.zeros_like(cls)) \
                     .cpu().numpy().astype(np.uint8)
             boxes2d = None
-            if args.model in ("v17", "v18", "v19", "v20", "v21", "v22", "v23", "v25", "v26", "v27") and len(out) >= 7:
+            if args.model in ("v17", "v18", "v19", "v20", "v21", "v22", "v23", "v25", "v26", "v27", "v28") and len(out) >= 7:
                 if isinstance(out[5], (list, tuple)):   # v19 multi-scale
                     boxes2d = m.decode_boxes2d_ms(
                         [t[0].float() for t in out[5]],
@@ -443,6 +447,18 @@ def main():
             BW2 = int(BH2 * pc.shape[1] / pc.shape[0])       # keep aspect
             bev = draw_ego_and_grid(DEMO_PALETTE[pc][:, :, ::-1], BH2, BW2,
                                     xh_m=60.0, yh_m=25.0)
+            if risk_map is not None:
+                # overlay predicted risk (+-40 x +-25 m) on the BEV panel
+                rm = cv2.resize(risk_map, (BW2, int(BH2 * 80.0 / 120.0)),
+                                interpolation=cv2.INTER_LINEAR)
+                y0r = int(BH2 * (60.0 - 40.0) / 120.0)
+                sub = bev[y0r:y0r + rm.shape[0]]
+                heat = cv2.applyColorMap((np.clip(rm, 0, 1) * 255
+                                          ).astype(np.uint8),
+                                         cv2.COLORMAP_TURBO)
+                a = (np.clip(rm, 0, 1) * 0.55)[..., None]
+                bev[y0r:y0r + rm.shape[0]] = (sub * (1 - a) + heat * a
+                                              ).astype(np.uint8)
             if det_boxes:
                 sy2 = BH2 / 120.0            # px per metre (2*60m vertical)
                 sx2 = BW2 / 50.0             # px per metre (2*25m lateral)
@@ -545,7 +561,7 @@ def main():
                             (BW2 - 136, 46), cv2.FONT_HERSHEY_SIMPLEX,
                             0.5, tcl[ti], 2 if ti else 1, cv2.LINE_AA)
             cv2.putText(bev, "pred BEV+bbox+E2E +-25x+-60m"
-                        if args.model in ("v18", "v19", "v20", "v21", "v22", "v23", "v25", "v26", "v27") else
+                        if args.model in ("v18", "v19", "v20", "v21", "v22", "v23", "v25", "v26", "v27", "v28") else
                         ("pred BEV+bbox +-25x+-60m" if args.model in ("v15", "v16", "v17")
                          else "pred BEV +-25x+-60m"), (6, 24),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 255), 2, cv2.LINE_AA)

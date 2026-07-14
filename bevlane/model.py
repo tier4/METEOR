@@ -1540,6 +1540,39 @@ class DepthSegIPMNetV27(DepthSegIPMNetV26):
                                weight=self._tl_w, ignore_index=255)
 
 
+class DepthSegIPMNetV28(DepthSegIPMNetV27):
+    """v28: + near-range area risk map (+-40 x +-25 m @ 0.2 m).
+
+    A small conv head on the FUSED BEV crop (risk encodes motion: lobes
+    grow/lead with agent speed, so it needs the temporal feature) predicts
+    the potential-field risk GT of bevlane/risk_field.py. Independent head,
+    modest weight -> minimal interference with the other tasks.
+    forward -> v27 outputs + (risk logits [B,1,400,250],)."""
+    def __init__(self, *a, **k):
+        super().__init__(*a, **k)
+        self.risk_head = nn.Sequential(
+            ConvBlock(96, 64), ConvBlock(64, 64), nn.Conv2d(64, 1, 1))
+        nn.init.constant_(self.risk_head[-1].bias, -2.0)   # start near 0 risk
+
+    def forward(self, imgs, K, T_cam_ego, v0=None, prev_bev=None,
+                warp_theta=None):
+        out = super().forward(imgs, K, T_cam_ego, v0, prev_bev, warp_theta)
+        crop = self._fused_bev[:, :, 200:600, 125:375]     # +-40 x +-25 m
+        return out + (self.risk_head(crop),)
+
+    @staticmethod
+    def risk_loss(pred, gt):
+        """pred logits [B,1,400,250]; gt [B,400,250] in [0,1] (-1 = no GT).
+        L1 on sigmoid with high-risk emphasis (weight 1 + 4*gt)."""
+        m = (gt >= 0).float()
+        if m.sum() == 0:
+            return pred.sum() * 0.0
+        p = pred[:, 0].float().sigmoid()
+        g = gt.clamp(min=0)
+        w = (1.0 + 4.0 * g) * m
+        return (w * (p - g).abs()).sum() / w.sum().clamp(min=1)
+
+
 MODELS = {"v1": IPMSegNet, "v2": IPMSegNetV2, "v3s": IPMSegNetV3,
           "lss": LSSDepthNet, "v8": DepthGatedIPMNet, "v13": DepthSegIPMNet,
           "v13d": DepthSegIPMNetS4, "v14d": DepthSegIPMNetV14,
@@ -1548,4 +1581,4 @@ MODELS = {"v1": IPMSegNet, "v2": IPMSegNetV2, "v3s": IPMSegNetV3,
           "v19": DepthSegIPMNetV19, "v20": DepthSegIPMNetV20,
           "v21": DepthSegIPMNetV21, "v22": DepthSegIPMNetV22,
           "v23": DepthSegIPMNetV23, "v24": DepthSegIPMNetV24,
-          "v25": DepthSegIPMNetV25, "v26": DepthSegIPMNetV26, "v27": DepthSegIPMNetV27}
+          "v25": DepthSegIPMNetV25, "v26": DepthSegIPMNetV26, "v27": DepthSegIPMNetV27, "v28": DepthSegIPMNetV28}

@@ -63,6 +63,10 @@ def convert_scene(scene):
              "--stride", "2", "--workers", "1"],
             [PY, "bevlane/extract_tl.py", "--scenes", scene,
              "--stride", "2", "--workers", "1"],
+            [PY, "bevlane/extract_risk.py", "--scenes", scene,
+             "--workers", "1"],
+            [PY, "bevlane/annotate_indoor.py", "--scenes", scene,
+             "--workers", "1"],
         ]
         for st in stages:
             rc, out = run(st)
