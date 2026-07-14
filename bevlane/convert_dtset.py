@@ -2,7 +2,7 @@
 """Convert DTSET scenes end-to-end into training data (all stages per scene).
 
 Per scene: autolabel production -> vectorize -> extract_gt(+narrow) -> gt_vec
--> depth (surround+narrow, fixed logic) -> bev_box. Scene-parallel; each stage
+-> depth (surround+narrow, fixed logic) -> bev_box -> ... -> tl_state. Scene-parallel; each stage
 skips work that already exists, so the driver is resumable.
 """
 import argparse
@@ -60,6 +60,8 @@ def convert_scene(scene):
             [PY, "bevlane/extract_occ.py", "--scenes", scene,
              "--stride", "2", "--workers", "1"],
             [PY, "bevlane/extract_agent_traj.py", "--scenes", scene,
+             "--stride", "2", "--workers", "1"],
+            [PY, "bevlane/extract_tl.py", "--scenes", scene,
              "--stride", "2", "--workers", "1"],
         ]
         for st in stages:

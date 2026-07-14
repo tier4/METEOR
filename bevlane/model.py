@@ -723,6 +723,7 @@ class DepthSegIPMNetV16(DepthSegIPMNetV14):
     def forward(self, imgs, K, T_cam_ego):
         B, N, _, H, W = imgs.shape
         f = self.image_feats(imgs)
+        self._f_s4 = f                 # v27 TL head reads the front cameras
         seg2d = self.seg_head(f)
         dlog = self.depth_head(self.depth_up(f))
         dprob = dlog.softmax(1)
@@ -766,7 +767,7 @@ class DepthSegIPMNetV16(DepthSegIPMNetV14):
                 ri, ci = int(r), int(c)
                 if not (0 <= ri < DET_H and 0 <= ci < DET_W):
                     continue
-                rad = max(2.0, 0.7 * max(l, w) / DET_RES / 2)
+                rad = min(max(2.0, 0.7 * max(l, w) / DET_RES / 2), 4.0)
                 g = torch.exp(-(((ys - r) ** 2).view(-1, 1)
                                 + ((xs - c) ** 2).view(1, -1)) / (2 * rad ** 2))
                 ch = 0 if cls < 1.5 else 1
@@ -805,8 +806,11 @@ class DepthSegIPMNetV16(DepthSegIPMNetV14):
             xe = 80.0 - rr * DET_RES
             ye = 50.0 - cc * DET_RES
             r = (xe ** 2 + ye ** 2).sqrt()
-            # near range must not miss: x2 inside 20 m, x3 inside 12 m
-            near = 1.0 + (r < 20.0).float() + (r < 12.0).float()
+            # near-range recall boost, per class: the veh boost is softened
+            # (x3 overfired -> near duplicate/phantom FPs); VRU keeps x3
+            near_veh = 1.0 + 0.25 * (r < 20.0).float() + 0.25 * (r < 12.0).float()
+            near_vru = 1.0 + (r < 20.0).float() + (r < 12.0).float()
+            near = torch.stack([near_veh, near_vru])
             cw = torch.tensor([2.0, 5.0], device=hm.device).view(2, 1, 1)
             # far positives are unresolvable at 768x432 (a 60 m pedestrian is
             # ~10 px); full-weight unlearnable positives push the focal loss
@@ -815,7 +819,7 @@ class DepthSegIPMNetV16(DepthSegIPMNetV14):
                                 torch.where(r > 40.0, 0.2, 1.0)])
             # laterally distant objects are out of scope -> nearly ignore
             damp = damp * torch.where(ye.abs() > 15.0, 0.2, 1.0)
-            self._det_posw = (near.unsqueeze(0) * cw * damp).unsqueeze(0)
+            self._det_posw = (near * cw * damp).unsqueeze(0)
         floss = -(pos * self._det_posw * (1 - p) ** 2 * p.log()
                   + (1 - pos) * neg_w * p ** 2 * (1 - p).log()).sum() \
             / (pos * self._det_posw).sum().clamp(min=1)
@@ -832,8 +836,9 @@ class DepthSegIPMNetV16(DepthSegIPMNetV14):
     def decode_boxes(hm, reg, thresh=0.3, topk=64):
         """-> list per batch of (cls, score, xe, ye, l, w, yaw)."""
         p = hm.sigmoid()
-        pmax = F.max_pool2d(p, 3, 1, 1)
-        p = p * (pmax == p)                        # 3x3 NMS
+        pmax = F.max_pool2d(p, 5, 1, 2)
+        p = p * (pmax == p)                        # 5x5 NMS (2 m): near-range
+        # duplicate peaks on large vehicles were the top veh-FP source
         B, C, Hh, Ww = p.shape
         out = []
         for bi in range(B):
@@ -1230,8 +1235,8 @@ class DepthSegIPMNetV20(DepthSegIPMNetV19):
         if getattr(self, "_occ_w", None) is None \
                 or self._occ_w.device != occ.device:
             w = torch.ones(OCC_C, device=occ.device)
-            w[0] = 0.2                     # free dominates the carved volume
-            w[2] = 2.0                     # vehicle
+            w[0] = 0.3                     # free dominates the carved volume
+            w[2] = 1.5                     # vehicle (2.0 caused near halos)
             w[1] = 3.0                     # obstacle/unknown (cones etc.)
             w[[3, 4]] = 4.0                # 2-wheelers / pedestrians
             self._occ_w = w
@@ -1492,6 +1497,49 @@ class DepthSegIPMNetV26(DepthSegIPMNetV25):
         return num / max(den, 1)
 
 
+TL_CLASSES = 4                 # none / green / yellow / red
+
+
+class DepthSegIPMNetV27(DepthSegIPMNetV26):
+    """v27: + ego-relevant traffic-light state (whole-image classification).
+
+    Reads the shared s4 features of the two forward cameras (FRONT_WIDE,
+    FRONT_NARROW), fuses them with a small conv tower and predicts one
+    4-way state: none / green / yellow / red. GT comes from the CoMET TLR
+    autolabels reduced to an ego-relevance heuristic (extract_tl.py).
+    forward -> v26 outputs + (tl [B,4],)."""
+    def __init__(self, *a, **k):
+        super().__init__(*a, **k)
+        self.tl_head = nn.Sequential(
+            nn.Conv2d(320, 128, 3, stride=2, padding=1, bias=False),
+            nn.BatchNorm2d(128), nn.ReLU(inplace=True),      # 54x96
+            ConvBlock(128, 128),
+            nn.Conv2d(128, 128, 3, stride=2, padding=1, bias=False),
+            nn.BatchNorm2d(128), nn.ReLU(inplace=True),      # 27x48
+            ConvBlock(128, 128),
+            nn.AdaptiveAvgPool2d(1))
+        self.tl_fc = nn.Linear(128, TL_CLASSES)
+
+    def forward(self, imgs, K, T_cam_ego, v0=None, prev_bev=None,
+                warp_theta=None):
+        out = super().forward(imgs, K, T_cam_ego, v0, prev_bev, warp_theta)
+        B, N = imgs.shape[:2]
+        f = self._f_s4.view(B, N, -1, *self._f_s4.shape[-2:])
+        ff = torch.cat([f[:, 0], f[:, 6]], 1)   # FRONT_WIDE + FRONT_NARROW
+        return out + (self.tl_fc(self.tl_head(ff).flatten(1)),)
+
+    def tl_loss(self, tl_pred, tl_gt):
+        """tl_gt [B] int64 (255 = no GT extracted). Class-weighted CE:
+        'none' dominates and red >> yellow among lit frames."""
+        if getattr(self, "_tl_w", None) is None                 or self._tl_w.device != tl_pred.device:
+            self._tl_w = torch.tensor([0.25, 1.5, 6.0, 1.5],
+                                      device=tl_pred.device)
+        if (tl_gt != 255).sum() == 0:
+            return tl_pred.sum() * 0.0
+        return F.cross_entropy(tl_pred.float(), tl_gt.long(),
+                               weight=self._tl_w, ignore_index=255)
+
+
 MODELS = {"v1": IPMSegNet, "v2": IPMSegNetV2, "v3s": IPMSegNetV3,
           "lss": LSSDepthNet, "v8": DepthGatedIPMNet, "v13": DepthSegIPMNet,
           "v13d": DepthSegIPMNetS4, "v14d": DepthSegIPMNetV14,
@@ -1500,4 +1548,4 @@ MODELS = {"v1": IPMSegNet, "v2": IPMSegNetV2, "v3s": IPMSegNetV3,
           "v19": DepthSegIPMNetV19, "v20": DepthSegIPMNetV20,
           "v21": DepthSegIPMNetV21, "v22": DepthSegIPMNetV22,
           "v23": DepthSegIPMNetV23, "v24": DepthSegIPMNetV24,
-          "v25": DepthSegIPMNetV25, "v26": DepthSegIPMNetV26}
+          "v25": DepthSegIPMNetV25, "v26": DepthSegIPMNetV26, "v27": DepthSegIPMNetV27}

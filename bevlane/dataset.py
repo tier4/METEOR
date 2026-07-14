@@ -23,7 +23,7 @@ class BevLaneDataset(Dataset):
                  with_boxdet=False, trim_start=0, trim_end=0,
                  min_cov_core=0.0, min_cov_fwd=0.0, seg2d_key="seg2d",
                  with_bbox2d=False, with_ego=False, with_occ=False,
-                 with_agenttraj=False, with_temporal=False):
+                 with_agenttraj=False, with_temporal=False, with_tl=False):
         self.root = root
         self.gt_key = gt_key
         self.dontcare_sidewalk = dontcare_sidewalk
@@ -39,6 +39,8 @@ class BevLaneDataset(Dataset):
         self.with_bbox2d = with_bbox2d
         self.with_ego = with_ego
         self.with_occ = with_occ
+        self.with_tl = with_tl
+        self._tl_cache = {}
         self._ego_cache = {}
         self.augment = augment
         self.items = []
@@ -215,6 +217,20 @@ class BevLaneDataset(Dataset):
             except Exception:                 # not extracted yet -> all ignore
                 oc = np.full((16, 200, 200), 255, np.uint8)
             out.append(torch.from_numpy(oc.astype(np.int64)))
+        if self.with_tl:
+            # [1] int64 state: 0 none / 1 green / 2 yellow / 3 red; 255 = no GT
+            t = 255
+            if s not in self._tl_cache:
+                try:
+                    self._tl_cache[s] = np.load(
+                        os.path.join(self.root, s, "tl_state.npz"))["label"]
+                except Exception:
+                    self._tl_cache[s] = None
+            z = self._tl_cache[s]
+            fi = f["frame"]
+            if z is not None and fi < len(z):
+                t = int(z[fi])
+            out.append(torch.tensor(t, dtype=torch.int64))
         if self.with_temporal:
             # previous frame (0.4 s back): images + relative 2D pose
             pimgs = np.zeros((len(CAMS), 3, 432, 768), np.float32)

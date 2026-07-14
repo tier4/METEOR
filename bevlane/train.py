@@ -254,6 +254,38 @@ def evaluate_occ(model, loader, device, occ_idx, max_batches=25):
 
 
 @torch.no_grad()
+@torch.no_grad()
+def evaluate_tl(model, loader, device, tl_idx, max_batches=40, tmp_idx=None):
+    """Ego-relevant traffic-light state: overall accuracy + per-class recall."""
+    model.eval()
+    hit = [0, 0, 0, 0]
+    tot = [0, 0, 0, 0]
+    for bi, batch in enumerate(loader):
+        if bi >= max_batches:
+            break
+        imgs, K, Tc = (t.to(device, non_blocking=True) for t in batch[:3])
+        tg = batch[tl_idx]
+        pb, th = _temporal_inputs(model, batch, device, tmp_idx)
+        with torch.autocast("cuda", torch.float16):
+            out = model(imgs, K, Tc, None, pb, th) if th is not None                 else model(imgs, K, Tc)
+        if not (isinstance(out, tuple) and len(out) >= 12):
+            break
+        pred = out[11].float().argmax(1).cpu()
+        for p, g in zip(pred.tolist(), tg.tolist()):
+            if g == 255:
+                continue
+            tot[g] += 1
+            hit[g] += int(p == g)
+    model.train()
+    if sum(tot) == 0:
+        return None
+    r = {"acc": sum(hit) / sum(tot)}
+    for c, nm in enumerate(("none", "green", "yellow", "red")):
+        if tot[c]:
+            r[nm] = hit[c] / tot[c]
+    return r
+
+
 def evaluate_traj(model, loader, device, tj_idx, max_batches=40,
                   tmp_idx=None):
     _STAT = [0, 0]
@@ -418,7 +450,7 @@ def main():
     ap.add_argument("--workers", type=int, default=6)
     ap.add_argument("--out", default="out/bevlane_ckpt")
     ap.add_argument("--limit-train", type=int, default=None)
-    ap.add_argument("--model", default="v1", choices=["v1", "v2", "v3s", "lss", "v8", "v13", "v13d", "v14d", "v15", "v16", "v17", "v18", "v19", "v20", "v21", "v22", "v23", "v24", "v25", "v26"])
+    ap.add_argument("--model", default="v1", choices=["v1", "v2", "v3s", "lss", "v8", "v13", "v13d", "v14d", "v15", "v16", "v17", "v18", "v19", "v20", "v21", "v22", "v23", "v24", "v25", "v26", "v27"])
     ap.add_argument("--depth-w", type=float, default=0.3)
     ap.add_argument("--seg2d-w", type=float, default=0.5)
     ap.add_argument("--seg2d-key", default="seg2d",
@@ -435,6 +467,7 @@ def main():
                     help="3D semantic occupancy loss weight (v20)")
     ap.add_argument("--traj-w", type=float, default=0.0,
                     help="agent trajectory forecast loss weight (v21)")
+    ap.add_argument("--tl-w", type=float, default=0.0)
     ap.add_argument("--aug", action="store_true")
     ap.add_argument("--dice-w", type=float, default=0.0)
     ap.add_argument("--far-w", type=float, default=0.0,
@@ -478,20 +511,21 @@ def main():
         os.makedirs(args.out, exist_ok=True)
 
     train_s, val_s = split_scenes(args.root)
-    use_depth = args.model in ("lss", "v8", "v13", "v13d", "v14d", "v15", "v16", "v17", "v18", "v19", "v20", "v21", "v22", "v23", "v24", "v25", "v26") and args.depth_w > 0
-    use_seg2d = args.model in ("v13", "v13d", "v14d", "v15", "v16", "v17", "v18", "v19", "v20", "v21", "v22", "v23", "v24", "v25", "v26") and args.seg2d_w > 0
+    use_depth = args.model in ("lss", "v8", "v13", "v13d", "v14d", "v15", "v16", "v17", "v18", "v19", "v20", "v21", "v22", "v23", "v24", "v25", "v26", "v27") and args.depth_w > 0
+    use_seg2d = args.model in ("v13", "v13d", "v14d", "v15", "v16", "v17", "v18", "v19", "v20", "v21", "v22", "v23", "v24", "v25", "v26", "v27") and args.seg2d_w > 0
     use_box = args.model == "v15" and args.box_w > 0
-    use_boxdet = args.model in ("v16", "v17", "v18", "v19", "v20", "v21", "v22", "v23", "v24", "v25", "v26") and args.box_w > 0
-    use_bbox2d = args.model in ("v17", "v18", "v19", "v20", "v21", "v22", "v23", "v24", "v25", "v26") and args.bbox2d_w > 0
-    use_ego = args.model in ("v18", "v19", "v20", "v21", "v22", "v23", "v24", "v25", "v26") and args.ego_w > 0
-    use_occ = args.model in ("v20", "v21", "v22", "v23", "v24", "v25", "v26") and args.occ_w > 0
-    use_traj = args.model in ("v21", "v22", "v23", "v24", "v25", "v26") and args.traj_w > 0
-    use_temporal = args.model in ("v22", "v23", "v24", "v25", "v26")
+    use_boxdet = args.model in ("v16", "v17", "v18", "v19", "v20", "v21", "v22", "v23", "v24", "v25", "v26", "v27") and args.box_w > 0
+    use_bbox2d = args.model in ("v17", "v18", "v19", "v20", "v21", "v22", "v23", "v24", "v25", "v26", "v27") and args.bbox2d_w > 0
+    use_ego = args.model in ("v18", "v19", "v20", "v21", "v22", "v23", "v24", "v25", "v26", "v27") and args.ego_w > 0
+    use_occ = args.model in ("v20", "v21", "v22", "v23", "v24", "v25", "v26", "v27") and args.occ_w > 0
+    use_traj = args.model in ("v21", "v22", "v23", "v24", "v25", "v26", "v27") and args.traj_w > 0
+    use_temporal = args.model in ("v22", "v23", "v24", "v25", "v26", "v27")
+    use_tl = args.model == "v27" and args.tl_w > 0
     if args.train_list:                       # restrict train to a scene list
         keep = set(open(args.train_list).read().split())
         train_s = [s for s in train_s if s in keep]
     # v13d depth GT is stride-4 of 768 (108x192); resize any mixed-res depth
-    depth_hw = (108, 192) if args.model in ("v13d", "v14d", "v15", "v16", "v17", "v18", "v19", "v20", "v21", "v22", "v23", "v24", "v25", "v26") else None
+    depth_hw = (108, 192) if args.model in ("v13d", "v14d", "v15", "v16", "v17", "v18", "v19", "v20", "v21", "v22", "v23", "v24", "v25", "v26", "v27") else None
     tr = BevLaneDataset(args.root, train_s, gt_key=args.gt_key,
                         dontcare_sidewalk=args.dontcare_sidewalk,
                         with_depth=use_depth, augment=args.aug,
@@ -501,6 +535,7 @@ def main():
                         with_agenttraj=use_traj,
                         with_bbox2d=use_bbox2d, with_ego=use_ego,
                         with_occ=use_occ, with_temporal=use_temporal,
+                        with_tl=use_tl,
                         trim_start=3, trim_end=args.trim_end,
                         min_cov_core=args.min_cov_core,
                         min_cov_fwd=args.min_cov_fwd,
@@ -515,7 +550,7 @@ def main():
                             with_depth=False, with_seg2d=use_seg2d,
                             seg2d_key=args.seg2d_key, with_ego=use_ego,
                             with_occ=use_occ, with_agenttraj=use_traj,
-                            with_temporal=use_temporal,
+                            with_temporal=use_temporal, with_tl=use_tl,
                             trim_start=3, trim_end=args.trim_end)
         print(f"train {len(tr)} samples / {len(train_s)} scenes; "
               f"val {len(va)} samples / {len(val_s)} scenes; "
@@ -537,7 +572,7 @@ def main():
                     drop_last=True, **dl_kw)
 
     mkw = {"n_seg": args.n_seg2d} \
-        if args.model in ("v13", "v13d", "v14d", "v15", "v16", "v17", "v18", "v19", "v20", "v21", "v22", "v23", "v24", "v25", "v26") else {}
+        if args.model in ("v13", "v13d", "v14d", "v15", "v16", "v17", "v18", "v19", "v20", "v21", "v22", "v23", "v24", "v25", "v26", "v27") else {}
     model = MODELS[args.model](**mkw).to(device)
     if args.init_ckpt:
         sd = torch.load(args.init_ckpt, map_location="cpu")["model"]
@@ -552,7 +587,7 @@ def main():
         model = torch.nn.parallel.DistributedDataParallel(
             model, device_ids=[local],
             find_unused_parameters=(args.seg_w == 0 or
-                                    (args.model in ("v13", "v13d", "v14d", "v15", "v16", "v17", "v18", "v19", "v20", "v21", "v22", "v23", "v24", "v25", "v26") and not use_seg2d)))
+                                    (args.model in ("v13", "v13d", "v14d", "v15", "v16", "v17", "v18", "v19", "v20", "v21", "v22", "v23", "v24", "v25", "v26", "v27") and not use_seg2d)))
     opt = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-4)
     total_steps = len(dl) * args.epochs
     sched = torch.optim.lr_scheduler.OneCycleLR(opt, max_lr=lr,
@@ -598,6 +633,8 @@ def main():
             bi += 1 if use_ego else 0
             occ_gt = batch[bi] if use_occ else None
             bi += 1 if use_occ else 0
+            tl_gt = batch[bi] if use_tl else None
+            bi += 1 if use_tl else 0
             if use_temporal:
                 prev_imgs, rel_pose, prev_valid = (batch[bi], batch[bi + 1],
                                                    batch[bi + 2])
@@ -663,6 +700,8 @@ def main():
                     if len(out) >= 11:      # v26 stationary-flag head
                         loss = loss + args.traj_w * net0.stat_loss(
                             out[10], det_boxes, det_n, traj_gt, tvalid_gt)
+                if use_tl and len(out) >= 12:   # v27 traffic-light state
+                    loss = loss + args.tl_w * net0.tl_loss(out[11], tl_gt)
                 if hm2d is not None and use_bbox2d:
                     loss = loss + args.bbox2d_w * net0.bbox2d_loss(
                         hm2d, rg2d, bb2d, nb2d)
@@ -729,7 +768,7 @@ def main():
                           + " ".join(f"{onm[c]}={oc[c]:.3f}"
                                      for c in onm if c in oc), flush=True)
             vtmp = (4 + int(use_seg2d) + 4 * int(use_traj) + int(use_ego)
-                    + int(use_occ)) if use_temporal else None
+                    + int(use_occ) + int(use_tl)) if use_temporal else None
             if use_traj and use_boxdet:
                 d3 = evaluate_det3d(net, dv, device, 4 + int(use_seg2d),
                                     tmp_idx=vtmp)
@@ -749,6 +788,15 @@ def main():
                           if "stat_acc" in tj else "")
                     print(f"[valTraj ep{ep}] agentADE={tj['ade']:.2f}m "
                           f"agentFDE={tj['fde']:.2f}m" + ss, flush=True)
+            if use_tl:
+                tl_idx = (4 + int(use_seg2d) + 4 * int(use_traj)
+                          + int(use_ego) + int(use_occ))
+                tr_ = evaluate_tl(net, dv, device, tl_idx, tmp_idx=vtmp)
+                if tr_:
+                    print(f"[valTL ep{ep}] acc={tr_['acc']:.2f} "
+                          + " ".join(f"{k}={tr_[k]:.2f}" for k in
+                                     ("none", "green", "yellow", "red")
+                                     if k in tr_), flush=True)
             if use_ego:
                 eg = evaluate_ego(net, dv, device,
                                   4 + int(use_seg2d) + 4 * int(use_traj),
