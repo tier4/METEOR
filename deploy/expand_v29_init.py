@@ -31,5 +31,20 @@ if sd["traj_head.weight"].shape[0] == 12:
     sd["traj_head.weight"] = torch.cat(
         [tile(w, K, 0.01), torch.zeros(K, *w.shape[1:])], 0)
     sd["traj_head.bias"] = torch.cat([b.repeat(K), torch.zeros(K)], 0)
+# temporal fuse: graft the TRAINED v28 tfuse into the 3-slot tfuse3.
+# Slot 0 keeps the same 0.4 s offset, so copying the [bev, warped] input
+# channels and zeroing the two new slots reproduces the v28 fusion exactly
+# at init -- without this, ego/traj heads see unfamiliar fused features and
+# their (heavily weighted) losses wreck the shared backbone (r20 collapse).
+if "tfuse.0.weight" in sd and "tfuse3.0.weight" not in sd:
+    w = sd["tfuse.0.weight"]                     # [96, 192, 1, 1]
+    w3 = torch.zeros(w.shape[0], 2 * w.shape[1], *w.shape[2:])
+    w3[:, :w.shape[1]] = w
+    sd["tfuse3.0.weight"] = w3
+    for k in list(sd.keys()):
+        if k.startswith("tfuse.") and not k.startswith("tfuse.0."):
+            sd["tfuse3." + k[len("tfuse."):]] = sd[k]
+    for k in [k for k in sd if k.startswith("tfuse.")]:
+        del sd[k]
 torch.save(ck, dst)
 print("expanded ->", dst)
