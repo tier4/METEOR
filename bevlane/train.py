@@ -627,6 +627,8 @@ def main():
     ap.add_argument("--risk-w", type=float, default=0.0)
     ap.add_argument("--lanegraph-w", type=float, default=0.0)
     ap.add_argument("--flow-w", type=float, default=0.0)
+    ap.add_argument("--val-every", type=int, default=0,
+                    help="probe BEV mIoU + 3D det every N steps (0=off)")
     ap.add_argument("--aug", action="store_true")
     ap.add_argument("--dice-w", type=float, default=0.0)
     ap.add_argument("--far-w", type=float, default=0.0,
@@ -816,14 +818,23 @@ def main():
                 prev_imgs = rel_pose = prev_valid = None
             if use_temporal and hist_n > 0:
                 # v29 memory queue: N history BEVs, each in its own no_grad
-                # + autocast region (r12 autocast-cache lesson)
+                # + autocast region (r12 autocast-cache lesson).
+                # eval() around the history pass: these are auxiliary feature
+                # extractions and must NOT drive BatchNorm running stats.
+                # With 3 slots they outnumber the current frame 3:1, and
+                # ~16% of them are all-zero images (missing history at scene
+                # starts); that mixture corrupts the running stats within
+                # ~50 steps and collapses every eval-mode metric while the
+                # training loss still looks healthy.
                 net00 = model.module if ddp else model
+                model.eval()
                 pbs, ths = [], []
                 with torch.no_grad(), torch.autocast("cuda", torch.float16):
                     for hi in range(hist_n):
                         pbs.append(net00.compute_bev(prev_imgs[:, hi], K, Tc)
                                    * prev_valid[:, hi].view(-1, 1, 1, 1))
                         ths.append(make_warp_theta(rel_pose[:, hi]))
+                model.train()
                 pb = torch.stack(pbs, 1).float()
                 theta = torch.stack(ths, 1)
             elif use_temporal:
@@ -831,9 +842,11 @@ def main():
                 # inside the main region caches detached fp16 weight casts
                 # and silently cuts gradients to the whole backbone
                 net00 = model.module if ddp else model
+                model.eval()                 # same BN-stat rule as above
                 with torch.no_grad(), torch.autocast("cuda", torch.float16):
                     pb = net00.compute_bev(prev_imgs, K, Tc) \
                         * prev_valid.view(-1, 1, 1, 1)
+                model.train()
                 pb = pb.float()
                 theta = make_warp_theta(rel_pose)
             with torch.autocast("cuda", torch.float16):
@@ -935,6 +948,36 @@ def main():
                 print(f"ep{ep} step{step}/{total_steps} loss={loss.item():.4f} "
                       f"lr={sched.get_last_lr()[0]:.2e} "
                       f"({(time.time() - t0) / step:.2f}s/it)", flush=True)
+            # ---- step-level probe of the two priority metrics -------------
+            # An epoch is ~75 min; a regression (or a fix) must be visible in
+            # minutes, not hours. Rank 0 runs a small val slice while the
+            # other ranks block on the next all-reduce, then a barrier
+            # re-syncs everyone.
+            if args.val_every and step % args.val_every == 0:
+                if is_main:
+                    netq = model.module if ddp else model
+                    iq = evaluate(netq, dv, device, max_batches=10)
+                    mq = float(np.nanmean(list(iq.values())))
+                    msg = (f"[probe ep{ep} step{step}] mIoU={mq:.3f} "
+                           f"road={iq.get('road', float('nan')):.3f} "
+                           f"lane={iq.get('laneline', float('nan')):.3f}")
+                    if use_boxdet:
+                        dq = evaluate_det3d(netq, dv, device,
+                                            4 + int(use_seg2d), max_batches=8,
+                                            tmp_idx=(4 + int(use_seg2d)
+                                                     + 4 * int(use_traj)
+                                                     + int(use_ego)
+                                                     + int(use_occ)
+                                                     + int(use_tl)
+                                                     + int(use_risk)
+                                                     + 4 * int(use_lg))
+                                            if use_temporal else None)
+                        msg += (f" | vehRn={dq['vehn']:.2f} P={dq['veh'][0]:.2f}"
+                                f" vruRn={dq['vrun']:.2f}"
+                                f" yaw={dq['veh_yaw']:.1f}deg")
+                    print(msg, flush=True)
+                if ddp:
+                    dist.barrier()
         if is_main:
             net = model.module if ddp else model
             ious = evaluate(net, dv, device)

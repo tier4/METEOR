@@ -1619,6 +1619,14 @@ class DepthSegIPMNetV29(DepthSegIPMNetV28):
         self.lg_mlp = nn.Sequential(nn.Linear(130, 256), nn.ReLU(inplace=True),
                                     nn.Linear(256, 256), nn.ReLU(inplace=True))
         self.lg_pts = nn.Linear(256, LG_P * 2)
+        # start each slot as a short straight segment on its anchor: the
+        # x30 output scale makes default-init offsets +-15 m of noise and
+        # the Hungarian matching never converges from there
+        nn.init.normal_(self.lg_pts.weight, std=1e-3)
+        with torch.no_grad():
+            b = torch.zeros(LG_P, 2)
+            b[:, 0] = torch.linspace(-4.0, 4.0, LG_P)     # +-4 m along x
+            self.lg_pts.bias.copy_((b / 30.0).reshape(-1))
         self.lg_meta = nn.Linear(256, 4)       # exist + 3-class logits
         self.lg_adj = nn.Sequential(nn.Linear(512, 128), nn.ReLU(inplace=True),
                                     nn.Linear(128, 1))
