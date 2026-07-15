@@ -188,6 +188,14 @@ def _temporal_inputs(model, batch, device, tmp_idx):
     pv = batch[tmp_idx + 2].to(device)
     K = batch[1].to(device)
     Tc = batch[2].to(device)
+    if hasattr(model, "tfuse3"):               # v29 memory queue
+        pbs, ths = [], []
+        with torch.no_grad():
+            for hi in range(pi.shape[1]):
+                pbs.append(model.compute_bev(pi[:, hi], K, Tc)
+                           * pv[:, hi].view(-1, 1, 1, 1))
+                ths.append(make_warp_theta(rel[:, hi]))
+        return torch.stack(pbs, 1), torch.stack(ths, 1)
     with torch.no_grad():
         pb = model.compute_bev(pi, K, Tc) * pv.view(-1, 1, 1, 1)
     return pb, make_warp_theta(rel)
@@ -212,6 +220,12 @@ def evaluate_ego(model, loader, device, ego_idx, max_batches=40,
         if not (isinstance(out, tuple) and len(out) >= 8):
             break
         p = out[7].float()
+        if p.shape[1] > 15:                    # v29 multimodal (K=3)
+            Kn = 3
+            wps = p[:, :12 * Kn].view(-1, Kn, 6, 2)
+            mode = p[:, 12 * Kn:12 * Kn + Kn].argmax(1)
+            wp1 = wps[torch.arange(len(p)), mode].reshape(-1, 12)
+            p = torch.cat([wp1, p[:, 12 * Kn + Kn:]], 1)
         v = eg[:, 16]
         if v.sum() == 0:
             continue
@@ -323,6 +337,106 @@ def evaluate_risk(model, loader, device, rk_idx, max_batches=30, tmp_idx=None):
     return {"l1": l1 / n, "l1_hi": l1h / max(nh, 1)}
 
 
+@torch.no_grad()
+def evaluate_lanegraph(model, loader, device, lg_idx, max_batches=20,
+                       tmp_idx=None):
+    """chain P/R at mean-chamfer < 0.5 m + adjacency accuracy."""
+    tp = fp = fn = 0
+    a_hit = a_tot = 0
+    model.eval()
+    for bi, batch in enumerate(loader):
+        if bi >= max_batches:
+            break
+        imgs, K, Tc = (t.to(device, non_blocking=True) for t in batch[:3])
+        gp = batch[lg_idx].to(device)
+        gn = batch[lg_idx + 2]
+        ga = batch[lg_idx + 3].to(device)
+        pb, th = _temporal_inputs(model, batch, device, tmp_idx)
+        with torch.autocast("cuda", torch.float16):
+            out = model(imgs, K, Tc, None, pb, th)
+        if len(out) < 17:
+            break
+        pts, meta, adj = out[14].float(), out[15].float(), out[16].float()
+        for b in range(gp.shape[0]):
+            keep = meta[b, :, 0].sigmoid() > 0.5
+            pk = pts[b][keep]
+            n = int(gn[b])
+            g = gp[b, :n].float()
+            used = torch.zeros(n, dtype=torch.bool)
+            pi_match = {}
+            for i in range(pk.shape[0]):
+                if n == 0:
+                    fp += 1
+                    continue
+                d1 = (pk[i:i + 1] - g).abs().mean((1, 2))
+                d2 = (pk[i:i + 1] - g.flip(1)).abs().mean((1, 2))
+                d = torch.minimum(d1, d2)
+                j = int(d.argmin())
+                if d[j] < 0.5 and not used[j]:
+                    used[j] = True
+                    tp += 1
+                    pi_match[i] = j
+                else:
+                    fp += 1
+            fn += int(n - used.sum())
+            kidx = keep.nonzero()[:, 0]
+            for i, j in pi_match.items():
+                for i2, j2 in pi_match.items():
+                    if i2 <= i:
+                        continue
+                    a_p = adj[b, kidx[i], kidx[i2]] > 0
+                    a_g = ga[b, j, j2] > 0.5
+                    a_hit += int(a_p == a_g)
+                    a_tot += 1
+    model.train()
+    if tp + fn == 0:
+        return None
+    return {"p": tp / max(tp + fp, 1), "r": tp / max(tp + fn, 1),
+            "adj": a_hit / max(a_tot, 1)}
+
+
+@torch.no_grad()
+def evaluate_flow(model, loader, device, bx_idx, max_batches=20,
+                  tmp_idx=None):
+    """mean endpoint error [m/s] on agent-box cells, moving/stationary."""
+    import cv2 as _cv
+    em = es = nm = ns = 0.0
+    model.eval()
+    for bi, batch in enumerate(loader):
+        if bi >= max_batches:
+            break
+        imgs, K, Tc = (t.to(device, non_blocking=True) for t in batch[:3])
+        bx, nb = batch[bx_idx], batch[bx_idx + 1]
+        tj, tv = batch[bx_idx + 2], batch[bx_idx + 3]
+        pb, th = _temporal_inputs(model, batch, device, tmp_idx)
+        with torch.autocast("cuda", torch.float16):
+            out = model(imgs, K, Tc, None, pb, th)
+        if len(out) < 14:
+            break
+        fl = out[13].float().cpu().numpy()
+        for b in range(bx.shape[0]):
+            for k in range(int(nb[b])):
+                cls, xe, ye, l, w, yaw = bx[b, k].tolist()
+                if l <= 0 or abs(xe) > 38 or abs(ye) > 38:
+                    continue
+                ri = int((40 - xe) / 0.4)
+                ci = int((40 - ye) / 0.4)
+                vx = vy = 0.0
+                if tv[b, k, 0] > 0.5:
+                    vx, vy = (float(tj[b, k, 0, 0]) / 0.5,
+                              float(tj[b, k, 0, 1]) / 0.5)
+                pv_ = fl[b, :, ri, ci]
+                e = ((pv_[0] - vx) ** 2 + (pv_[1] - vy) ** 2) ** 0.5
+                if (vx * vx + vy * vy) ** 0.5 > 0.5:
+                    em += e; nm += 1
+                else:
+                    es += e; ns += 1
+    model.train()
+    if nm + ns == 0:
+        return None
+    return {"epe_mov": em / max(nm, 1), "epe_stat": es / max(ns, 1)}
+
+
 def evaluate_traj(model, loader, device, tj_idx, max_batches=40,
                   tmp_idx=None):
     _STAT = [0, 0]
@@ -351,7 +465,12 @@ def evaluate_traj(model, loader, device, tj_idx, max_batches=40,
                 ci = int((50.0 - float(bx[b, k, 2])) / 0.4)
                 if not (0 <= ri < tp.shape[-2] and 0 <= ci < tp.shape[-1]):
                     continue
-                p = tp[b, :, ri, ci].view(6, 2)
+                vec = tp[b, :, ri, ci]
+                if vec.numel() >= 39:          # v29 multimodal per cell
+                    kbest = int(vec[36:39].argmax())
+                    p = vec[kbest * 12:(kbest + 1) * 12].view(6, 2)
+                else:
+                    p = vec.view(6, 2)
                 d = (p - tj[b, k]).norm(dim=1)
                 v = tv[b, k]
                 if v.sum() == 0:
@@ -487,7 +606,7 @@ def main():
     ap.add_argument("--workers", type=int, default=6)
     ap.add_argument("--out", default="out/bevlane_ckpt")
     ap.add_argument("--limit-train", type=int, default=None)
-    ap.add_argument("--model", default="v1", choices=["v1", "v2", "v3s", "lss", "v8", "v13", "v13d", "v14d", "v15", "v16", "v17", "v18", "v19", "v20", "v21", "v22", "v23", "v24", "v25", "v26", "v27", "v28"])
+    ap.add_argument("--model", default="v1", choices=["v1", "v2", "v3s", "lss", "v8", "v13", "v13d", "v14d", "v15", "v16", "v17", "v18", "v19", "v20", "v21", "v22", "v23", "v24", "v25", "v26", "v27", "v28", "v29"])
     ap.add_argument("--depth-w", type=float, default=0.3)
     ap.add_argument("--seg2d-w", type=float, default=0.5)
     ap.add_argument("--seg2d-key", default="seg2d",
@@ -506,6 +625,8 @@ def main():
                     help="agent trajectory forecast loss weight (v21)")
     ap.add_argument("--tl-w", type=float, default=0.0)
     ap.add_argument("--risk-w", type=float, default=0.0)
+    ap.add_argument("--lanegraph-w", type=float, default=0.0)
+    ap.add_argument("--flow-w", type=float, default=0.0)
     ap.add_argument("--aug", action="store_true")
     ap.add_argument("--dice-w", type=float, default=0.0)
     ap.add_argument("--far-w", type=float, default=0.0,
@@ -549,22 +670,25 @@ def main():
         os.makedirs(args.out, exist_ok=True)
 
     train_s, val_s = split_scenes(args.root)
-    use_depth = args.model in ("lss", "v8", "v13", "v13d", "v14d", "v15", "v16", "v17", "v18", "v19", "v20", "v21", "v22", "v23", "v24", "v25", "v26", "v27", "v28") and args.depth_w > 0
-    use_seg2d = args.model in ("v13", "v13d", "v14d", "v15", "v16", "v17", "v18", "v19", "v20", "v21", "v22", "v23", "v24", "v25", "v26", "v27", "v28") and args.seg2d_w > 0
+    use_depth = args.model in ("lss", "v8", "v13", "v13d", "v14d", "v15", "v16", "v17", "v18", "v19", "v20", "v21", "v22", "v23", "v24", "v25", "v26", "v27", "v28", "v29") and args.depth_w > 0
+    use_seg2d = args.model in ("v13", "v13d", "v14d", "v15", "v16", "v17", "v18", "v19", "v20", "v21", "v22", "v23", "v24", "v25", "v26", "v27", "v28", "v29") and args.seg2d_w > 0
     use_box = args.model == "v15" and args.box_w > 0
-    use_boxdet = args.model in ("v16", "v17", "v18", "v19", "v20", "v21", "v22", "v23", "v24", "v25", "v26", "v27", "v28") and args.box_w > 0
-    use_bbox2d = args.model in ("v17", "v18", "v19", "v20", "v21", "v22", "v23", "v24", "v25", "v26", "v27", "v28") and args.bbox2d_w > 0
-    use_ego = args.model in ("v18", "v19", "v20", "v21", "v22", "v23", "v24", "v25", "v26", "v27", "v28") and args.ego_w > 0
-    use_occ = args.model in ("v20", "v21", "v22", "v23", "v24", "v25", "v26", "v27", "v28") and args.occ_w > 0
-    use_traj = args.model in ("v21", "v22", "v23", "v24", "v25", "v26", "v27", "v28") and args.traj_w > 0
-    use_temporal = args.model in ("v22", "v23", "v24", "v25", "v26", "v27", "v28")
-    use_tl = args.model in ("v27", "v28") and args.tl_w > 0
-    use_risk = args.model == "v28" and args.risk_w > 0
+    use_boxdet = args.model in ("v16", "v17", "v18", "v19", "v20", "v21", "v22", "v23", "v24", "v25", "v26", "v27", "v28", "v29") and args.box_w > 0
+    use_bbox2d = args.model in ("v17", "v18", "v19", "v20", "v21", "v22", "v23", "v24", "v25", "v26", "v27", "v28", "v29") and args.bbox2d_w > 0
+    use_ego = args.model in ("v18", "v19", "v20", "v21", "v22", "v23", "v24", "v25", "v26", "v27", "v28", "v29") and args.ego_w > 0
+    use_occ = args.model in ("v20", "v21", "v22", "v23", "v24", "v25", "v26", "v27", "v28", "v29") and args.occ_w > 0
+    use_traj = args.model in ("v21", "v22", "v23", "v24", "v25", "v26", "v27", "v28", "v29") and args.traj_w > 0
+    use_temporal = args.model in ("v22", "v23", "v24", "v25", "v26", "v27", "v28", "v29")
+    use_tl = args.model in ("v27", "v28", "v29") and args.tl_w > 0
+    use_risk = args.model in ("v28", "v29") and args.risk_w > 0
+    use_lg = args.model == "v29" and args.lanegraph_w > 0
+    use_flow = args.model == "v29" and args.flow_w > 0
+    hist_n = 3 if args.model == "v29" else 0
     if args.train_list:                       # restrict train to a scene list
         keep = set(open(args.train_list).read().split())
         train_s = [s for s in train_s if s in keep]
     # v13d depth GT is stride-4 of 768 (108x192); resize any mixed-res depth
-    depth_hw = (108, 192) if args.model in ("v13d", "v14d", "v15", "v16", "v17", "v18", "v19", "v20", "v21", "v22", "v23", "v24", "v25", "v26", "v27", "v28") else None
+    depth_hw = (108, 192) if args.model in ("v13d", "v14d", "v15", "v16", "v17", "v18", "v19", "v20", "v21", "v22", "v23", "v24", "v25", "v26", "v27", "v28", "v29") else None
     tr = BevLaneDataset(args.root, train_s, gt_key=args.gt_key,
                         dontcare_sidewalk=args.dontcare_sidewalk,
                         with_depth=use_depth, augment=args.aug,
@@ -575,6 +699,7 @@ def main():
                         with_bbox2d=use_bbox2d, with_ego=use_ego,
                         with_occ=use_occ, with_temporal=use_temporal,
                         with_tl=use_tl, with_risk=use_risk,
+                        with_lanegraph=use_lg, temporal_hist=hist_n,
                         trim_start=3, trim_end=args.trim_end,
                         min_cov_core=args.min_cov_core,
                         min_cov_fwd=args.min_cov_fwd,
@@ -590,7 +715,8 @@ def main():
                             seg2d_key=args.seg2d_key, with_ego=use_ego,
                             with_occ=use_occ, with_agenttraj=use_traj,
                             with_temporal=use_temporal, with_tl=use_tl,
-                            with_risk=use_risk,
+                            with_risk=use_risk, with_lanegraph=use_lg,
+                            temporal_hist=hist_n,
                             trim_start=3, trim_end=args.trim_end)
         print(f"train {len(tr)} samples / {len(train_s)} scenes; "
               f"val {len(va)} samples / {len(val_s)} scenes; "
@@ -612,7 +738,7 @@ def main():
                     drop_last=True, **dl_kw)
 
     mkw = {"n_seg": args.n_seg2d} \
-        if args.model in ("v13", "v13d", "v14d", "v15", "v16", "v17", "v18", "v19", "v20", "v21", "v22", "v23", "v24", "v25", "v26", "v27", "v28") else {}
+        if args.model in ("v13", "v13d", "v14d", "v15", "v16", "v17", "v18", "v19", "v20", "v21", "v22", "v23", "v24", "v25", "v26", "v27", "v28", "v29") else {}
     model = MODELS[args.model](**mkw).to(device)
     if args.init_ckpt:
         sd = torch.load(args.init_ckpt, map_location="cpu")["model"]
@@ -627,7 +753,7 @@ def main():
         model = torch.nn.parallel.DistributedDataParallel(
             model, device_ids=[local],
             find_unused_parameters=(args.seg_w == 0 or
-                                    (args.model in ("v13", "v13d", "v14d", "v15", "v16", "v17", "v18", "v19", "v20", "v21", "v22", "v23", "v24", "v25", "v26", "v27", "v28") and not use_seg2d)))
+                                    (args.model in ("v13", "v13d", "v14d", "v15", "v16", "v17", "v18", "v19", "v20", "v21", "v22", "v23", "v24", "v25", "v26", "v27", "v28", "v29") and not use_seg2d)))
     opt = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-4)
     total_steps = len(dl) * args.epochs
     sched = torch.optim.lr_scheduler.OneCycleLR(opt, max_lr=lr,
@@ -677,12 +803,30 @@ def main():
             bi += 1 if use_tl else 0
             risk_gt = batch[bi] if use_risk else None
             bi += 1 if use_risk else 0
+            if use_lg:
+                lg_pts_gt, lg_cls_gt = batch[bi], batch[bi + 1]
+                lg_n_gt, lg_adj_gt = batch[bi + 2], batch[bi + 3]
+                bi += 4
+            else:
+                lg_pts_gt = lg_cls_gt = lg_n_gt = lg_adj_gt = None
             if use_temporal:
                 prev_imgs, rel_pose, prev_valid = (batch[bi], batch[bi + 1],
                                                    batch[bi + 2])
             else:
                 prev_imgs = rel_pose = prev_valid = None
-            if use_temporal:
+            if use_temporal and hist_n > 0:
+                # v29 memory queue: N history BEVs, each in its own no_grad
+                # + autocast region (r12 autocast-cache lesson)
+                net00 = model.module if ddp else model
+                pbs, ths = [], []
+                with torch.no_grad(), torch.autocast("cuda", torch.float16):
+                    for hi in range(hist_n):
+                        pbs.append(net00.compute_bev(prev_imgs[:, hi], K, Tc)
+                                   * prev_valid[:, hi].view(-1, 1, 1, 1))
+                        ths.append(make_warp_theta(rel_pose[:, hi]))
+                pb = torch.stack(pbs, 1).float()
+                theta = torch.stack(ths, 1)
+            elif use_temporal:
                 # prev-frame BEV in its OWN autocast region: computing it
                 # inside the main region caches detached fp16 weight casts
                 # and silently cuts gradients to the whole backbone
@@ -747,6 +891,13 @@ def main():
                 if use_risk and len(out) >= 13:  # v28 area risk map
                     loss = loss + args.risk_w * net0.risk_loss(out[12],
                                                                risk_gt)
+                if use_flow and len(out) >= 14 and traj_gt is not None:
+                    loss = loss + args.flow_w * net0.flow_loss(
+                        out[13], det_boxes, det_n, traj_gt, tvalid_gt)
+                if use_lg and len(out) >= 17:
+                    loss = loss + args.lanegraph_w * net0.lanegraph_loss(
+                        out[14], out[15], out[16],
+                        lg_pts_gt, lg_cls_gt, lg_n_gt, lg_adj_gt)
                 if hm2d is not None and use_bbox2d:
                     loss = loss + args.bbox2d_w * net0.bbox2d_loss(
                         hm2d, rg2d, bb2d, nb2d)
@@ -813,8 +964,8 @@ def main():
                           + " ".join(f"{onm[c]}={oc[c]:.3f}"
                                      for c in onm if c in oc), flush=True)
             vtmp = (4 + int(use_seg2d) + 4 * int(use_traj) + int(use_ego)
-                    + int(use_occ) + int(use_tl) + int(use_risk)) \
-                if use_temporal else None
+                    + int(use_occ) + int(use_tl) + int(use_risk)
+                    + 4 * int(use_lg)) if use_temporal else None
             if use_traj and use_boxdet:
                 d3 = evaluate_det3d(net, dv, device, 4 + int(use_seg2d),
                                     tmp_idx=vtmp)
@@ -850,6 +1001,22 @@ def main():
                 if rk:
                     print(f"[valRisk ep{ep}] L1={rk['l1']:.3f} "
                           f"L1(hi)={rk['l1_hi']:.3f}", flush=True)
+            if use_flow:
+                fl_ = evaluate_flow(net, dv, device, 4 + int(use_seg2d),
+                                    tmp_idx=vtmp)
+                if fl_:
+                    print(f"[valFlow ep{ep}] EPE(mov)={fl_['epe_mov']:.2f} "
+                          f"EPE(stat)={fl_['epe_stat']:.2f} m/s", flush=True)
+            if use_lg:
+                lg_idx = (4 + int(use_seg2d) + 4 * int(use_traj)
+                          + int(use_ego) + int(use_occ) + int(use_tl)
+                          + int(use_risk))
+                lg_ = evaluate_lanegraph(net, dv, device, lg_idx,
+                                         tmp_idx=vtmp)
+                if lg_:
+                    print(f"[valLane ep{ep}] P={lg_['p']:.2f} "
+                          f"R={lg_['r']:.2f} adjAcc={lg_['adj']:.2f}",
+                          flush=True)
             if use_ego:
                 eg = evaluate_ego(net, dv, device,
                                   4 + int(use_seg2d) + 4 * int(use_traj),

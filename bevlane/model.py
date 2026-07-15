@@ -1224,7 +1224,9 @@ class DepthSegIPMNetV20(DepthSegIPMNetV19):
     def forward(self, imgs, K, T_cam_ego, v0=None):
         out = super().forward(imgs, K, T_cam_ego, v0)
         crop = self.occ_input()[:, :, 200:600, 50:450]
-        o = self.occ_head(self.occ_stem(crop))
+        of = self.occ_stem(crop)
+        self._occ_feat = of                    # v29 flow head reads this
+        o = self.occ_head(of)
         B = o.shape[0]
         return out + (o.view(B, OCC_C, OCC_Z, o.shape[-2], o.shape[-1]),)
 
@@ -1573,6 +1575,206 @@ class DepthSegIPMNetV28(DepthSegIPMNetV27):
         return (w * (p - g).abs()).sum() / w.sum().clamp(min=1)
 
 
+EGO_K = 3                      # trajectory hypotheses (WTA-trained)
+HIST_N = 3                     # temporal memory slots (0.4 / 1.2 / 2.8 s)
+LG_M, LG_P = 24, 12            # lane-graph slots / points per chain
+
+
+class DepthSegIPMNetV29(DepthSegIPMNetV28):
+    """v29 (DESIGN_v29): multimodal trajectories (K=3, winner-takes-all),
+    3-slot temporal memory queue, vector lane-graph slot decoder, occupancy
+    flow. forward(imgs, K, T, v0, hist_bev [B,3,96,800,500],
+    hist_theta [B,3,2,3]) -> v28 outputs (with wider ego/traj) +
+    (flow [B,2,200,200], lg_pts [B,24,12,2], lg_meta [B,24,4],
+     lg_adj [B,24,24])."""
+    def __init__(self, *a, **k):
+        super().__init__(*a, **k)
+        # 1. multimodal heads (WTA)
+        self.ego_mlp[-1] = nn.Linear(256, 12 * EGO_K + EGO_K + 3)
+        self.traj_head = nn.Conv2d(128, TRAJ_H * 2 * EGO_K + EGO_K, 1)
+        # 2. temporal memory queue replaces the single-frame tfuse
+        del self.tfuse
+        self.tfuse3 = nn.Sequential(
+            nn.Conv2d(96 * (1 + HIST_N), 96, 1, bias=False),
+            nn.BatchNorm2d(96), nn.ReLU(inplace=True), ConvBlock(96, 96))
+        last_bn = self.tfuse3[-1][-2]
+        nn.init.zeros_(last_bn.weight)
+        nn.init.zeros_(last_bn.bias)
+        # 3. lane-graph slot decoder on the RAW BEV ROI (x -10..60, |y|<=25)
+        self.lg_tower = nn.Sequential(
+            nn.Conv2d(96, 128, 3, stride=2, padding=1, bias=False),
+            nn.BatchNorm2d(128), nn.ReLU(inplace=True), ConvBlock(128, 128),
+            nn.Conv2d(128, 128, 3, stride=2, padding=1, bias=False),
+            nn.BatchNorm2d(128), nn.ReLU(inplace=True), ConvBlock(128, 128))
+        ax = torch.linspace(-4.0, 54.0, 6)     # anchor x (fwd)
+        ay = torch.linspace(-18.75, 18.75, 4)  # anchor y (left)
+        gx, gy = torch.meshgrid(ax, ay, indexing="ij")
+        anchors = torch.stack([gx.reshape(-1), gy.reshape(-1)], 1)  # [24,2]
+        self.register_buffer("lg_anchors", anchors)
+        # normalized sample coords on the ROI crop (rows x 60..-10, cols y)
+        u = (25.0 - anchors[:, 1]) / 50.0 * 2 - 1
+        v = (60.0 - anchors[:, 0]) / 70.0 * 2 - 1
+        self.register_buffer("lg_grid",
+                             torch.stack([u, v], 1).view(1, LG_M, 1, 2))
+        self.lg_mlp = nn.Sequential(nn.Linear(130, 256), nn.ReLU(inplace=True),
+                                    nn.Linear(256, 256), nn.ReLU(inplace=True))
+        self.lg_pts = nn.Linear(256, LG_P * 2)
+        self.lg_meta = nn.Linear(256, 4)       # exist + 3-class logits
+        self.lg_adj = nn.Sequential(nn.Linear(512, 128), nn.ReLU(inplace=True),
+                                    nn.Linear(128, 1))
+        # 4. occupancy flow
+        self.flow_head = nn.Conv2d(192, 2, 1)
+
+    def temporal_fuse(self, bev):
+        hb, th = self._prev
+        if hb is None:
+            cat = [bev] + [torch.zeros_like(bev)] * HIST_N
+        else:
+            cat = [bev]
+            for i in range(HIST_N):
+                grid = F.affine_grid(th[:, i].to(bev.dtype), list(bev.shape),
+                                     align_corners=False)
+                cat.append(F.grid_sample(hb[:, i].to(bev.dtype), grid,
+                                         align_corners=False))
+        return bev + self.tfuse3(torch.cat(cat, 1))
+
+    def forward(self, imgs, K, T_cam_ego, v0=None, prev_bev=None,
+                warp_theta=None):
+        out = super().forward(imgs, K, T_cam_ego, v0, prev_bev, warp_theta)
+        flow = self.flow_head(self._occ_feat)
+        roi = self._last_bev[:, :, 100:450, 125:375]
+        f = self.lg_tower(roi)
+        B = f.shape[0]
+        emb = F.grid_sample(f, self.lg_grid.expand(B, -1, -1, -1),
+                            align_corners=False)[..., 0].transpose(1, 2)
+        emb = self.lg_mlp(torch.cat(
+            [emb, self.lg_anchors.unsqueeze(0).expand(B, -1, -1) / 30.0], 2))
+        pts = self.lg_pts(emb).view(B, LG_M, LG_P, 2) * 30.0             + self.lg_anchors.view(1, LG_M, 1, 2)
+        meta = self.lg_meta(emb)
+        pair = torch.cat([emb.unsqueeze(2).expand(-1, -1, LG_M, -1),
+                          emb.unsqueeze(1).expand(-1, LG_M, -1, -1)], 3)
+        adj = self.lg_adj(pair)[..., 0]
+        return out + (flow, pts, meta, adj)
+
+    # ---- 1. WTA losses -------------------------------------------------
+    def ego_loss(self, ego, gt):
+        valid = gt[:, 16:17]
+        n = valid.sum().clamp(min=1)
+        Kn = EGO_K
+        wps = ego[:, :12 * Kn].view(-1, Kn, 6, 2)
+        err = torch.abs(wps - gt[:, :12].view(-1, 1, 6, 2))
+        wp_ek = (err[..., 0] + 4.0 * err[..., 1]).mean(2) / 2.5  # [B,K]
+        best = wp_ek.detach().argmin(1)
+        wp_e = wp_ek.gather(1, best[:, None])
+        mlog = ego[:, 12 * Kn:12 * Kn + Kn]
+        ce = F.cross_entropy(mlog, best, reduction="none")[:, None]
+        cw = 1.0 + gt[:, 11:12].abs().clamp(max=6.0) / 1.5
+        nw = (cw * valid).sum().clamp(min=1)
+        wl = (wp_e * cw * valid).sum() / nw
+        cl = (ce * valid).sum() / n
+        o = 12 * Kn + Kn
+        sl = (torch.abs(ego[:, o:o + 1] - gt[:, 14:15]) * cw * valid).sum() / nw
+        al = (torch.abs(ego[:, o + 1:o + 2] - gt[:, 13:14]) * valid).sum() / n
+        p = ego[:, o + 2:o + 3].clamp(-15, 15)
+        bl = (F.binary_cross_entropy_with_logits(
+            p, gt[:, 15:16], reduction="none") * valid).sum() / n
+        return wl + 0.3 * cl + 2.0 * sl + al + 0.5 * bl
+
+    def traj_loss(self, tr_pred, boxes, nbox, traj, tvalid):
+        t, m = self.build_traj_targets(boxes, nbox, traj, tvalid,
+                                       tr_pred.device)
+        if m.sum() == 0:
+            return tr_pred.sum() * 0.0
+        Kn = EGO_K
+        B, _, Hh, Ww = tr_pred.shape
+        wps = tr_pred[:, :12 * Kn].view(B, Kn, 12, Hh, Ww).float()
+        ml = tr_pred[:, 12 * Kn:].float()                    # [B,K,H,W]
+        ek = (torch.abs(wps - t.unsqueeze(1)) * m.unsqueeze(1)).sum(2)
+        best = ek.detach().argmin(1, keepdim=True)           # [B,1,H,W]
+        cell = m.sum(1) > 0                                  # [B,H,W]
+        wl = ek.gather(1, best).squeeze(1)[cell].sum() / m.sum()
+        ce = F.cross_entropy(ml, best.squeeze(1), reduction="none")
+        cl = ce[cell].mean()
+        return wl + 0.3 * cl
+
+    # ---- 4. occupancy-flow loss ----------------------------------------
+    @staticmethod
+    def flow_loss(flow, boxes, nbox, traj, tvalid):
+        """target: per-cell ego-frame velocity of the covering agent box
+        (traj[0]/0.5 s); stationary boxes supervise (0,0)."""
+        import cv2
+        import numpy as np
+        B = flow.shape[0]
+        tgt = np.zeros((B, 2, 200, 200), np.float32)
+        msk = np.zeros((B, 1, 200, 200), np.float32)
+        bx = boxes.detach().cpu().numpy()
+        tj = traj.detach().cpu().numpy()
+        tv = tvalid.detach().cpu().numpy()
+        for b in range(B):
+            for k2 in range(int(nbox[b])):
+                cls, xe, ye, l, w, yaw = bx[b, k2]
+                if l <= 0 or abs(xe) > 42 or abs(ye) > 42:
+                    continue
+                vx = vy = 0.0
+                if tv[b, k2, 0] > 0.5:
+                    vx, vy = tj[b, k2, 0] / 0.5
+                c, s = np.cos(yaw), np.sin(yaw)
+                pts = []
+                for lx, wy in ((l / 2, w / 2), (l / 2, -w / 2),
+                               (-l / 2, -w / 2), (-l / 2, w / 2)):
+                    px = xe + lx * c - wy * s
+                    py = ye + lx * s + wy * c
+                    pts.append([int((40 - py) / 0.4), int((40 - px) / 0.4)])
+                mm = np.zeros((200, 200), np.uint8)
+                cv2.fillPoly(mm, [np.array(pts, np.int32).reshape(-1, 1, 2)], 1)
+                tgt[b, 0][mm > 0] = vx
+                tgt[b, 1][mm > 0] = vy
+                msk[b, 0][mm > 0] = 1
+        tgt_t = torch.from_numpy(tgt).to(flow.device)
+        msk_t = torch.from_numpy(msk).to(flow.device)
+        if msk_t.sum() == 0:
+            return flow.sum() * 0.0
+        return (torch.abs(flow.float() - tgt_t) * msk_t).sum()             / msk_t.sum().clamp(min=1) / 2
+
+    # ---- 3. lane-graph loss (train-time Hungarian) ---------------------
+    @staticmethod
+    def lanegraph_loss(pts, meta, adj, gt_pts, gt_cls, gt_n, gt_adj):
+        from scipy.optimize import linear_sum_assignment
+        B = pts.shape[0]
+        total = pts.sum() * 0.0
+        nb = 0
+        for b in range(B):
+            n = int(gt_n[b])
+            ex_t = torch.zeros(LG_M, device=pts.device)
+            if n == 0:
+                total = total + F.binary_cross_entropy_with_logits(
+                    meta[b, :, 0].float(), ex_t)
+                # graph-preserving zeros: DDP needs every head in the loss
+                total = total + (adj[b].sum() + pts[b].sum()
+                                 + meta[b, :, 1:].sum()) * 0.0
+                nb += 1
+                continue
+            g = gt_pts[b, :n].float()                        # [n,P,2]
+            p = pts[b].float()                               # [M,P,2]
+            d1 = (p.unsqueeze(1) - g.unsqueeze(0)).abs().mean((2, 3))
+            d2 = (p.unsqueeze(1) - g.flip(1).unsqueeze(0)).abs().mean((2, 3))
+            cost = torch.minimum(d1, d2)                     # [M,n]
+            ri, ci = linear_sum_assignment(cost.detach().cpu().numpy())
+            ri = torch.as_tensor(ri, device=pts.device)
+            ci = torch.as_tensor(ci, device=pts.device)
+            total = total + cost[ri, ci].mean()
+            ex_t[ri] = 1.0
+            total = total + F.binary_cross_entropy_with_logits(
+                meta[b, :, 0].float(), ex_t)
+            total = total + F.cross_entropy(meta[b, ri, 1:].float(),
+                                            gt_cls[b][ci].long())
+            a_t = gt_adj[b][ci][:, ci].float()
+            a_p = adj[b][ri][:, ri].float()
+            total = total + 0.5 * F.binary_cross_entropy_with_logits(a_p, a_t)
+            nb += 1
+        return total / max(nb, 1)
+
+
 MODELS = {"v1": IPMSegNet, "v2": IPMSegNetV2, "v3s": IPMSegNetV3,
           "lss": LSSDepthNet, "v8": DepthGatedIPMNet, "v13": DepthSegIPMNet,
           "v13d": DepthSegIPMNetS4, "v14d": DepthSegIPMNetV14,
@@ -1581,4 +1783,4 @@ MODELS = {"v1": IPMSegNet, "v2": IPMSegNetV2, "v3s": IPMSegNetV3,
           "v19": DepthSegIPMNetV19, "v20": DepthSegIPMNetV20,
           "v21": DepthSegIPMNetV21, "v22": DepthSegIPMNetV22,
           "v23": DepthSegIPMNetV23, "v24": DepthSegIPMNetV24,
-          "v25": DepthSegIPMNetV25, "v26": DepthSegIPMNetV26, "v27": DepthSegIPMNetV27, "v28": DepthSegIPMNetV28}
+          "v25": DepthSegIPMNetV25, "v26": DepthSegIPMNetV26, "v27": DepthSegIPMNetV27, "v28": DepthSegIPMNetV28, "v29": DepthSegIPMNetV29}

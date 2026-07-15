@@ -24,7 +24,7 @@ class BevLaneDataset(Dataset):
                  min_cov_core=0.0, min_cov_fwd=0.0, seg2d_key="seg2d",
                  with_bbox2d=False, with_ego=False, with_occ=False,
                  with_agenttraj=False, with_temporal=False, with_tl=False,
-                 with_risk=False):
+                 with_risk=False, with_lanegraph=False, temporal_hist=0):
         self.root = root
         self.gt_key = gt_key
         self.dontcare_sidewalk = dontcare_sidewalk
@@ -42,6 +42,8 @@ class BevLaneDataset(Dataset):
         self.with_occ = with_occ
         self.with_tl = with_tl
         self.with_risk = with_risk
+        self.with_lanegraph = with_lanegraph
+        self.temporal_hist = temporal_hist   # v29: N history slots
         self._tl_cache = {}
         self._ego_cache = {}
         self.augment = augment
@@ -245,7 +247,72 @@ class BevLaneDataset(Dataset):
             except Exception:
                 pass
             out.append(torch.from_numpy(r))
-        if self.with_temporal:
+        if self.with_lanegraph:
+            # pts [24,12,2], cls [24] (255 empty), n, adj [24,24]
+            lp = np.zeros((24, 12, 2), np.float32)
+            lc = np.full(24, 255, np.int64)
+            ln = 0
+            la = np.zeros((24, 24), np.float32)
+            try:
+                z = np.load(os.path.join(self.root, s, "lanegraph.npz"))
+                fi = f["frame"]
+                if fi < len(z["n"]):
+                    lp = z["pts"][fi].astype(np.float32)
+                    lc = z["cls"][fi].astype(np.int64)
+                    ln = int(z["n"][fi])
+                    la = z["adj"][fi].astype(np.float32)
+            except Exception:
+                pass
+            out.append(torch.from_numpy(lp))
+            out.append(torch.from_numpy(lc))
+            out.append(torch.tensor(ln, dtype=torch.int64))
+            out.append(torch.from_numpy(la))
+        if self.with_temporal and self.temporal_hist > 0:
+            # v29 memory queue: N history frames at fi-2, fi-6, fi-14
+            HN = self.temporal_hist
+            OFFS = (2, 6, 14)[:HN]
+            himgs = np.zeros((HN, len(CAMS), 3, 432, 768), np.float32)
+            hrel = np.zeros((HN, 3), np.float32)
+            hval = np.zeros(HN, np.float32)
+            if s not in self._ego_cache:
+                try:
+                    z = np.load(os.path.join(self.root, s, "ego_motion.npz"))
+                    self._ego_cache[s] = {k: z[k] for k in z.files}
+                except Exception:
+                    self._ego_cache[s] = None
+            z = self._ego_cache[s]
+            if z is not None and "pose" in z and f["frame"] < len(z["pose"]):
+                pc_ = z["pose"][f["frame"]]
+                for hi, off in enumerate(OFFS):
+                    fp = self._byfi.get(s, {}).get(f["frame"] - off)
+                    if fp is None or fp["frame"] >= len(z["pose"]):
+                        continue
+                    pp_ = z["pose"][fp["frame"]]
+                    if abs(pc_).sum() == 0 or abs(pp_).sum() == 0:
+                        continue
+                    ok = True
+                    tmp = []
+                    for c in CAMS:
+                        im = cv2.imread(os.path.join(self.root, s,
+                                                     fp["imgs"].get(c, "_")))
+                        if im is None:
+                            ok = False
+                            break
+                        im = im[:, :, ::-1].astype(np.float32) / 255.0
+                        tmp.append(((im - MEAN) / STD).transpose(2, 0, 1))
+                    if not ok:
+                        continue
+                    himgs[hi] = np.stack(tmp)
+                    dy = float(pc_[2] - pp_[2])
+                    cp, sp = np.cos(pp_[2]), np.sin(pp_[2])
+                    dx0, dy0 = pc_[0] - pp_[0], pc_[1] - pp_[1]
+                    hrel[hi] = (cp * dx0 + sp * dy0,
+                                -sp * dx0 + cp * dy0, dy)
+                    hval[hi] = 1.0
+            out.append(torch.from_numpy(np.ascontiguousarray(himgs)))
+            out.append(torch.from_numpy(hrel))
+            out.append(torch.from_numpy(hval))
+        elif self.with_temporal:
             # previous frame (0.4 s back): images + relative 2D pose
             pimgs = np.zeros((len(CAMS), 3, 432, 768), np.float32)
             rel = np.zeros(3, np.float32)
