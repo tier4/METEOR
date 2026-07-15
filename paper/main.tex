@@ -16,8 +16,8 @@
 \newcommand{\eg}{e.g.,}
 \newcommand{\ie}{i.e.,}
 
-\title{\textbf{\meteor{}: From Raw Surround-View Recordings to a Seven-Task\\
-Driving Network without Human Labels or Human-Written Code}}
+\title{\textbf{\meteor{}: From Raw Surround-View Recordings to a Twelve-Task\\
+Driving Network with \emph{Zero Human Annotation} and \emph{Zero Human-Written Code}}}
 \author{Dan Umeda\\
 TIER IV, Inc.\\
 \texttt{https://github.com/tier4/METEOR}}
@@ -28,30 +28,40 @@ TIER IV, Inc.\\
 
 \begin{abstract}
 We present \meteor{} (Multi-task Estimation of Traffic Elements, Objects and
-Roads), a surround-view, camera-only network that predicts seven driving tasks
-in a single forward pass---BEV lane segmentation, metric depth, oriented 3D
-boxes, 21-class 2D segmentation, 10-class 2D detection, 3D semantic occupancy,
-and an end-to-end driving output (trajectory, steering, acceleration,
-braking)---and, equally importantly, the fully automated pipeline that builds
-it. Every supervision signal is distilled offline from raw eight-camera
-recordings of the Co-MLOps Data Recording System by an autolabel factory
-built on the CoMET autolabeling foundation, which combines LiDAR, ego-motion
-and 2D panoptic pseudo-labels; no human annotated a single box, mask, or
-trajectory. The network couples a shared image backbone with a
-\emph{depth-gated inverse perspective mapping} that uses predicted depth as a
-visibility gate for geometric BEV projection, and restricts itself to
-TensorRT-exportable operators (38.3\,M parameters, 3.1\,TFLOPs for eight
-cameras). We describe a rolling-round training methodology in which data
-conversion, ground-truth refinement and multi-task training run concurrently,
-and report a series of measurement-driven loss corrections---curvature-weighted
-imitation, coverage-preserving thin-class rasterisation, and small-object
-retention---each of which repaired a quantified failure mode. On a held-out
-recording, \meteor{} reaches 0.292 BEV lane mIoU, 1.60\,m depth MAE, and a
-3\,s trajectory ADE of 0.76\,m (0.72\,m on curves, brought down from 2.31\,m
-by curvature weighting). Finally, the entire system---models, pipeline,
-training and analysis code, and this manuscript---was authored by a large
-language model agent (Claude Fable~5) operating autonomously under human
-direction, which we discuss as a development methodology.
+Roads), a surround-view, camera-only network that predicts twelve driving
+tasks in a single forward pass---BEV lane segmentation, metric depth,
+oriented 3D boxes, 21-class 2D segmentation, 10-class 2D detection, 3D
+semantic occupancy with ground-plane flow, multimodal end-to-end driving
+(three trajectory hypotheses with confidences, steering, acceleration,
+braking), one-shot multi-agent forecasting with an explicit parked/stopped
+flag, ego-relevant traffic-light state, a continuous near-range risk field,
+and a vector lane graph---and, equally importantly, the fully automated
+pipeline that builds it. \textbf{No human annotated a single box, mask,
+waypoint or light state, and no human wrote a single line of code}: every
+supervision signal is distilled offline from raw eight-camera recordings of
+the Co-MLOps Data Recording System by a fourteen-stage autolabel factory
+built on the CoMET autolabeling foundation, and the complete system---the
+factory, the network, the trainer, the deployment stack, and this
+manuscript---was authored by an LLM agent (Claude Fable~5) operating
+autonomously under human direction. The network couples a shared image
+backbone with a \emph{depth-gated inverse perspective mapping}, a streaming
+temporal memory (three ego-motion-warped BEV slots covering 2.8\,s), and
+task routing that serves geometry heads from the single-frame BEV and motion
+heads from the fused BEV; it restricts itself to TensorRT-exportable
+operators (45.8\,M parameters) and runs all tasks in a single fp16 engine at
+$\sim$70\,ms per eight-camera frame on one L40S. A rolling-round training
+methodology interleaves data conversion, ground-truth refinement and
+training; we document its measurement-driven corrections---curvature-weighted
+imitation, camera-confirmation relaxation for vulnerable road users,
+near-range-first detection supervision, 3$\times$3-neighbourhood yaw targets,
+learned-fusion grafting for warm starts, and automatic exclusion of
+GNSS-dead indoor scenes detected from the sky fraction of 2D
+autolabels---each of which repaired a quantified failure mode. On a held-out
+recording day, \meteor{} reaches 0.283 BEV lane mIoU, 0.490 2D-segmentation
+mIoU, 1.60\,m depth MAE, 3\,s trajectory ADE of 0.66\,m (0.62\,m on curves,
+down from 2.31\,m), near-corridor vehicle recall of 0.67 with $6.3^\circ$
+yaw error, and 0.88 traffic-light accuracy---\emph{all without a single
+human label}.
 \end{abstract}
 
 \section{Introduction}
@@ -68,14 +78,15 @@ This paper describes an attempt to close that loop completely. Starting from
 raw recordings of the Co-MLOps Data Recording System
 (DRS)\footnote{\url{https://co-mlops.tier4.jp/}}---eight synchronized cameras,
 a concatenated LiDAR, ego-poses, and machine-generated 2D panoptic
-labels---we build \emph{seven} supervision signals and train a single
+labels---we build \emph{twelve} supervision signals and train a single
 multi-task network, with two hard constraints that we believe make the result
 practically interesting:
 
 \begin{itemize}\itemsep1pt
-\item \textbf{Zero human labels.} All ground truth is produced by an
-autolabel factory built on CoMET, the autolabeling foundation of the Co-MLOps
-project. Humans never annotate; they only record.
+\item \textbf{Zero human labels.} All ground truth---including traffic-light
+states, per-agent futures, risk fields and the vector lane graph---is produced
+by an autolabel factory built on CoMET, the autolabeling foundation of the
+Co-MLOps project. \emph{Humans never annotate; they only record and drive.}
 \item \textbf{Zero human-written code.} The complete system---ground-truth
 extractors, model, trainer, demo tooling, documentation, and this
 paper---was written by an LLM agent (Claude Fable~5) working autonomously
@@ -84,17 +95,24 @@ under human direction (Sec.~\ref{sec:agent}).
 
 \noindent Our contributions are:
 \begin{enumerate}\itemsep1pt
-\item \textbf{An autolabel factory for seven tasks} (Sec.~\ref{sec:factory}):
-a ten-stage, per-scene, resumable pipeline that turns raw DRS recordings into
-BEV lane maps, dense metric depth, camera-confirmed oriented 3D boxes,
+\item \textbf{An autolabel factory for twelve tasks} (Sec.~\ref{sec:factory}):
+a fourteen-stage, per-scene, resumable pipeline that turns raw DRS recordings
+into BEV lane maps, dense metric depth, camera-confirmed oriented 3D boxes,
 21-class 2D segmentation, 10-class 2D boxes, end-to-end driving targets
-derived purely from ego-motion, and 3D semantic occupancy with ray-carved free
-space---plus the quality gates that make such labels trainable.
-\item \textbf{\meteor{}} (Sec.~\ref{sec:arch}): a 38.3\,M-parameter,
-3.1\,TFLOP surround-view network whose depth-gated IPM converts image features
-to BEV using only TensorRT-friendly operators, and whose head design follows
-an explicit capacity rule---\emph{parameters at low resolution, compute at
-high resolution}---that adds tasks at $<5\%$ marginal cost.
+derived purely from ego-motion, 3D semantic occupancy with ray-carved free
+space, per-agent 3\,s futures with stationary flags, ego-relevant
+traffic-light states distilled from TLR autolabels, a potential-field risk
+map, and a vector lane graph with adjacency---plus a four-layer cleansing
+stack (scene, frame, label, loss) that makes such labels trainable.
+\item \textbf{\meteor{}} (Sec.~\ref{sec:arch}): a 45.8\,M-parameter
+surround-view network whose depth-gated IPM converts image features to BEV
+using only TensorRT-friendly operators, extended with a streaming three-slot
+temporal memory, task routing (geometry heads on the raw single-frame BEV,
+motion heads on the fused BEV), and winner-takes-all multimodal trajectories
+($K{=}3$); the head design follows an explicit capacity rule---\emph{parameters
+at low resolution, compute at high resolution}---that adds tasks at $<5\%$
+marginal cost, and the whole graph deploys as one fp16 TensorRT engine at
+$\sim$70\,ms per frame.
 \item \textbf{A rolling-round training methodology}
 (Sec.~\ref{sec:training}): data conversion, GT re-extraction and training run
 concurrently; each $\sim$24\,h round folds in newly converted scenes and
@@ -296,6 +314,54 @@ sweep at 0.4\,m intervals; coarser stepping (an early 1.7\,m version) left
 most above-road voxels unknown, and the trained model hallucinated confident
 structure in exactly those unsupervised regions.
 
+\subsection{Agent futures and stationary flags}
+The same camera-confirmed instances used for 3D boxes are tracked through
+the annotation timeline to yield, per agent, six future offsets at
+0.5\,s spacing (3\,s horizon). A binary stationary flag is derived on the
+fly during training as $|$displacement@3s$|<0.5$\,m; 32\% of valid agents
+are stationary (parked rows), giving the flag a balanced signal. For
+vulnerable road users the camera-confirmation overlap threshold is relaxed
+from 0.3 to 0.15---their small 2D projections are dominated by geometric
+error, and the strict gate silently deleted a third of them; relaxing it
+raised VRU recall from 0.08 to 0.25 in one round.
+
+\subsection{Ego-relevant traffic-light state}
+CoMET's TLR subnet already writes per-image light boxes with colour states
+into the 2D autolabels; we reduce them to one whole-image label per frame
+with an ego-relevance heuristic: the front telephoto camera wins outright
+(its narrow field of view looks straight down the travel corridor), else the
+front wide camera restricted to the central 50\% of the image; the largest
+confirmed box supplies the state, and a 3-frame temporal median removes
+single-frame flickers. Classes are none/green/yellow/red.
+
+\subsection{Near-range risk field}
+A continuous potential field on a $\pm$40$\times$$\pm$25\,m grid: each
+agent contributes an anisotropic Gaussian lobe that grows and leads with its
+GT speed (comet-shaped for vehicles, isotropic for VRUs, tight for parked
+vehicles), the static world contributes a distance falloff from occupied
+voxels, lobes combine saturatingly ($1-e^{-1.6\Sigma}$), and the field is
+weighted toward the ego neighbourhood. The definition composes upstream
+gates---camera-confirmed agents, ray-carved occupancy---so cleansing
+propagates.
+
+\subsection{Vector lane graph}
+The factory's vectorisation stage already produces connected polyline maps
+per scene; per frame we transform them into the ego frame, clip to the ROI
+($x\in[-10,60]$\,m, $|y|\le25$\,m), resample every chain to 12 points, keep
+the 24 nearest slots over \{laneline, road edge, stopline\}, and record an
+adjacency matrix linking consecutive pieces and near-touching endpoints
+($<$1\,m)---a planner-consumable structure rather than a raster.
+
+\subsection{Indoor / GNSS-dead exclusion}
+Underground garages defeat pose estimation \emph{silently}: the fused pose
+drifts smoothly, so kinematic sanity checks pass while every pose-derived
+target (E2E, futures, temporal warps, BEV accumulation) is fiction. We
+detect the \emph{environment} instead of the failure: the mean sky fraction
+of the front-wide 2D segmentation autolabel is $\approx$0.000 indoors versus
+0.35+ outdoors even at night; thresholding at 0.02 flags 99 of 3{,}021
+scenes (including three validation scenes that had been silently polluting
+E2E metrics), which are excluded from both training and validation.
+
 \subsection{Quality gates}
 Three train-time filters removed systematic label noise: scene-end trimming
 (the last 10 frames lack forward accumulation), a per-frame GT-coverage
@@ -381,6 +447,37 @@ Total & 38.31\,M & $\sim$3118 & \\
 \end{tabular}
 \end{table}
 
+\subsection{Temporal memory and task routing}
+Since v22 the BEV is temporal: the previous frame's raw BEV, warped into the
+current frame by the relative ego pose (affine grid + sampling, no RNN), is
+fused residually; v29 generalises this to a three-slot memory at
+$t{-}0.4/1.2/2.8$\,s with per-slot warps, covering occlusion persistence as
+well as velocity. The recurrence lives \emph{outside} the graph: at
+deployment the history BEVs and warp matrices are ordinary engine inputs and
+the current raw BEV is an ordinary output, so the graph stays static.
+Crucially, tasks are \emph{routed}: lanes, 3D boxes and occupancy read the
+raw single-frame BEV (temporal warps smear static geometry with
+moving-object ghosts), while the E2E head and agent forecasting read the
+fused BEV where velocity lives. Routing was verified numerically by
+perturbing the history inputs and checking output invariances. When a new
+fusion module replaces a trained one across rounds, its weights are
+\emph{grafted}, not re-initialised: a zero-initialised fusion is
+function-preserving for the geometry heads but starves the motion heads of
+the transformed features they were trained on, and their heavily weighted
+losses then degrade the shared backbone---a failure we measured (BEV mIoU
+0.283$\to$0.211) before adopting grafting, after which the fused output is
+bit-equal to the previous round's at initialisation.
+
+\subsection{Multimodal trajectories}
+Single-trajectory imitation averages over genuinely ambiguous futures
+(straight vs.\ turn) and produces the geometric mean of both---a path
+through neither. The ego head therefore predicts $K{=}3$ trajectory
+hypotheses with mode confidences, trained winner-takes-all: only the
+hypothesis closest to the GT receives the (curvature-weighted) regression
+loss, and a cross-entropy trains the confidences toward the winner. The
+same widening applies to per-agent forecasting. Modes warm-start as copies
+of the previously trained single mode with symmetry-breaking noise.
+
 \section{Training}
 \label{sec:training}
 
@@ -438,22 +535,29 @@ All numbers below are single-model, single-pass; no test-time augmentation.
 \toprule
 Metric & Value\\
 \midrule
-BEV lane mIoU (8 classes + bg) & 0.292\\
-2D segmentation mIoU (21 classes) & 0.451\\
-\quad lane line / pole IoU & 0.483 / 0.449\\
+BEV lane mIoU (8 classes + bg) & 0.283\\
+2D segmentation mIoU (21 classes) & 0.490\\
 Depth MAE (0--80\,m, 8 cams) & 1.60\,m\\
-E2E trajectory ADE / FDE (3\,s) & 0.76\,m / 1.65\,m\\
-E2E curve ADE ($|y_{3s}|>2$\,m) & 0.72\,m\\
-Steering MAE / brake accuracy & 0.027\,rad / 0.81\\
+3D det.\ near-corridor recall veh / VRU ($<$30\,m, $|y|<$12\,m) & 0.67 / 0.45\\
+3D det.\ yaw axis error / direction flips & $6.3^\circ$ / 11\%\\
+E2E trajectory ADE / FDE (3\,s) & 0.66\,m / 1.39\,m\\
+E2E curve ADE ($|y_{3s}|>2$\,m) & 0.62\,m\\
+Steering MAE / brake accuracy & 0.019\,rad / 0.78\\
+Agent forecast ADE (3\,s) / stationary-flag acc. & 1.83\,m / 0.69\\
+Traffic-light state accuracy & 0.88\\
+Risk-field L1 (all / high-risk cells) & 0.079 / 0.126\\
 Occupancy road IoU (0--10 / 10--20 / 20--40\,m) & 0.63 / 0.64 / 0.64\\
 \bottomrule
 \end{tabular}
 \end{table}
 
 Table~\ref{tab:main} summarises the current operating point. We stress the
-context: every number is achieved \emph{without a single human label}, and
-the validation recording is from a different day and route than all training
-data. Fig.~\ref{fig:qual} shows qualitative output.
+context: \textbf{every number is achieved without a single human label and
+without a single line of human-written code}, and the validation recording is
+from a different day and route than all training data; indoor (GNSS-dead)
+segments are excluded from both sides by the sky-fraction gate. The
+occupancy-flow and lane-graph heads were in their first training round at
+submission time and are reported qualitatively only. Fig.~\ref{fig:qual} shows qualitative output.
 
 \subsection{Curvature weighting for imitation}
 \label{sec:exp:curve}
@@ -498,6 +602,19 @@ lanes with oriented boxes and the E2E trajectory with control gauges.
 Bottom: the corresponding fully automatic ground truth.}
 \label{fig:qual}
 \end{figure}
+
+\section{Deployment}
+The entire network exports as one static ONNX graph (all task outputs plus
+the raw BEV for the streaming recurrence); \texttt{affine\_grid} is
+replaced at export by a constant base grid and a matrix product, after which
+every operator is TensorRT-native---no plugins. ONNX-Runtime outputs match
+PyTorch to $\sim$$10^{-5}$ on all heads. A stock fp16 build on TensorRT~8.6
+runs the full eight-camera, all-task graph at 14.4 inferences/s
+($\sim$70\,ms/frame) on a single L40S that was concurrently running a
+training job---a lower bound. The temporal memory is a device-side ring
+buffer maintained by the host runtime: history BEVs and warp matrices enter
+as inputs, the raw BEV returns as an output, and the graph itself remains
+feed-forward.
 
 \section{Agent-Authored Development}
 \label{sec:agent}
