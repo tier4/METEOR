@@ -111,6 +111,34 @@ def boundary_weight(gt, radius=2, w=4.0):
     return 1.0 + (w - 1.0) * bnd
 
 
+class EpochSubsetSampler(torch.utils.data.Sampler):
+    """Draw a FRESH random subset of `n` samples every epoch, sharded across
+    DDP ranks.
+
+    It replaces `Subset(RandomState(0).permutation(len)[:n])`, which pinned
+    every epoch of every round to the same 46k of 340k frames -- 86% of the
+    extracted corpus was never trained on. All ranks share the same seed so
+    they draw the same subset, then take disjoint slices of it.
+    """
+    def __init__(self, n_total, n_draw, rank=0, world=1, seed=0):
+        self.n_total, self.n_draw = n_total, min(n_draw, n_total)
+        self.rank, self.world, self.seed = rank, world, seed
+        self.epoch = 0
+
+    def set_epoch(self, ep):
+        self.epoch = ep
+
+    def __iter__(self):
+        g = torch.Generator()
+        g.manual_seed(self.seed + 9973 * self.epoch)
+        idx = torch.randperm(self.n_total, generator=g)[:self.n_draw]
+        per = self.n_draw // self.world
+        return iter(idx[self.rank * per:(self.rank + 1) * per].tolist())
+
+    def __len__(self):
+        return self.n_draw // self.world
+
+
 def split_scenes(root):
     scenes = sorted(os.listdir(root))
     # indoor / GNSS-dead scenes (annotate_indoor.py): ego pose is a smooth
@@ -629,6 +657,8 @@ def main():
     ap.add_argument("--flow-w", type=float, default=0.0)
     ap.add_argument("--val-every", type=int, default=0,
                     help="probe BEV mIoU + 3D det every N steps (0=off)")
+    ap.add_argument("--seed-subset", type=int, default=0,
+                    help="base seed for the per-epoch training subset")
     ap.add_argument("--aug", action="store_true")
     ap.add_argument("--dice-w", type=float, default=0.0)
     ap.add_argument("--far-w", type=float, default=0.0,
@@ -706,9 +736,8 @@ def main():
                         min_cov_core=args.min_cov_core,
                         min_cov_fwd=args.min_cov_fwd,
                         seg2d_key=args.seg2d_key)
-    if args.limit_train:
-        idx = np.random.RandomState(0).permutation(len(tr))[:args.limit_train]
-        tr = torch.utils.data.Subset(tr, idx.tolist())
+    # NOTE: --limit-train no longer slices the dataset here; it is applied
+    # per epoch by EpochSubsetSampler so each epoch sees fresh frames.
     if is_main:
         # val never needs depth GT (BEV mIoU eval only) -> with_depth=False
         va = BevLaneDataset(args.root, val_s, max_per_scene=8, gt_key=args.gt_key,
@@ -720,13 +749,23 @@ def main():
                             with_risk=use_risk, with_lanegraph=use_lg,
                             temporal_hist=hist_n,
                             trim_start=3, trim_end=args.trim_end)
+        seen = min(args.limit_train or len(tr), len(tr)) * args.epochs
         print(f"train {len(tr)} samples / {len(train_s)} scenes; "
               f"val {len(va)} samples / {len(val_s)} scenes; "
               f"world={world} lr={lr:.1e}", flush=True)
+        print(f"[data] {args.limit_train or len(tr)} fresh samples/epoch x "
+              f"{args.epochs} ep = {seen} draws over {len(tr)} frames "
+              f"({100 * min(seen, len(tr)) / max(len(tr), 1):.0f}% expected "
+              f"coverage)", flush=True)
         dv = DataLoader(va, batch_size=args.batch, shuffle=False,
                         num_workers=4, pin_memory=True)
 
-    sampler = DistributedSampler(tr) if ddp else None
+    if args.limit_train and args.limit_train < len(tr):
+        sampler = EpochSubsetSampler(len(tr), args.limit_train,
+                                     rank=rank if ddp else 0,
+                                     world=world, seed=args.seed_subset)
+    else:
+        sampler = DistributedSampler(tr) if ddp else None
     # with depth the extra per-sample tensor + many DDP workers exhaust the
     # shared-memory collate ("resize storage not resizable"); lighten the loader.
     pin = not use_depth
