@@ -1642,7 +1642,10 @@ class DepthSegIPMNetV29(DepthSegIPMNetV28):
                 warp_theta=None):
         out = super().forward(imgs, K, T_cam_ego, v0, prev_bev, warp_theta)
         flow = self.flow_head(self._occ_feat)
-        roi = self._last_bev[:, :, 100:450, 125:375]
+        # detached: the lane-graph loss is large early and its gradients
+        # through the shared raw BEV wrecked every other task in r20 --
+        # the slot decoder learns on frozen features, interference-free
+        roi = self._last_bev.detach()[:, :, 100:450, 125:375]
         f = self.lg_tower(roi)
         B = f.shape[0]
         emb = F.grid_sample(f, self.lg_grid.expand(B, -1, -1, -1),
