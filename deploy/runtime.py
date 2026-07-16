@@ -30,9 +30,11 @@ try:                                     # imported lazily so decode utils
 except Exception:                        # pragma: no cover
     _TRT = False
 
-INPUTS = ["imgs", "K", "T_cam_ego", "v0", "prev_bev", "warp_theta"]
+INPUTS = ["imgs", "K", "T_cam_ego", "v0", "hist_bev", "hist_theta"]
 OUTPUTS = ["lane", "depth", "seg2d", "hm", "reg", "hm2d", "reg2d",
-           "ego", "occ", "traj", "stationary", "raw_bev"]
+           "ego", "occ", "traj", "stationary", "tl", "risk", "flow",
+           "lg_pts", "lg_meta", "lg_adj", "raw_bev"]
+HIST_OFFS = (2, 6, 14)          # slots at t-0.4 / -1.2 / -2.8 s (5 Hz frames)
 MEAN = np.array([0.485, 0.456, 0.406], np.float32)
 STD = np.array([0.229, 0.224, 0.225], np.float32)
 
@@ -88,27 +90,35 @@ class MeteorRT:
             self.dev[nm] = cuda.mem_alloc(self.host[nm].nbytes)
             self.ctx.set_tensor_address(nm, int(self.dev[nm]))
         self.stream = cuda.Stream()
-        self._prev_bev = np.zeros(self.shapes["prev_bev"], np.float32)
-        self._prev_pose = None
+        self._hist = {}                 # frame index -> (raw_bev, pose)
+        self._t = 0
 
     def reset(self):
         """call at scene boundaries: drops the temporal state."""
-        self._prev_bev[:] = 0
-        self._prev_pose = None
+        self._hist.clear()
+        self._t = 0
 
     def infer(self, imgs, K, T_cam_ego, v0, pose=None):
         """imgs [1,8,3,432,768] f32 (preprocess_images), K [1,8,3,3],
         T_cam_ego [1,8,4,4], v0 scalar, pose (x, y, yaw) or None.
-        Returns {name: ndarray}; feeds raw_bev/theta forward automatically."""
-        if pose is None or self._prev_pose is None:
-            theta = _identity_theta()
-            if pose is None:
-                self._prev_bev[:] = 0        # no odometry -> no history
-        else:
-            theta = make_warp_theta(self._prev_pose, pose)
+
+        Returns {name: ndarray}. The temporal memory is maintained here:
+        each frame's raw_bev is stored with its pose and the three history
+        slots (t-0.4 / -1.2 / -2.8 s) are fed back on the next call. Slots
+        with no history yet are zero-filled with an identity warp, exactly
+        as training does for scene starts."""
+        hb = np.zeros(self.shapes["hist_bev"], np.float32)
+        ht = np.zeros(self.shapes["hist_theta"], np.float32)
+        for i, off in enumerate(HIST_OFFS):
+            h = self._hist.get(self._t - off)
+            if h is None or pose is None or h[1] is None:
+                ht[0, i] = _identity_theta()[0]
+                continue
+            hb[0, i] = h[0]
+            ht[0, i] = make_warp_theta(h[1], pose)[0]
         feed = {"imgs": imgs, "K": K, "T_cam_ego": T_cam_ego,
                 "v0": np.array([v0], np.float32),
-                "prev_bev": self._prev_bev, "warp_theta": theta}
+                "hist_bev": hb, "hist_theta": ht}
         for nm, v in feed.items():
             np.copyto(self.host[nm],
                       np.ascontiguousarray(v, np.float32).ravel())
@@ -120,8 +130,10 @@ class MeteorRT:
         self.stream.synchronize()
         for nm in OUTPUTS:
             out[nm] = self.host[nm].reshape(self.shapes[nm]).copy()
-        self._prev_bev = out["raw_bev"]
-        self._prev_pose = pose
+        self._hist[self._t] = (out["raw_bev"][0], pose)
+        for k in [k for k in self._hist if k < self._t - max(HIST_OFFS)]:
+            del self._hist[k]
+        self._t += 1
         return out
 
 

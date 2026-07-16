@@ -1,5 +1,9 @@
 #!/usr/bin/env python3
-"""Render the English METEOR architecture diagram (docs/media/architecture.png)."""
+"""Render the English METEOR architecture diagram (docs/media/architecture.png).
+
+v29: 12 tasks, streaming 3-slot temporal memory, task-routed BEV
+(geometry heads on the raw single-frame BEV, motion heads on the fused BEV).
+"""
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
@@ -7,15 +11,17 @@ from matplotlib.patches import FancyArrowPatch, FancyBboxPatch
 
 AI = "#F7CE9C"      # learned
 OP = "#CFE2F3"      # geometry / fixed
-E2E = "#E8D5F2"     # planning
+E2E = "#E8D5F2"     # planning / motion
+MEM = "#FDE7B5"     # temporal memory
 IN = "#EEEEEE"
 EDGE = "#606870"
 DARK = "#202830"
 GREEN = "#1B7837"
+AMBER = "#B9770E"
 
-fig, ax = plt.subplots(figsize=(17.6, 8.6), dpi=110)
-ax.set_xlim(0, 176)
-ax.set_ylim(0, 86)
+fig, ax = plt.subplots(figsize=(19.0, 9.6), dpi=110)
+ax.set_xlim(0, 190)
+ax.set_ylim(0, 96)
 ax.axis("off")
 
 
@@ -35,72 +41,114 @@ def box(x, y, w, h, title, sub="", out="", fc=AI, fs=12, sfs=9.2):
                 va="center", fontsize=sfs, color=GREEN, fontweight="bold")
 
 
-def arrow(x1, y1, x2, y2, lw=1.6):
+def arrow(x1, y1, x2, y2, lw=1.6, col=DARK):
     ax.add_patch(FancyArrowPatch((x1, y1), (x2, y2), arrowstyle="-|>",
-                                 mutation_scale=14, lw=lw, color=DARK))
+                                 mutation_scale=14, lw=lw, color=col))
 
 
 # ---- inputs (left column) ----
-box(2, 56, 17, 12, "8 cameras", "3ch 432×768\nWIDE/L/R/NARROW ×F/B", fc=IN, fs=11)
-box(2, 36, 17, 9, "Calibration K/T", "used by IPM only", fc=IN, fs=10.5)
-box(2, 20, 17, 9, "Speed v0", "used by E2E only", fc=IN, fs=10.5)
+box(1, 62, 17, 12, "8 cameras", "3ch 432×768\nWIDE/L/R/NARROW ×F/B", fc=IN, fs=11)
+box(1, 46, 17, 8.5, "Calibration K/T", "used by IPM only", fc=IN, fs=10.5)
+box(1, 33, 17, 8.5, "Speed v0", "used by E2E only", fc=IN, fs=10.5)
+box(1, 18, 17, 9.5, "Ego pose", "→ warp θ ×3 slots", fc=IN, fs=10.5)
 
 # ---- image branch ----
-box(25, 56, 21, 12, "ResNet-34 + FPN",
-    "shared feature 160ch\n@108×192 (s4) · 21.7M · 475G", fs=11.5)
-box(54, 72, 30, 11.5, "2D Seg head", "enc-dec s8/s16 · 4.2M · 219G",
-    out="→ 21-class semantics ×8 cams")
-box(54, 57, 30, 11.5, "2D Det head", "3-scale CenterNet · 2.9M · 219G",
-    out="→ 10-class boxes ×8 cams")
-box(54, 42, 30, 11.5, "Depth decoder", "64 bins @s4 · 3.3M · 1093G",
-    out="→ metric depth 0–80 m ×8")
-box(54, 29, 30, 9.5, "Context 1×1", "96ch · 0.02M · 5G", fs=11)
+box(23, 62, 20, 12, "ResNet-34 + FPN",
+    "shared feature 160ch\n@108×192 (s4) · 21.7M", fs=11.5)
+box(50, 82, 28, 10.5, "2D Seg head", "enc-dec s8/s16 · 4.2M",
+    out="→ 21-class semantics ×8", sfs=8.8)
+box(50, 69.5, 28, 10.5, "2D Det head", "3-scale CenterNet · 2.9M",
+    out="→ 10-class boxes ×8", sfs=8.8)
+box(50, 57, 28, 10.5, "Depth decoder", "64 bins @s4 · 3.3M",
+    out="→ metric depth 0–80 m ×8", sfs=8.8)
+box(50, 45.5, 28, 9.5, "TL head", "front WIDE+NARROW · 1.1M",
+    out="→ ego traffic-light state", sfs=8.8)
+box(50, 34.5, 28, 9, "Context 1×1", "96ch · 0.02M", fs=11)
 
 # ---- IPM + BEV ----
-box(92, 36, 25, 13, "Depth-gated IPM",
+box(84, 40, 22, 12.5, "Depth-gated IPM",
     "project (K/T) · grid_sample\n· gather — parameter-free", fc=OP, fs=11.5)
-box(123, 38, 15, 9.5, "BEV feature", "96ch 800×500 @0.2 m", fc=OP, fs=10.5)
+box(111, 52, 17, 9.5, "RAW BEV", "96ch 800×500 @0.2 m\nsingle frame", fc=OP,
+    fs=10.5, sfs=8.6)
+box(111, 33, 17, 11.5, "Temporal fuse", "tfuse3 · 0.6M\nzero-init = identity",
+    fc=MEM, fs=10.5, sfs=8.6)
+box(111, 16, 17, 10.5, "Memory queue", "t−0.4 / 1.2 / 2.8 s\nBEVs, ego-warped",
+    fc=MEM, fs=10, sfs=8.4)
+box(133, 33, 14, 9.5, "FUSED BEV", "96ch · velocity", fc=MEM, fs=10.5, sfs=8.6)
 
-# ---- BEV heads ----
-box(144, 68, 30, 11.5, "BEV lane decoder", "@800×500 · 1.2M · 933G",
-    out="→ 9-class lane map 160×100 m")
-box(144, 53, 30, 11.5, "3D Box head", "CenterPoint @s2 · 0.4M · 82G",
-    out="→ oriented boxes: veh + VRU")
-box(144, 38, 30, 11.5, "Occupancy head", "16z × 200×200 · 0.7M · 55G",
-    out="→ 10-class voxels ±40 m")
-box(144, 23, 30, 11.5, "E2E head", "pyramid+MLP(·, v0) · 4.0M · 37G",
-    out="→ 3 s path · steer · accel · brake", fc=E2E)
+# ---- geometry heads (from RAW BEV) ----
+box(152, 82, 36, 10.5, "BEV lane decoder", "LaneDecED @800×500 · 4.1M",
+    out="→ 9-class lane map 160×100 m", sfs=8.8)
+box(152, 70, 36, 10.5, "3D Box head", "CenterPoint @s2 · 2.1M",
+    out="→ oriented boxes: veh + VRU", sfs=8.8)
+box(152, 58, 36, 10.5, "Occupancy + flow", "16z×200×200 · 0.75M",
+    out="→ 10-class voxels + velocity", sfs=8.8)
+box(152, 46, 36, 10.5, "Lane-graph decoder", "24 anchored slots · 1.4M",
+    out="→ vector chains + adjacency", sfs=8.8)
+
+# ---- motion heads (from FUSED BEV) ----
+box(152, 32, 36, 10.5, "E2E head (K=3)", "pyramid+MLP(·, v0) · 4.0M",
+    out="→ 3 paths + conf · steer/accel/brake", fc=E2E, sfs=8.4)
+box(152, 20, 36, 10.5, "Agent forecast (K=3)", "+ class feature · 0.5M",
+    out="→ per-agent 3 s ×3 + parked flag", fc=E2E, sfs=8.6)
+box(152, 8, 36, 10.5, "Risk field", "ConvBlocks on fused BEV · 0.2M",
+    out="→ area risk ±40×±25 m", fc=E2E, sfs=8.8)
 
 # ---- arrows ----
-arrow(19, 62, 25, 62)
-for hy in (77.5, 62.5, 47.5, 33.5):
-    arrow(46, 62, 54, hy)
-arrow(84, 45, 92, 44)            # depth -> IPM
-arrow(84, 33.5, 92, 40)          # ctx  -> IPM
-arrow(19, 40.5, 92, 41.5)        # K/T  -> IPM
-arrow(117, 42.5, 123, 42.5)
-for hy in (73.5, 58.5, 43.5, 28.5):
-    arrow(138, 43, 144, hy)
-arrow(19, 24.5, 144, 26)         # v0 -> E2E
+arrow(18, 68, 23, 68)
+for hy in (87, 74.5, 62, 50, 39):
+    arrow(43, 68, 50, hy)
+arrow(78, 61, 84, 50)                     # depth -> IPM
+arrow(78, 39, 84, 45)                     # ctx  -> IPM
+arrow(18, 50, 84, 47, lw=1.2)             # K/T  -> IPM
+arrow(106, 47, 111, 55)                   # IPM -> RAW BEV
+arrow(119, 52, 119, 44.5, lw=1.4)         # RAW -> fuse
+arrow(119, 26.5, 119, 33, lw=1.4)         # queue -> fuse
+arrow(18, 22, 111, 21, lw=1.2)            # pose -> queue
+arrow(128, 38, 133, 38)                   # fuse -> FUSED BEV
+for hy in (87, 75, 63, 51):               # raw BEV -> geometry heads
+    arrow(128, 57, 152, hy, col=GREEN, lw=1.3)
+for hy in (37, 25, 13):                   # fused BEV -> motion heads
+    arrow(147, 38, 152, hy, col=AMBER, lw=1.3)
+arrow(18, 37, 152, 34, lw=1.2)            # v0 -> E2E
 
-# ---- legend (bottom-left, clear zone) ----
-lx = 25
+# streaming feedback: the raw BEV returns as next frame's history.
+# Routed through the clear gap between the IPM box (ends x=106.6) and the
+# BEV column (starts x=111) so it crosses nothing.
+for seg, head in ((((111, 54), (108.6, 54)), False),
+                  (((108.6, 54), (108.6, 19)), False),
+                  (((108.6, 19), (111, 19)), True)):
+    ax.add_patch(FancyArrowPatch(seg[0], seg[1],
+                                 arrowstyle="-|>" if head else "-",
+                                 mutation_scale=13, lw=1.5, color=AMBER))
+ax.text(119.5, 12.5, "raw BEV feeds back as next frame's history",
+        ha="center", fontsize=8.4, style="italic", color=AMBER,
+        fontweight="bold")
+
+# ---- legend ----
+lx = 23
 for c, t in ((AI, "learned"), (OP, "geometry (no params)"),
-             (E2E, "planning"), (IN, "inputs")):
-    ax.add_patch(FancyBboxPatch((lx, 8), 3.4, 3.4,
+             (MEM, "temporal memory"), (E2E, "motion / planning"),
+             (IN, "inputs")):
+    ax.add_patch(FancyBboxPatch((lx, 8), 3.0, 3.0,
                                 boxstyle="round,pad=0.3", fc=c, ec=EDGE, lw=1))
-    ax.text(lx + 4.6, 9.7, t, fontsize=10.5, va="center", color=DARK)
-    lx += 7.5 + len(t) * 1.2
-ax.text(25, 3.2, "green = task outputs (one forward pass produces all seven)",
+    ax.text(lx + 4.2, 9.5, t, fontsize=10, va="center", color=DARK)
+    lx += 7.0 + len(t) * 1.15
+ax.text(23, 3.6, "green arrows = geometry tasks read the RAW single-frame BEV   ·   "
+        "amber = motion tasks read the FUSED temporal BEV", fontsize=10,
+        color=DARK)
+ax.text(23, 0.8, "green text = task outputs — one forward pass produces all twelve",
         fontsize=10.5, color=GREEN, fontweight="bold")
 
-ax.text(88, 83.5,
-        "METEOR v20 — 7 tasks · 38.3M params · 3.1 TFLOPs @ 8×768×432 · TensorRT-safe ops only",
-        ha="center", fontsize=14, fontweight="bold", color=DARK)
-ax.text(104, 31.5,
-        "depth gates the IPM:\nfeatures enter the BEV only where\npredicted depth matches the ray range",
-        ha="center", fontsize=9.2, style="italic", color="#555c63")
+ax.text(95, 94,
+        "METEOR v29 — 12 tasks · 45.8M params · one static TensorRT engine "
+        "(fp16, ~70 ms / 8-camera frame) · zero human labels, zero human code",
+        ha="center", fontsize=13.5, fontweight="bold", color=DARK)
+ax.text(95, 29.5,
+        "depth gates the IPM: features enter the BEV only where\n"
+        "predicted depth matches the ray range",
+        ha="center", fontsize=9, style="italic", color="#555c63")
 
 plt.tight_layout()
 plt.savefig("docs/media/architecture.png", bbox_inches="tight", facecolor="white")
-print("saved")
+print("saved docs/media/architecture.png")

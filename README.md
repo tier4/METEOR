@@ -21,8 +21,10 @@
 
 <img src="docs/media/inference.gif" width="880" alt="METEOR multi-task inference"/>
 
-*Live inference — 8 DRS cameras in, everything out: 2D segmentation, 2D & 3D detection,
-metric depth, BEV lane map, 3D occupancy, and an end-to-end driving path (green ribbon).*
+*Live inference (v29) — 8 DRS cameras in, everything out: 2D segmentation, 2D & 3D
+detection with parked/stopped flags, metric depth, BEV lane map, 3D occupancy, the
+ego-relevant traffic-light state, a continuous near-range risk field, and multimodal
+end-to-end driving (3 path hypotheses + confidences).*
 
 </div>
 
@@ -101,20 +103,33 @@ for the geometric projection. No transformers, no deformable attention:
 
 ## The autolabel factory (powered by CoMET / [Co-MLOps](https://co-mlops.tier4.jp/))
 
-Every supervision signal is distilled offline from raw recordings — LiDAR, ego-pose and
-2D panoptic masks — by a 10-stage, per-scene resumable pipeline built on the
-**CoMET autolabeling foundation from the Co-MLOps project**:
+Every supervision signal is distilled offline from raw recordings — LiDAR, ego-pose,
+2D panoptic masks and TLR autolabels — by a **14-stage**, per-scene resumable pipeline
+built on the **CoMET autolabeling foundation from the Co-MLOps project**:
 
 <div align="center">
 <img src="docs/media/groundtruth.gif" width="880" alt="auto-generated ground truth"/>
 
 *Auto-generated GT: 21-class 2D seg + 10-class 2D boxes + BEV lanes + oriented
-3D boxes + E2E trajectory (green) with speed / steering / accel / brake.*
+3D boxes + per-agent 3 s futures + E2E trajectory (green) with speed / steering /
+accel / brake.*
 
 <img src="docs/media/occ_gt.gif" width="880" alt="occupancy ground truth"/>
 
 *3D occupancy GT: accumulated labeled LiDAR, voxelized with ray-carved free space —
 top-down and isometric views.*
+
+<img src="docs/media/lanegraph_flow_gt.gif" width="880" alt="lane-graph and flow ground truth"/>
+
+*Vector lane-graph GT (cyan lane lines, orange road edges, red stop lines, white
+adjacency links) + occupancy-flow GT (green velocity arrows) + the ego path — all
+derived from the same autolabels, no extra annotation.*
+
+<img src="docs/media/risk_gt.gif" width="880" alt="area risk field ground truth"/>
+
+*Near-range area risk field: each agent contributes an anisotropic lobe that grows and
+leads with its GT speed, statics contribute a distance falloff, and the lobes combine
+saturatingly — a continuous hazard map with zero human input.*
 
 </div>
 
@@ -195,30 +210,45 @@ bevlane/
 autolabel_bev.py       # LiDAR x panoptic BEV accumulation (map frame)
 vectorize_bev.py       # raster -> connected polyline vector maps
 run_batch.py           # scene-parallel autolabel production
-deploy/                # ONNX export + streaming TensorRT runtime
+deploy/
+  export_onnx.py       # checkpoint -> static 18-output ONNX (parity-checked)
+  runtime.py           # TensorRT streaming runtime (3-slot memory) + decoders
+  infer_t4dataset.py   # raw t4dataset scene -> TRT inference -> npz + video
 comlops-21cls-autolabel-2504.csv   # 2D seg taxonomy (id, name, colour)
 fastlabel_2510_instance.csv        # 2D det taxonomy (id, name, colour)
 docs/                  # architecture / data / training / demo docs
 ```
 
-## Deployment (TensorRT)
+## Deployment: raw t4dataset → TensorRT, in one command
 
-The whole 8-task network exports to a **single static ONNX graph** (12 outputs,
-verified bit-close against PyTorch) and builds with stock `trtexec --fp16` on
-TensorRT 8.6 — no plugins. The streaming temporal BEV is a **host-side
-recurrence**: `prev_bev`/`warp_theta` are engine inputs, `raw_bev` is an engine
-output that the runtime feeds back on the next frame.
+The whole 12-task network exports to a **single static ONNX graph** (18 outputs,
+every one verified against PyTorch to ~1e-5) and builds with stock
+`trtexec --fp16` on TensorRT 8.6 — **no plugins, no dynamic shapes**. The
+streaming temporal memory is a **host-side recurrence**: the three history BEVs
+and their warp matrices are engine inputs, `raw_bev` is an engine output that
+the runtime rings back on the next frame.
 
 ```bash
-python3 deploy/export_onnx.py --ckpt ckpt.pt --out meteor_v26.onnx --check --fp16
-trtexec --onnx=meteor_v26.onnx --saveEngine=meteor_v26_fp16.engine --fp16
+# 1) checkpoint -> ONNX (parity-checked) -> fp16 engine
+python3 deploy/export_onnx.py --ckpt ckpt.pt --out meteor_v29.onnx --check --fp16
+trtexec --onnx=meteor_v29.onnx --saveEngine=meteor_v29_fp16.engine --fp16
+
+# 2) run it straight on a raw t4dataset scene — no GT, no PyTorch
+python3 deploy/infer_t4dataset.py --engine meteor_v29_fp16.engine \
+        --scene /path/to/t4dataset/<scene> --out out/infer --video out/infer.mp4
 ```
 
-Measured: **~70 ms/frame** (fp16, all 8 cameras, all 8 tasks, single engine —
-on a GPU shared with a running training job).
+`infer_t4dataset.py` reads `annotation/*.json` + `data/CAM_*` directly, rebuilds
+the 8-camera tensor and calibration exactly as training does, derives ego speed
+and pose from `ego_pose`, streams the temporal memory, and writes per-frame
+`npz` (3D boxes with parked flags and speeds, lane map, K=3 ego paths with
+confidences, traffic-light state, risk field, occupancy) plus an overlay video.
+
+Measured: **~70 ms/frame** (fp16, all 8 cameras, all tasks, single engine —
+on a GPU shared with a running training job, so a lower bound).
 
 See [deploy/README.md](deploy/README.md). Pre-exported ONNX weights are attached
-to [release tags](../../tags) (fp16, ~84 MB) — not tracked in the repo.
+to [release tags](../../tags) — not tracked in the repo.
 
 ## Paper
 
