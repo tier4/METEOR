@@ -471,6 +471,47 @@ def evaluate_flow(model, loader, device, bx_idx, max_batches=20,
     return {"epe_mov": em / max(nm, 1), "epe_stat": es / max(ns, 1)}
 
 
+@torch.no_grad()
+def evaluate_unknown(model, loader, device, uk_idx, max_batches=20,
+                     tmp_idx=None):
+    """unknown-object P/R at 1 m centre match (fixed-size class)."""
+    tp = fp = fn = 0
+    model.eval()
+    for bi, batch in enumerate(loader):
+        if bi >= max_batches:
+            break
+        imgs, K, Tc = (t.to(device, non_blocking=True) for t in batch[:3])
+        uc, un = batch[uk_idx], batch[uk_idx + 1]
+        pb, th = _temporal_inputs(model, batch, device, tmp_idx)
+        with torch.autocast("cuda", torch.float16):
+            out = model(imgs, K, Tc, None, pb, th)
+        if len(out) < 18:
+            break
+        dets = model.decode_unknown(out[17].float())
+        for b in range(uc.shape[0]):
+            gt = [(float(uc[b, k, 0]), float(uc[b, k, 1]))
+                  for k in range(int(un[b]))]
+            used = [False] * len(gt)
+            for _, sc, xe, ye, *_ in sorted(dets[b], key=lambda d: -d[1]):
+                best, bd = -1, 1.0
+                for gi, (gx, gy) in enumerate(gt):
+                    if used[gi]:
+                        continue
+                    d = ((gx - xe) ** 2 + (gy - ye) ** 2) ** 0.5
+                    if d < bd:
+                        best, bd = gi, d
+                if best >= 0:
+                    used[best] = True
+                    tp += 1
+                else:
+                    fp += 1
+            fn += used.count(False)
+    model.train()
+    if tp + fn == 0:
+        return None
+    return {"p": tp / max(tp + fp, 1), "r": tp / max(tp + fn, 1)}
+
+
 def evaluate_traj(model, loader, device, tj_idx, max_batches=40,
                   tmp_idx=None):
     _STAT = [0, 0]
@@ -1147,6 +1188,14 @@ def main():
                           + " ".join(f"{k}={tr_[k]:.2f}" for k in
                                      ("none", "green", "yellow", "red")
                                      if k in tr_), flush=True)
+            if use_unk:
+                uk_idx = (4 + int(use_seg2d) + 4 * int(use_traj)
+                          + int(use_ego) + int(use_occ) + int(use_tl)
+                          + int(use_risk) + 4 * int(use_lg))
+                uk = evaluate_unknown(net, dv, device, uk_idx, tmp_idx=vtmp)
+                if uk:
+                    print(f"[valUnk ep{ep}] P={uk['p']:.2f} R={uk['r']:.2f}",
+                          flush=True)
             if use_risk:
                 rk_idx = (4 + int(use_seg2d) + 4 * int(use_traj)
                           + int(use_ego) + int(use_occ) + int(use_tl))

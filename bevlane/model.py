@@ -1837,6 +1837,28 @@ class DepthSegIPMNetV30(DepthSegIPMNetV29):
         return out + (self.unk_head(self._det_feat),)
 
     @staticmethod
+    def decode_unknown(hm_unk, thresh=0.4, topk=32):
+        """-> per-batch list of (cls=2, score, xe, ye, 0.4, 0.4, 0.0):
+        unknown objects join the BEV 3D box stream as a third class with a
+        fixed footprint (no size GT exists for them)."""
+        p = hm_unk.sigmoid()
+        pmax = F.max_pool2d(p, 3, 1, 1)
+        p = p * (pmax == p)
+        B, _, Hh, Ww = p.shape
+        out = []
+        for bi in range(B):
+            flat = p[bi, 0].reshape(-1)
+            sc, idx = flat.topk(min(topk, flat.numel()))
+            keep = sc > thresh
+            boxes = []
+            for s_, i_ in zip(sc[keep].tolist(), idx[keep].tolist()):
+                ri, ci = divmod(i_, Ww)
+                boxes.append((2, s_, 80.0 - ri * DET_RES,
+                              50.0 - ci * DET_RES, 0.4, 0.4, 0.0))
+            out.append(boxes)
+        return out
+
+    @staticmethod
     def unk_loss(hm, centers, n):
         """penalty-reduced focal on 1ch heatmap; Gaussian radius 1.5 cells."""
         B = hm.shape[0]
