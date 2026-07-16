@@ -264,6 +264,8 @@ without Human Labels or Human-Written Code"** — Dan Umeda.
 | [DATA_PIPELINE.md](docs/DATA_PIPELINE.md) | the 10-stage autolabel factory, taxonomies, quality gates |
 | [TRAINING.md](docs/TRAINING.md) | losses, curricula, rolling rounds, operational notes |
 | [DEMO.md](docs/DEMO.md) | demo tooling and video layouts |
+| [DESIGN_v29.md](docs/DESIGN_v29.md) | the v29 design: multimodal K=3, memory queue, lane graph, occupancy flow |
+| [ROADMAP.md](docs/ROADMAP.md) | candidate list for future rounds: known defects, TRT-safe transformer options, capabilities |
 
 ---
 
