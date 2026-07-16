@@ -1668,6 +1668,14 @@ class DepthSegIPMNetV29(DepthSegIPMNetV28):
         return out + (flow, pts, meta, adj)
 
     # ---- 1. WTA losses -------------------------------------------------
+    # Pure winner-takes-all starves the losing modes: with modes warm-started
+    # as near-copies of one trained trajectory, whichever wins first takes
+    # every gradient and the others never differentiate. Measured on val at
+    # r20 ep3: mode 1 won 80/80 samples, hypotheses 0.74 m apart, minADE only
+    # 0.10 m better than top-1 -- i.e. K=3 was dead weight. EPS_WTA keeps the
+    # losers alive with a small share of the loss so they can specialise.
+    EPS_WTA = 0.1
+
     def ego_loss(self, ego, gt):
         valid = gt[:, 16:17]
         n = valid.sum().clamp(min=1)
@@ -1676,7 +1684,9 @@ class DepthSegIPMNetV29(DepthSegIPMNetV28):
         err = torch.abs(wps - gt[:, :12].view(-1, 1, 6, 2))
         wp_ek = (err[..., 0] + 4.0 * err[..., 1]).mean(2) / 2.5  # [B,K]
         best = wp_ek.detach().argmin(1)
-        wp_e = wp_ek.gather(1, best[:, None])
+        e = self.EPS_WTA
+        wp_e = ((1.0 - e) * wp_ek.gather(1, best[:, None])
+                + e * wp_ek.mean(1, keepdim=True))
         mlog = ego[:, 12 * Kn:12 * Kn + Kn]
         ce = F.cross_entropy(mlog, best, reduction="none")[:, None]
         cw = 1.0 + gt[:, 11:12].abs().clamp(max=6.0) / 1.5
@@ -1703,7 +1713,10 @@ class DepthSegIPMNetV29(DepthSegIPMNetV28):
         ek = (torch.abs(wps - t.unsqueeze(1)) * m.unsqueeze(1)).sum(2)
         best = ek.detach().argmin(1, keepdim=True)           # [B,1,H,W]
         cell = m.sum(1) > 0                                  # [B,H,W]
-        wl = ek.gather(1, best).squeeze(1)[cell].sum() / m.sum()
+        e = self.EPS_WTA
+        ek_w = ((1.0 - e) * ek.gather(1, best).squeeze(1)
+                + e * ek.mean(1))
+        wl = ek_w[cell].sum() / m.sum()
         ce = F.cross_entropy(ml, best.squeeze(1), reduction="none")
         cl = ce[cell].mean()
         return wl + 0.3 * cl
