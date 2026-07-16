@@ -1711,13 +1711,15 @@ class DepthSegIPMNetV29(DepthSegIPMNetV28):
         nw = (cw * valid).sum().clamp(min=1)
         wl = (wp_e * cw * valid).sum() / nw
         cl = (ce * valid).sum() / n
+        # r22: mode-confidence CE weighted up 0.3 -> 0.6 (winner confidence
+        # was stuck near 1/3 = undecided while modes specialise)
         o = 12 * Kn + Kn
         sl = (torch.abs(ego[:, o:o + 1] - gt[:, 14:15]) * cw * valid).sum() / nw
         al = (torch.abs(ego[:, o + 1:o + 2] - gt[:, 13:14]) * valid).sum() / n
         p = ego[:, o + 2:o + 3].clamp(-15, 15)
         bl = (F.binary_cross_entropy_with_logits(
             p, gt[:, 15:16], reduction="none") * valid).sum() / n
-        return wl + 0.3 * cl + 2.0 * sl + al + 0.5 * bl
+        return wl + 0.6 * cl + 2.0 * sl + al + 0.5 * bl
 
     def traj_loss(self, tr_pred, boxes, nbox, traj, tvalid):
         t, m = self.build_traj_targets(boxes, nbox, traj, tvalid,

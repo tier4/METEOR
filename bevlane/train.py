@@ -120,9 +120,11 @@ class EpochSubsetSampler(torch.utils.data.Sampler):
     extracted corpus was never trained on. All ranks share the same seed so
     they draw the same subset, then take disjoint slices of it.
     """
-    def __init__(self, n_total, n_draw, rank=0, world=1, seed=0):
+    def __init__(self, n_total, n_draw, rank=0, world=1, seed=0,
+                 weights=None):
         self.n_total, self.n_draw = n_total, min(n_draw, n_total)
         self.rank, self.world, self.seed = rank, world, seed
+        self.weights = weights            # optional per-sample draw weights
         self.epoch = 0
 
     def set_epoch(self, ep):
@@ -131,7 +133,11 @@ class EpochSubsetSampler(torch.utils.data.Sampler):
     def __iter__(self):
         g = torch.Generator()
         g.manual_seed(self.seed + 9973 * self.epoch)
-        idx = torch.randperm(self.n_total, generator=g)[:self.n_draw]
+        if self.weights is not None:
+            idx = torch.multinomial(self.weights, self.n_draw,
+                                    replacement=False, generator=g)
+        else:
+            idx = torch.randperm(self.n_total, generator=g)[:self.n_draw]
         per = self.n_draw // self.world
         return iter(idx[self.rank * per:(self.rank + 1) * per].tolist())
 
@@ -676,6 +682,8 @@ def main():
                     help="probe BEV mIoU + 3D det every N steps (0=off)")
     ap.add_argument("--seed-subset", type=int, default=0,
                     help="base seed for the per-epoch training subset")
+    ap.add_argument("--turn-oversample", type=float, default=1.0,
+                    help="draw weight for turn frames (|lat@3s|>4m)")
     ap.add_argument("--aug", action="store_true")
     ap.add_argument("--dice-w", type=float, default=0.0)
     ap.add_argument("--far-w", type=float, default=0.0,
@@ -778,9 +786,38 @@ def main():
                         num_workers=4, pin_memory=True)
 
     if args.limit_train and args.limit_train < len(tr):
+        weights = None
+        if args.turn_oversample > 1.0:
+            # WTA multimodality only differentiates on samples where the
+            # future turns; those are 7.5% of moving frames (|lat@3s|>4 m),
+            # so straight frames win the modes 12:1. Upweight turn frames.
+            import numpy as _np
+            weights = torch.ones(len(tr))
+            cache = {}
+            n_turn = 0
+            for ii, (s_, f_) in enumerate(tr.items):
+                if s_ not in cache:
+                    try:
+                        z_ = _np.load(os.path.join(args.root, s_,
+                                                   "ego_motion.npz"))
+                        cache[s_] = (z_["wp"], z_["v0"], z_["valid"])
+                    except Exception:
+                        cache[s_] = None
+                z_ = cache[s_]
+                if z_ is None:
+                    continue
+                fi_ = f_["frame"]
+                if fi_ < len(z_[1]) and z_[2][fi_] > 0 and z_[1][fi_] > 2.0 \
+                        and abs(z_[0][fi_, 5, 1]) > 4.0:
+                    weights[ii] = args.turn_oversample
+                    n_turn += 1
+            if is_main:
+                print(f"[data] turn oversample x{args.turn_oversample}: "
+                      f"{n_turn}/{len(tr)} frames boosted", flush=True)
         sampler = EpochSubsetSampler(len(tr), args.limit_train,
                                      rank=rank if ddp else 0,
-                                     world=world, seed=args.seed_subset)
+                                     world=world, seed=args.seed_subset,
+                                     weights=weights)
     else:
         sampler = DistributedSampler(tr) if ddp else None
     # with depth the extra per-sample tensor + many DDP workers exhaust the
