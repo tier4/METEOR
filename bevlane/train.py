@@ -468,6 +468,8 @@ def evaluate_flow(model, loader, device, bx_idx, max_batches=20,
 def evaluate_traj(model, loader, device, tj_idx, max_batches=40,
                   tmp_idx=None):
     _STAT = [0, 0]
+    _pc = [0.0, 0.0]; _pn = [0, 0]        # per-class ADE (veh, vru)
+    _hd = [0.0, 0.0]; _hn = [0, 0]        # per-class heading error @3s
     """Agent-forecast ADE/FDE [m] sampled at GT box centres (valid wps)."""
     model.eval()
     n = ade = fde = nf = 0.0
@@ -504,8 +506,18 @@ def evaluate_traj(model, loader, device, tj_idx, max_batches=40,
                 if v.sum() == 0:
                     continue
                 ade += float((d * v).sum() / v.sum()); n += 1
+                _c = 0 if float(bx[b, k, 0]) < 1.5 else 1
+                _pc[_c] += float((d * v).sum() / v.sum()); _pn[_c] += 1
                 if v[5] > 0:
                     fde += float(d[5]); nf += 1
+                    # heading error at 3 s (only when both actually move)
+                    _g = tj[b, k, 5]; _p = p[5]
+                    if float(_g.norm()) > 1.0 and float(_p.norm()) > 0.3:
+                        import math as _m
+                        _ga = _m.atan2(float(_g[1]), float(_g[0]))
+                        _pa = _m.atan2(float(_p[1]), float(_p[0]))
+                        _d = abs((_pa - _ga + _m.pi) % (2 * _m.pi) - _m.pi)
+                        _hd[_c] += _m.degrees(_d); _hn[_c] += 1
                     if stat is not None:
                         pred_s = float(stat[b, 0, ri, ci]) > 0
                         gt_s = float(tj[b, k, 5].norm()) < 0.5
@@ -516,6 +528,11 @@ def evaluate_traj(model, loader, device, tj_idx, max_batches=40,
     r = {"ade": ade / n, "fde": fde / max(nf, 1)}
     if _STAT[1]:
         r["stat_acc"] = _STAT[0] / _STAT[1]
+    for c, nm in ((0, "veh"), (1, "vru")):
+        if _pn[c]:
+            r[nm + "_ade"] = _pc[c] / _pn[c]
+        if _hn[c]:
+            r[nm + "_head"] = _hd[c] / _hn[c]
     return r
 
 
@@ -1065,8 +1082,15 @@ def main():
                 if tj:
                     ss = (f" statAcc={tj['stat_acc']:.2f}"
                           if "stat_acc" in tj else "")
+                    pc = "".join(
+                        f" {k}ADE={tj[k + '_ade']:.2f}" for k in ("veh", "vru")
+                        if k + "_ade" in tj)
+                    hd = "".join(
+                        f" {k}Head={tj[k + '_head']:.0f}deg"
+                        for k in ("veh", "vru") if k + "_head" in tj)
                     print(f"[valTraj ep{ep}] agentADE={tj['ade']:.2f}m "
-                          f"agentFDE={tj['fde']:.2f}m" + ss, flush=True)
+                          f"agentFDE={tj['fde']:.2f}m" + ss + pc + hd,
+                          flush=True)
             if use_tl:
                 tl_idx = (4 + int(use_seg2d) + 4 * int(use_traj)
                           + int(use_ego) + int(use_occ))

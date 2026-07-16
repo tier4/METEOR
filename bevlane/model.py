@@ -1270,7 +1270,12 @@ class DepthSegIPMNetV21(DepthSegIPMNetV20):
 
     @staticmethod
     def build_traj_targets(boxes, nbox, traj, tvalid, device):
-        """-> (t [B,12,h,w], m [B,12,h,w]) at box-centre cells."""
+        """-> (t [B,12,h,w], m [B,12,h,w]) at box-centre cells.
+
+        The mask doubles as a class weight: VRU cells count x2.5 because a
+        pedestrian's 3 s displacement is half a vehicle's (2.58 m vs 5.51 m
+        on val), so their contribution was being drowned out by traffic.
+        """
         Bn = boxes.shape[0]
         t = torch.zeros(Bn, TRAJ_H * 2, DET_H, DET_W, device=device)
         m = torch.zeros(Bn, TRAJ_H * 2, DET_H, DET_W, device=device)
@@ -1283,8 +1288,9 @@ class DepthSegIPMNetV21(DepthSegIPMNetV20):
                 ci = int((50.0 - float(ye)) / DET_RES)
                 if not (0 <= ri < DET_H and 0 <= ci < DET_W):
                     continue
+                w = 2.5 if float(cls) >= 1.5 else 1.0      # VRU emphasis
                 t[bi, :, ri, ci] = traj[bi, k].reshape(-1)
-                m[bi, :, ri, ci] = tvalid[bi, k].repeat_interleave(2)
+                m[bi, :, ri, ci] = tvalid[bi, k].repeat_interleave(2) * w
         return t, m
 
     def traj_loss(self, tr_pred, boxes, nbox, traj, tvalid):
@@ -1452,12 +1458,24 @@ class DepthSegIPMNetV25(DepthSegIPMNetV24):
         self.traj_stem = nn.Sequential(
             nn.Conv2d(96, 128, 3, stride=2, padding=1, bias=False),
             nn.BatchNorm2d(128), nn.ReLU(inplace=True), ConvBlock(128, 128))
+        self.traj_head = nn.Conv2d(256, TRAJ_H * 2, 1)   # +det feat (class)
 
     def det_input(self):
         return self._last_bev           # 3D det joins the BEV-geometry group
 
     def traj_feat(self):
-        return self.traj_stem(self._fused_bev)
+        # Motion comes from the FUSED BEV (velocity lives there), but the
+        # shallow traj_stem cannot tell a crossing pedestrian from a car
+        # following the road, so it regressed the dominant road-direction
+        # prior for everyone: measured on val at r20 ep3, VRU GT headings
+        # average 87.9 deg off ego-forward (crossing) while predictions
+        # averaged 29.7 deg (along the road), a 75.9 deg mean error.
+        # Concatenate the DETACHED detection feature -- it already encodes
+        # class (it feeds the class heatmap) -- so the head can condition on
+        # what the agent is. Detached: the trajectory loss must not perturb
+        # 3D detection or the shared BEV.
+        return torch.cat([self.traj_stem(self._fused_bev),
+                          self._det_feat.detach()], 1)
 
 
 class DepthSegIPMNetV26(DepthSegIPMNetV25):
@@ -1591,7 +1609,7 @@ class DepthSegIPMNetV29(DepthSegIPMNetV28):
         super().__init__(*a, **k)
         # 1. multimodal heads (WTA)
         self.ego_mlp[-1] = nn.Linear(256, 12 * EGO_K + EGO_K + 3)
-        self.traj_head = nn.Conv2d(128, TRAJ_H * 2 * EGO_K + EGO_K, 1)
+        self.traj_head = nn.Conv2d(256, TRAJ_H * 2 * EGO_K + EGO_K, 1)
         # 2. temporal memory queue replaces the single-frame tfuse
         del self.tfuse
         self.tfuse3 = nn.Sequential(
