@@ -24,7 +24,8 @@ class BevLaneDataset(Dataset):
                  min_cov_core=0.0, min_cov_fwd=0.0, seg2d_key="seg2d",
                  with_bbox2d=False, with_ego=False, with_occ=False,
                  with_agenttraj=False, with_temporal=False, with_tl=False,
-                 with_risk=False, with_lanegraph=False, temporal_hist=0):
+                 with_risk=False, with_lanegraph=False, temporal_hist=0,
+                 with_unknown=False):
         self.root = root
         self.gt_key = gt_key
         self.dontcare_sidewalk = dontcare_sidewalk
@@ -43,6 +44,8 @@ class BevLaneDataset(Dataset):
         self.with_tl = with_tl
         self.with_risk = with_risk
         self.with_lanegraph = with_lanegraph
+        self.with_unknown = with_unknown
+        self._unk_cache = {}
         self.temporal_hist = temporal_hist   # v29: N history slots
         self._tl_cache = {}
         self._ego_cache = {}
@@ -267,6 +270,22 @@ class BevLaneDataset(Dataset):
             out.append(torch.from_numpy(lc))
             out.append(torch.tensor(ln, dtype=torch.int64))
             out.append(torch.from_numpy(la))
+        if self.with_unknown:
+            uc = np.zeros((32, 2), np.float32)
+            un = 0
+            if s not in self._unk_cache:
+                try:
+                    z = np.load(os.path.join(self.root, s, "unknown_obj.npz"))
+                    self._unk_cache[s] = (z["centers"], z["n"])
+                except Exception:
+                    self._unk_cache[s] = None
+            z = self._unk_cache[s]
+            fi = f["frame"]
+            if z is not None and fi < len(z[1]):
+                uc = z[0][fi].astype(np.float32)
+                un = int(z[1][fi])
+            out.append(torch.from_numpy(uc))
+            out.append(torch.tensor(un, dtype=torch.int64))
         if self.with_temporal and self.temporal_hist > 0:
             # v29 memory queue: N history frames at fi-2, fi-6, fi-14
             HN = self.temporal_hist

@@ -1819,6 +1819,51 @@ class DepthSegIPMNetV29(DepthSegIPMNetV28):
         return total / max(nb, 1)
 
 
+class DepthSegIPMNetV30(DepthSegIPMNetV29):
+    """v30: + unknown-object (cone/pole/debris) detection, fixed size.
+
+    Separate 1ch centre heatmap on the (raw-BEV) detection stem; GT centres
+    come from small occupancy-obstacle blobs (extract_unknown.py) — the
+    annotation set has no unknown boxes, so size is fixed at decode
+    (0.4x0.4 m). forward -> v29 outputs + (hm_unk [B,1,400,250],)."""
+    def __init__(self, *a, **k):
+        super().__init__(*a, **k)
+        self.unk_head = nn.Conv2d(128, 1, 1)
+        nn.init.constant_(self.unk_head.bias, -2.19)
+
+    def forward(self, imgs, K, T_cam_ego, v0=None, prev_bev=None,
+                warp_theta=None):
+        out = super().forward(imgs, K, T_cam_ego, v0, prev_bev, warp_theta)
+        return out + (self.unk_head(self._det_feat),)
+
+    @staticmethod
+    def unk_loss(hm, centers, n):
+        """penalty-reduced focal on 1ch heatmap; Gaussian radius 1.5 cells."""
+        B = hm.shape[0]
+        dev = hm.device
+        hm_t = torch.zeros(B, 1, DET_H, DET_W, device=dev)
+        ys = torch.arange(DET_H, device=dev, dtype=torch.float32)
+        xs = torch.arange(DET_W, device=dev, dtype=torch.float32)
+        npos = 0
+        for b in range(B):
+            for k in range(int(n[b])):
+                xe, ye = float(centers[b, k, 0]), float(centers[b, k, 1])
+                r = (80.0 - xe) / DET_RES
+                c = (50.0 - ye) / DET_RES
+                if not (0 <= r < DET_H and 0 <= c < DET_W):
+                    continue
+                g = torch.exp(-(((ys - r) ** 2).view(-1, 1)
+                                + ((xs - c) ** 2).view(1, -1)) / (2 * 1.5 ** 2))
+                hm_t[b, 0] = torch.maximum(hm_t[b, 0], g)
+                npos += 1
+        p = hm.float().sigmoid().clamp(1e-4, 1 - 1e-4)
+        pos = (hm_t > 0.99).float()
+        neg_w = (1 - hm_t) ** 4
+        loss = -(pos * (1 - p) ** 2 * p.log()
+                 + (1 - pos) * neg_w * p ** 2 * (1 - p).log()).sum()
+        return loss / max(npos, 1)
+
+
 MODELS = {"v1": IPMSegNet, "v2": IPMSegNetV2, "v3s": IPMSegNetV3,
           "lss": LSSDepthNet, "v8": DepthGatedIPMNet, "v13": DepthSegIPMNet,
           "v13d": DepthSegIPMNetS4, "v14d": DepthSegIPMNetV14,
@@ -1827,4 +1872,4 @@ MODELS = {"v1": IPMSegNet, "v2": IPMSegNetV2, "v3s": IPMSegNetV3,
           "v19": DepthSegIPMNetV19, "v20": DepthSegIPMNetV20,
           "v21": DepthSegIPMNetV21, "v22": DepthSegIPMNetV22,
           "v23": DepthSegIPMNetV23, "v24": DepthSegIPMNetV24,
-          "v25": DepthSegIPMNetV25, "v26": DepthSegIPMNetV26, "v27": DepthSegIPMNetV27, "v28": DepthSegIPMNetV28, "v29": DepthSegIPMNetV29}
+          "v25": DepthSegIPMNetV25, "v26": DepthSegIPMNetV26, "v27": DepthSegIPMNetV27, "v28": DepthSegIPMNetV28, "v29": DepthSegIPMNetV29, "v30": DepthSegIPMNetV30}

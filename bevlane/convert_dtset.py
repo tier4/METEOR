@@ -69,6 +69,8 @@ def convert_scene(scene):
              "--workers", "1"],
             [PY, "bevlane/filter_occ_shadows.py", "--scenes", scene,
              "--workers", "1"],
+            [PY, "bevlane/extract_unknown.py", "--scenes", scene,
+             "--workers", "1"],
         ]
         for st in stages:
             rc, out = run(st)

@@ -657,7 +657,7 @@ def main():
     ap.add_argument("--workers", type=int, default=6)
     ap.add_argument("--out", default="out/bevlane_ckpt")
     ap.add_argument("--limit-train", type=int, default=None)
-    ap.add_argument("--model", default="v1", choices=["v1", "v2", "v3s", "lss", "v8", "v13", "v13d", "v14d", "v15", "v16", "v17", "v18", "v19", "v20", "v21", "v22", "v23", "v24", "v25", "v26", "v27", "v28", "v29"])
+    ap.add_argument("--model", default="v1", choices=["v1", "v2", "v3s", "lss", "v8", "v13", "v13d", "v14d", "v15", "v16", "v17", "v18", "v19", "v20", "v21", "v22", "v23", "v24", "v25", "v26", "v27", "v28", "v29", "v30"])
     ap.add_argument("--depth-w", type=float, default=0.3)
     ap.add_argument("--seg2d-w", type=float, default=0.5)
     ap.add_argument("--seg2d-key", default="seg2d",
@@ -684,6 +684,7 @@ def main():
                     help="base seed for the per-epoch training subset")
     ap.add_argument("--turn-oversample", type=float, default=1.0,
                     help="draw weight for turn frames (|lat@3s|>4m)")
+    ap.add_argument("--unk-w", type=float, default=0.0)
     ap.add_argument("--aug", action="store_true")
     ap.add_argument("--dice-w", type=float, default=0.0)
     ap.add_argument("--far-w", type=float, default=0.0,
@@ -727,7 +728,7 @@ def main():
         os.makedirs(args.out, exist_ok=True)
 
     train_s, val_s = split_scenes(args.root)
-    use_depth = args.model in ("lss", "v8", "v13", "v13d", "v14d", "v15", "v16", "v17", "v18", "v19", "v20", "v21", "v22", "v23", "v24", "v25", "v26", "v27", "v28", "v29") and args.depth_w > 0
+    use_depth = args.model in ("lss", "v8", "v13", "v13d", "v14d", "v15", "v16", "v17", "v18", "v19", "v20", "v21", "v22", "v23", "v24", "v25", "v26", "v27", "v28", "v29", "v30") and args.depth_w > 0
     use_seg2d = args.model in ("v13", "v13d", "v14d", "v15", "v16", "v17", "v18", "v19", "v20", "v21", "v22", "v23", "v24", "v25", "v26", "v27", "v28", "v29") and args.seg2d_w > 0
     use_box = args.model == "v15" and args.box_w > 0
     use_boxdet = args.model in ("v16", "v17", "v18", "v19", "v20", "v21", "v22", "v23", "v24", "v25", "v26", "v27", "v28", "v29") and args.box_w > 0
@@ -736,11 +737,12 @@ def main():
     use_occ = args.model in ("v20", "v21", "v22", "v23", "v24", "v25", "v26", "v27", "v28", "v29") and args.occ_w > 0
     use_traj = args.model in ("v21", "v22", "v23", "v24", "v25", "v26", "v27", "v28", "v29") and args.traj_w > 0
     use_temporal = args.model in ("v22", "v23", "v24", "v25", "v26", "v27", "v28", "v29")
-    use_tl = args.model in ("v27", "v28", "v29") and args.tl_w > 0
-    use_risk = args.model in ("v28", "v29") and args.risk_w > 0
-    use_lg = args.model == "v29" and args.lanegraph_w > 0
-    use_flow = args.model == "v29" and args.flow_w > 0
-    hist_n = 3 if args.model == "v29" else 0
+    use_tl = args.model in ("v27", "v28", "v29", "v30") and args.tl_w > 0
+    use_risk = args.model in ("v28", "v29", "v30") and args.risk_w > 0
+    use_lg = args.model in ("v29", "v30") and args.lanegraph_w > 0
+    use_unk = args.model == "v30" and args.unk_w > 0
+    use_flow = args.model in ("v29", "v30") and args.flow_w > 0
+    hist_n = 3 if args.model in ("v29", "v30") else 0
     if args.train_list:                       # restrict train to a scene list
         keep = set(open(args.train_list).read().split())
         train_s = [s for s in train_s if s in keep]
@@ -757,6 +759,7 @@ def main():
                         with_occ=use_occ, with_temporal=use_temporal,
                         with_tl=use_tl, with_risk=use_risk,
                         with_lanegraph=use_lg, temporal_hist=hist_n,
+                        with_unknown=use_unk,
                         trim_start=3, trim_end=args.trim_end,
                         min_cov_core=args.min_cov_core,
                         min_cov_fwd=args.min_cov_fwd,
@@ -772,7 +775,7 @@ def main():
                             with_occ=use_occ, with_agenttraj=use_traj,
                             with_temporal=use_temporal, with_tl=use_tl,
                             with_risk=use_risk, with_lanegraph=use_lg,
-                            temporal_hist=hist_n,
+                            temporal_hist=hist_n, with_unknown=use_unk,
                             trim_start=3, trim_end=args.trim_end)
         seen = min(args.limit_train or len(tr), len(tr)) * args.epochs
         print(f"train {len(tr)} samples / {len(train_s)} scenes; "
@@ -904,6 +907,9 @@ def main():
                 bi += 4
             else:
                 lg_pts_gt = lg_cls_gt = lg_n_gt = lg_adj_gt = None
+            unk_c = batch[bi] if use_unk else None
+            unk_n = batch[bi + 1] if use_unk else None
+            bi += 2 if use_unk else 0
             if use_temporal:
                 prev_imgs, rel_pose, prev_valid = (batch[bi], batch[bi + 1],
                                                    batch[bi + 2])
@@ -1004,6 +1010,9 @@ def main():
                     loss = loss + args.lanegraph_w * net0.lanegraph_loss(
                         out[14], out[15], out[16],
                         lg_pts_gt, lg_cls_gt, lg_n_gt, lg_adj_gt)
+                if use_unk and len(out) >= 18:
+                    loss = loss + args.unk_w * net0.unk_loss(
+                        out[17], unk_c, unk_n)
                 if hm2d is not None and use_bbox2d:
                     loss = loss + args.bbox2d_w * net0.bbox2d_loss(
                         hm2d, rg2d, bb2d, nb2d)
@@ -1101,7 +1110,8 @@ def main():
                                      for c in onm if c in oc), flush=True)
             vtmp = (4 + int(use_seg2d) + 4 * int(use_traj) + int(use_ego)
                     + int(use_occ) + int(use_tl) + int(use_risk)
-                    + 4 * int(use_lg)) if use_temporal else None
+                    + 4 * int(use_lg) + 2 * int(use_unk)) \
+                if use_temporal else None
             if use_traj and use_boxdet:
                 d3 = evaluate_det3d(net, dv, device, 4 + int(use_seg2d),
                                     tmp_idx=vtmp)
