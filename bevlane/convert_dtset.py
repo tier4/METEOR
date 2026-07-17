@@ -71,6 +71,10 @@ def convert_scene(scene):
              "--workers", "1"],
             [PY, "bevlane/extract_unknown.py", "--scenes", scene,
              "--workers", "1"],
+            [PY, "bevlane/extract_lanegraph.py", "--scenes", scene,
+             "--workers", "1"],
+            [PY, "bevlane/extract_lidar_bev.py", "--scenes", scene,
+             "--stride", "2", "--workers", "1"],
         ]
         for st in stages:
             rc, out = run(st)

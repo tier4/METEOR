@@ -29,6 +29,9 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from bevlane.extract_gt import OUT  # noqa: E402
 
 DYN = (2, 3, 4)
+NEAR_R = 30          # cells (12 m): near-ego zone where GT asserts FREE
+_yy, _xx = np.mgrid[0:200, 0:200]
+NEAR = ((_yy - 100) ** 2 + (_xx - 100) ** 2) <= NEAR_R ** 2
 
 
 def footprint_mask(boxes, count):
@@ -51,9 +54,9 @@ def process_scene(scene):
         out_dir = os.path.join(OUT, scene)
         mf = os.path.join(out_dir, "manifest.json")
         man = json.load(open(mf))
-        if man.get("occ_shadow_filtered"):
-            return f"[skip] {scene}: already filtered"
-        n_fix = 0
+        if man.get("occ_shadow_v2"):
+            return f"[skip] {scene}: already v2"
+        n_ign = n_free = 0
         for fr in man["frames"]:
             if not fr.get("occ") or not fr.get("agent_traj"):
                 continue
@@ -64,16 +67,26 @@ def process_scene(scene):
             except Exception:
                 continue
             m = footprint_mask(z["boxes"], z["count"])
+            outside = m[None] == 0
             dyn = np.isin(occ, DYN)
-            shadow = dyn & (m[None] == 0)
-            if shadow.any():
+            # near ego the multi-sweep LiDAR is dense and boxes are
+            # camera-confirmed: outside-box dynamics AND outside-box
+            # leftovers of the v1 ignore pass are asserted FREE there —
+            # ignore gives no gradient, so near-ego vehicle FPs learned
+            # in earlier rounds were never being corrected
+            nearfix = (dyn | (occ == 255)) & outside & NEAR[None]
+            shadow = dyn & outside & ~NEAR[None]
+            if nearfix.any() or shadow.any():
                 occ = occ.copy()
                 occ[shadow] = 255
+                occ[nearfix] = 0
                 np.savez_compressed(op.replace(".npz", ""), occ=occ)
-                n_fix += int(shadow.sum())
+                n_ign += int(shadow.sum())
+                n_free += int(nearfix.sum())
         man["occ_shadow_filtered"] = 1
+        man["occ_shadow_v2"] = 1
         json.dump(man, open(mf, "w"))
-        return f"[ok] {scene} ignored={n_fix}"
+        return f"[ok] {scene} ignored={n_ign} freed={n_free}"
     except Exception as e:
         return f"[fail] {scene}: {e}"
 

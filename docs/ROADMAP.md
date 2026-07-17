@@ -4,19 +4,19 @@ Living list of what we could do next, why, and what it would cost. Nothing
 here is committed work; each entry is sized so it can be picked up
 independently. Ordered within each section by (expected value ÷ risk).
 
-**Baseline to beat** (r20 = v29, clean data, held-out recording day):
+**Baseline to beat** (r26 = v32 ep1 / best-so-far values, held-out recording day):
 
 | metric | value |
 |---|---|
-| BEV lane mIoU | 0.308 |
-| 2D seg mIoU (21 cls) | 0.539 |
-| 3D det veh P / Rn / yaw | 0.83 / 0.72 / 6.4° |
-| 3D det VRU P / Rn | 0.75 / 0.45 |
-| E2E ADE / ADEc | 0.71 / 0.78 m |
-| agent ADE / stationary acc | 2.31 m / 0.68 |
-| TL accuracy | 0.28 (regressed — see A3) |
-| risk L1 (all / high) | 0.072 / 0.161 |
-| occupancy flow EPE (mov / stat) | 1.47 / 0.24 m/s |
+| BEV lane mIoU | 0.314 (r25 ep1; r23 final 0.312) |
+| 2D seg mIoU (21 cls) | 0.535 |
+| 3D det veh P / Rn / yaw / dir-flips | 0.85 / 0.72 / 5.1° / 8% |
+| 3D det VRU P / Rn | 0.75 / 0.47 |
+| E2E ADE / ADEc | 0.69 / 0.47 m (r23) |
+| agent ADE / vehHead / stationary acc | 1.87 m / 26° / 0.70 |
+| TL accuracy | 0.86 (recovered, red class still weak ~0.5) |
+| unknown obj P / R | 0.07 / 0.02 (first non-zero, v3 GT) |
+| +LiDAR mIoU delta (same weights) | +0.004 and widening (C6b) |
 | lane graph P / R | 0.01 / 0.01 (not learning — see B1) |
 
 **Rule of thumb**: every candidate must be checkable with `--val-every`
@@ -30,8 +30,8 @@ in a 10-minute probe run is not ready to be a round.
 | # | Item | Evidence | Cost |
 |---|---|---|---|
 | A1 | **Lane-graph decoder does not learn** — P/R pinned at 0.01 | 24 anchored slots predict independently; adjacency is a post-hoc pair MLP. Point init was fixed (±15 m noise → straight segments) but the ceiling looks structural, see B1 | — |
-| A2 | **3D box flicker** across frames | user-visible in demos; scores fluctuate near the decode threshold | S: score EMA in the runtime (no retrain), or M: temporal consistency loss |
-| A3 | **TL accuracy regressed 0.88 → 0.28** at r20 | the head survived the v29 task additions but its share of the loss did not; likely just `--tl-w` starvation | S: raise tl-w, verify with a probe |
+| A2 | (partially addressed r27: crossing-yaw weight) **3D box flicker** across frames | user-visible in demos; scores fluctuate near the decode threshold | S: score EMA in the runtime (no retrain), or M: temporal consistency loss |
+| A3 | ✅ FIXED r22 (0.86; red class ~0.5 remains) — **TL accuracy regressed 0.88 → 0.28** at r20 | the head survived the v29 task additions but its share of the loss did not; likely just `--tl-w` starvation | S: raise tl-w, verify with a probe |
 | A4 | **VRU recall still low** (Rn 0.45 vs veh 0.72) | small 2D projections; camera-confirmation already relaxed to 0.15 | M: recall-oriented focal weighting, or a VRU-specific heatmap radius |
 | A5 | **Lane-graph GT includes irrelevant edges** | road edges trace parking-lot outlines, not just the drivable corridor | S: filter chains to those touching the ego-connected drivable region |
 
@@ -101,6 +101,9 @@ entries below are ordered by (value ÷ risk).
 | C3 | **Per-lane TL association** | Today the TL state is one whole-image label. Associating lights to lane-graph branches (needs B1 working) is what makes it usable at multi-lane intersections. |
 | C4 | **INT8 deployment** | trtexec `--int8` needs entropy calibration over real frames; `prev_bev` must be fed real BEVs or the fusion ranges calibrate wrong. Keep depth-softmax and the regression heads in fp16 (`--precisionConstraints`). ~80 % of FLOPs are backbone convs, so most of the win is available even with those exclusions. |
 | C5 | **Longer horizon / more slots** | The memory queue is 2.8 s. Occlusion persistence beyond that (parked car hidden by a bus) would need more slots — cost is linear in backbone passes, so measure `it/s` first. |
+| C6 | **Optional LiDAR input, single weights** | ✅ C6a IMPLEMENTED (v31, r23+); ✅ C6b IMPLEMENTED (v32, r25+): host-side pillar raster -> flag-gated 96ch residual, zeros = bit-equal camera-only; +lidar probe delta positive and widening.  Same checkpoint must run with AND without LiDAR (user requirement). Mechanism = modality dropout (drop LiDAR ~50% of train samples) + zero-fill-with-valid-gate at inference — the exact pattern already proven for missing memory slots. **C6a (do first)**: project points to per-camera sparse depth and *sharpen the predicted depth softmax* where measurements exist; depth is where our uncertainty lives, params ~0, Orin-free, single TRT engine (feed zeros + valid=0 when absent). **C6b (if C6a is not enough)**: light pillar branch → BEV 96ch fused as a gated residual like tfuse3; bigger 3D det/occ gains, real Orin cost, use GroupNorm in the branch (BN-pollution lesson from r20). |
+
+| C7 | ✅ L1 IMPLEMENTED (bevlane/guardrail.py + demo --guard; HOLD state, fragment-tolerant, detailed reasons) — next: intervention-rate eval on val. **E2E guardrails (doer/checker safety channel)** | The 12 heads make a classic safety architecture nearly free: (L1) deterministic hard gates — spacetime collision check of the chosen path against predicted occupancy+flow+agent futures, red-light×stop-line gate, bicycle-model feasibility clamp, drivable/free containment; checker heads run on the RAW BEV route while E2E uses the fused route (partial input independence), and with LiDAR attached the raw-point near-field AEB is a **non-ML** last wall. (L2) = C1 risk-integral mode fallback (pick the safest of K=3). (L3) uncertainty monitors (mode spread, temporal path stability, depth/seg entropy OOD) trigger degraded mode. (L4) an independently generated in-lane-stop MRM path (centerline spline + decel profile) replaces vetoed plans. Measurable: correct-intervention vs false-intervention rate on val futures, per round. Runtime-only through L2; no retraining. |
 
 ## D. Data / infrastructure
 

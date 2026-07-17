@@ -558,7 +558,23 @@ class DepthSegIPMNetV14(DepthSegIPMNetS4):
         valid = (gt > 0.1) & (tgt >= 0) & (tgt < self.D)
         tgt = tgt.clamp(0, self.D - 1)
         tgt[~valid] = -1
-        ce = F.cross_entropy(logits, tgt, ignore_index=-1, label_smoothing=0.05)
+        # edge-aware weighting: depth discontinuities (object boundaries)
+        # are a handful of pixels and plain CE lets them smear; weight
+        # boundary pixels up to 3x (gradient of GT, valid neighbours only)
+        gx = (gt[:, :, 1:] - gt[:, :, :-1]).abs()
+        gx = gx * (valid[:, :, 1:] & valid[:, :, :-1])
+        gy = (gt[:, 1:, :] - gt[:, :-1, :]).abs()
+        gy = gy * (valid[:, 1:, :] & valid[:, :-1, :])
+        g = torch.zeros_like(gt)
+        g[:, :, 1:] = torch.maximum(g[:, :, 1:], gx)
+        g[:, :, :-1] = torch.maximum(g[:, :, :-1], gx)
+        g[:, 1:, :] = torch.maximum(g[:, 1:, :], gy)
+        g[:, :-1, :] = torch.maximum(g[:, :-1, :], gy)
+        wpx = 1.0 + 2.0 * (g / 3.0).clamp(max=1.0)
+        ce_px = F.cross_entropy(logits, tgt, ignore_index=-1,
+                                label_smoothing=0.05, reduction="none")
+        ce = (ce_px * wpx)[valid].mean() if valid.any() \
+            else logits.sum() * 0.0
         # L1 on expected depth (metres) -> metric accuracy, sharper distributions
         prob = logits.softmax(1)
         bins = (torch.arange(self.D, device=logits.device, dtype=prob.dtype)
@@ -705,8 +721,16 @@ class DepthSegIPMNetV16(DepthSegIPMNetV14):
         previous-frame pass and for streaming deployment."""
         B, N, _, H, W = imgs.shape
         f = self.image_feats(imgs)
-        dprob = self.depth_head(self.depth_up(f)).softmax(1)
-        return self.project_bev(dprob, self.ctx(f), K, T_cam_ego, B, N, H, W)
+        dprob = self.sharpen_dprob(self.depth_head(self.depth_up(f))
+                                   .softmax(1))
+        return self.bev_extra(self.project_bev(dprob, self.ctx(f), K,
+                                               T_cam_ego, B, N, H, W))
+
+    def sharpen_dprob(self, dprob):
+        return dprob                    # v31 blends in LiDAR when present
+
+    def bev_extra(self, bev):
+        return bev                      # v32 adds the LiDAR pillar residual
 
     def temporal_fuse(self, bev):
         return bev                      # identity below v22
@@ -726,9 +750,10 @@ class DepthSegIPMNetV16(DepthSegIPMNetV14):
         self._f_s4 = f                 # v27 TL head reads the front cameras
         seg2d = self.seg_head(f)
         dlog = self.depth_head(self.depth_up(f))
-        dprob = dlog.softmax(1)
+        dprob = self.sharpen_dprob(dlog.softmax(1))
         ctx = self.ctx(f)
-        bev = self.project_bev(dprob, ctx, K, T_cam_ego, B, N, H, W)
+        bev = self.bev_extra(
+            self.project_bev(dprob, ctx, K, T_cam_ego, B, N, H, W))
         self._last_bev = bev
         bev = self.temporal_fuse(bev)
         self._fused_bev = bev          # consumed by ego / occ / traj heads
@@ -737,9 +762,11 @@ class DepthSegIPMNetV16(DepthSegIPMNetV14):
         lane_bev = self.lane_input()
         fh2, fw2 = dlog.shape[-2:]
         sh, sw = seg2d.shape[-2:]
+        rg_out = self.reg_head(det)
+        self._det_reg = rg_out          # v33 traj head reads sin/cos yaw
         return (self.dec(lane_bev), dlog.view(B, N, self.D, fh2, fw2),
                 seg2d.view(B, N, seg2d.shape[1], sh, sw),
-                self.hm_head(det), self.reg_head(det))
+                self.hm_head(det), rg_out)
 
     @staticmethod
     def build_det_targets(boxes, nbox, device, dtype=torch.float32):
@@ -774,6 +801,10 @@ class DepthSegIPMNetV16(DepthSegIPMNetV14):
                 hm[bi, ch] = torch.maximum(hm[bi, ch], g)
                 ll, lw = math.log(max(l, .1)), math.log(max(w, .1))
                 sy, cy = math.sin(yaw), math.cos(yaw)
+                # crossing vehicles (lateral yaw) are rare and their yaw
+                # regresses toward the along-road prior -> weight by
+                # lateralness (mask doubles as the per-cell reg weight)
+                wy = 1.0 + 2.0 * abs(sy)
                 for dr in (-1, 0, 1):
                     for dc in (-1, 0, 1):
                         r2, c2 = ri + dr, ci + dc
@@ -782,13 +813,13 @@ class DepthSegIPMNetV16(DepthSegIPMNetV14):
                         reg[bi, :, r2, c2] = torch.tensor(
                             [r - r2, c - c2, ll, lw, sy, cy],
                             device=device, dtype=dtype)
-                        msk[bi, 0, r2, c2] = 1
-                centres.append((bi, ri, ci,
+                        msk[bi, 0, r2, c2] = wy
+                centres.append((bi, ri, ci, wy,
                                 torch.tensor([r - ri, c - ci, ll, lw, sy, cy],
                                              device=device, dtype=dtype)))
-        for bi, ri, ci, t in centres:
+        for bi, ri, ci, wy, t in centres:
             reg[bi, :, ri, ci] = t
-            msk[bi, 0, ri, ci] = 1
+            msk[bi, 0, ri, ci] = wy
         return hm, reg, msk
 
     def boxdet_loss(self, hm, reg, boxes, nbox):
@@ -1242,8 +1273,25 @@ class DepthSegIPMNetV20(DepthSegIPMNetV19):
             w[1] = 3.0                     # obstacle/unknown (cones etc.)
             w[[3, 4]] = 4.0                # 2-wheelers / pedestrians
             self._occ_w = w
-        return F.cross_entropy(occ, occ_gt.long(), weight=self._occ_w,
-                               ignore_index=255)
+            yy, xx = torch.meshgrid(
+                torch.arange(occ.shape[-2], device=occ.device),
+                torch.arange(occ.shape[-1], device=occ.device),
+                indexing="ij")
+            cy, cx = occ.shape[-2] / 2.0, occ.shape[-1] / 2.0
+            self._occ_near = (((yy - cy) ** 2 + (xx - cx) ** 2)
+                              <= 30.0 ** 2)          # 12 m at 0.4 m cells
+        ce = F.cross_entropy(occ, occ_gt.long(), weight=self._occ_w,
+                             ignore_index=255)
+        # near-ego dynamic false positives (fragmentary phantom vehicles
+        # beside the ego) get a dedicated penalty: where GT says FREE
+        # inside the 12 m zone, push down the summed dynamic-class prob
+        p = occ.float().softmax(1)
+        pdyn = p[:, 2:5].sum(1)                       # veh + 2wheel + ped
+        fp_mask = (occ_gt == 0) & self._occ_near
+        if fp_mask.any():
+            ce = ce + 0.5 * (-torch.log1p(
+                -pdyn[fp_mask].clamp(max=0.999))).mean()
+        return ce
 
 
 TRAJ_H = 6                     # agent-forecast waypoints @0.5 s
@@ -1289,6 +1337,14 @@ class DepthSegIPMNetV21(DepthSegIPMNetV20):
                 if not (0 <= ri < DET_H and 0 <= ci < DET_W):
                     continue
                 w = 2.5 if float(cls) >= 1.5 else 1.0      # VRU emphasis
+                # oncoming vehicles: rare direction, and the failure the
+                # user sees (heading flipped to ego-forward) concentrates
+                # there -> same emphasis as VRUs
+                yaw_k = float(boxes[bi, k, 5])
+                if float(cls) < 1.5 and \
+                        abs((yaw_k + math.pi) % (2 * math.pi) - math.pi) \
+                        > 2.36:
+                    w = 2.5
                 t[bi, :, ri, ci] = traj[bi, k].reshape(-1)
                 m[bi, :, ri, ci] = tvalid[bi, k].repeat_interleave(2) * w
         return t, m
@@ -1510,7 +1566,10 @@ class DepthSegIPMNetV26(DepthSegIPMNetV25):
                 ci = int((50.0 - float(boxes[b, k, 2])) / DET_RES)
                 if not (0 <= ri < DET_H and 0 <= ci < DET_W):
                     continue
-                lbl = (traj[b, k, 5].norm() < 0.5).float()
+                d3 = float(traj[b, k, 5].norm())
+                if 0.35 < d3 < 0.8:      # ambiguous creep band -> no label
+                    continue
+                lbl = torch.tensor(float(d3 <= 0.35), device=stat.device)
                 num = num + F.binary_cross_entropy_with_logits(
                     stat[b, 0, ri, ci].float().clamp(-15, 15), lbl)
                 den += 1
@@ -1662,6 +1721,8 @@ class DepthSegIPMNetV29(DepthSegIPMNetV28):
                                      align_corners=False)
                 cat.append(F.grid_sample(hb[:, i].to(bev.dtype), grid,
                                          align_corners=False))
+        # warped t-0.4s slot, kept for the trajectory head's motion residual
+        self._warped0 = cat[1]
         return bev + self.tfuse3(torch.cat(cat, 1))
 
     def forward(self, imgs, K, T_cam_ego, v0=None, prev_bev=None,
@@ -1739,6 +1800,20 @@ class DepthSegIPMNetV29(DepthSegIPMNetV28):
         wl = ek_w[cell].sum() / m.sum()
         ce = F.cross_entropy(ml, best.squeeze(1), reduction="none")
         cl = ce[cell].mean()
+        # heading term: L1 keeps magnitudes honest but under-penalises a
+        # flipped direction (user-visible on oncoming traffic) -> add
+        # 1 - cos between the winning mode's 3 s displacement and GT,
+        # weighted by the cell mask (which already carries the oncoming
+        # and VRU emphasis), on clearly-moving agents only
+        bidx = best.unsqueeze(2).expand(-1, -1, 12, -1, -1)
+        wb = wps.gather(1, bidx).squeeze(1)          # [B,12,H,W]
+        pd, gd = wb[:, 10:12], t[:, 10:12]
+        gn = gd.norm(dim=1)
+        mov = (gn > 2.0) & (m[:, 10] > 0)
+        if mov.any():
+            cos = (pd * gd).sum(1) / (pd.norm(dim=1) * gn + 1e-3)
+            dl = ((1.0 - cos) * m[:, 10])[mov].mean()
+            wl = wl + 0.5 * dl
         return wl + 0.3 * cl
 
     # ---- 4. occupancy-flow loss ----------------------------------------
@@ -1830,6 +1905,25 @@ class DepthSegIPMNetV30(DepthSegIPMNetV29):
         super().__init__(*a, **k)
         self.unk_head = nn.Conv2d(128, 1, 1)
         nn.init.constant_(self.unk_head.bias, -2.19)
+        # motion-residual input for the trajectory head: current BEV minus
+        # the ego-warped t-0.4s slot. Oncoming cars read as a signed dipole
+        # along their true motion; without it the only direction cue is the
+        # fused-BEV smear, and predictions collapsed to the ego-forward
+        # majority prior (measured: oncoming heading flips, worst at launch).
+        self.traj_stem = nn.Sequential(
+            nn.Conv2d(192, 128, 3, stride=2, padding=1, bias=False),
+            nn.BatchNorm2d(128), nn.ReLU(inplace=True), ConvBlock(128, 128))
+
+    def traj_feat(self):
+        # zero residual when the slot is missing (all-zero warped feature),
+        # otherwise "everything just appeared" reads as fake motion
+        valid = (self._warped0.abs().sum(1, keepdim=True) > 0).to(
+            self._last_bev.dtype)
+        mot = (self._last_bev - self._warped0) * valid
+        self._tf = torch.cat(
+            [self.traj_stem(torch.cat([self._fused_bev, mot], 1)),
+             self._det_feat.detach()], 1)
+        return self._tf
 
     def forward(self, imgs, K, T_cam_ego, v0=None, prev_bev=None,
                 warp_theta=None):
@@ -1837,7 +1931,7 @@ class DepthSegIPMNetV30(DepthSegIPMNetV29):
         return out + (self.unk_head(self._det_feat),)
 
     @staticmethod
-    def decode_unknown(hm_unk, thresh=0.4, topk=32):
+    def decode_unknown(hm_unk, thresh=0.25, topk=64):
         """-> per-batch list of (cls=2, score, xe, ye, 0.4, 0.4, 0.0):
         unknown objects join the BEV 3D box stream as a third class with a
         fixed footprint (no size GT exists for them)."""
@@ -1860,19 +1954,32 @@ class DepthSegIPMNetV30(DepthSegIPMNetV29):
 
     @staticmethod
     def unk_loss(hm, centers, n):
-        """penalty-reduced focal on 1ch heatmap; Gaussian radius 1.5 cells."""
+        """penalty-reduced focal on 1ch heatmap; Gaussian radius 1.5 cells.
+
+        n is PACKED (dataset): low byte = positives, high byte = occluded
+        blobs stored after them in `centers` — those get an ignore disk
+        (no negative loss) instead of counting as background."""
         B = hm.shape[0]
         dev = hm.device
         hm_t = torch.zeros(B, 1, DET_H, DET_W, device=dev)
+        ign = torch.zeros(B, 1, DET_H, DET_W, device=dev)
         ys = torch.arange(DET_H, device=dev, dtype=torch.float32)
         xs = torch.arange(DET_W, device=dev, dtype=torch.float32)
         npos = 0
         for b in range(B):
-            for k in range(int(n[b])):
+            nv = int(n[b]) & 0xFF
+            ni = (int(n[b]) >> 8) & 0xFF
+            for k in range(nv + ni):
                 xe, ye = float(centers[b, k, 0]), float(centers[b, k, 1])
                 r = (80.0 - xe) / DET_RES
                 c = (50.0 - ye) / DET_RES
                 if not (0 <= r < DET_H and 0 <= c < DET_W):
+                    continue
+                if k >= nv:                     # occluded -> ignore disk
+                    d2 = ((ys - r) ** 2).view(-1, 1) \
+                        + ((xs - c) ** 2).view(1, -1)
+                    ign[b, 0] = torch.maximum(ign[b, 0],
+                                              (d2 < 3.0 ** 2).float())
                     continue
                 g = torch.exp(-(((ys - r) ** 2).view(-1, 1)
                                 + ((xs - c) ** 2).view(1, -1)) / (2 * 1.5 ** 2))
@@ -1881,9 +1988,157 @@ class DepthSegIPMNetV30(DepthSegIPMNetV29):
         p = hm.float().sigmoid().clamp(1e-4, 1 - 1e-4)
         pos = (hm_t > 0.99).float()
         neg_w = (1 - hm_t) ** 4
+        # KMAX-saturated frames have unlabeled real positives beyond the
+        # cap; punishing their cells as negatives suppresses the whole
+        # head's scores (measured: max score 0.21 after 8 epochs). Ignore
+        # negatives on saturated frames — positives still supervise.
+        sat = ((n & 0xFF).float() >= 64).view(-1, 1, 1, 1).to(p.dtype)
+        # sparse-positive rebalance: ~2 positives vs 100k cells after the
+        # v3 GT cleanup; unscaled negatives suppress the whole head
         loss = -(pos * (1 - p) ** 2 * p.log()
-                 + (1 - pos) * neg_w * p ** 2 * (1 - p).log()).sum()
+                 + 0.25 * (1 - pos) * (1 - ign) * (1 - sat) * neg_w
+                 * p ** 2 * (1 - p).log()).sum()
         return loss / max(npos, 1)
+
+
+class DepthSegIPMNetV31(DepthSegIPMNetV30):
+    """v31: optional LiDAR depth input (roadmap C6a) — one set of weights
+    serves camera-only AND LiDAR-assisted inference.
+
+    Input: LiDAR points projected to the 6 IPM cameras as a sparse metric
+    depth map [B,6,hd,wd] (0 = no return) — the exact format of the depth4
+    GT, so training reuses the batch's depth tensor as the input. Where a
+    return exists, the predicted depth softmax is blended toward the
+    measured bin (triangular two-bin interpolation, elementwise only —
+    TRT-safe, no scatter):
+
+        dprob' = (1 - a*m) * dprob + a*m * tri(d)      a = sigmoid(w_a)
+
+    Feeding zeros makes m == 0 everywhere -> bit-equal to the camera-only
+    network: one ONNX/engine for both modes. Train with modality dropout
+    (--lidar-drop) so BN statistics stay calibrated for both. History
+    slots always run camera-only (self._lidar is cleared after forward),
+    matching a runtime whose memory ring stores raw camera BEVs."""
+    def __init__(self, *a, **k):
+        super().__init__(*a, **k)
+        self.lid_alpha = nn.Parameter(torch.tensor(1.5))  # sigmoid -> 0.82
+        self._lidar = None
+
+    def sharpen_dprob(self, dprob):
+        if self._lidar is None:
+            return dprob
+        BN, D, fh, fw = dprob.shape
+        d = self._lidar.reshape(BN, 1, *self._lidar.shape[-2:]).to(
+            dprob.dtype)
+        if d.shape[-2:] != (fh, fw):
+            d = F.interpolate(d, (fh, fw), mode="nearest")
+        m = ((d > self.D_MIN) & (d < self.D_MIN + self.D_STEP * (self.D - 2))
+             ).to(dprob.dtype)
+        bins = (self.D_MIN + torch.arange(
+            self.D, device=dprob.device, dtype=dprob.dtype)
+            * self.D_STEP).view(1, D, 1, 1)
+        tri = (1.0 - (d - bins).abs() / self.D_STEP).clamp(min=0)
+        a = torch.sigmoid(self.lid_alpha) * m
+        return (1.0 - a) * dprob + a * tri
+
+    def forward(self, imgs, K, T_cam_ego, v0=None, prev_bev=None,
+                warp_theta=None, lidar=None):
+        self._lidar = lidar
+        try:
+            return super().forward(imgs, K, T_cam_ego, v0, prev_bev,
+                                   warp_theta)
+        finally:
+            self._lidar = None          # history compute_bev stays cam-only
+
+
+class DepthSegIPMNetV32(DepthSegIPMNetV31):
+    """v32: + optional LiDAR pillar branch (roadmap C6b), switchable at
+    inference on the same weights.
+
+    Input: a host-side BEV raster of the current LiDAR sweep
+    [B,4,400,250] at 0.4 m (log-count, max z, mean z, occupancy — see
+    extract_lidar_bev.py; the deployment runtime computes the identical
+    raster from the raw pcd). A small conv stem turns it into a 96-ch
+    residual added to the raw BEV *before* every head and the temporal
+    queue:
+
+        bev' = bev + flag * up2(stem(raster))
+
+    flag is derived from the raster itself (any nonzero cell), so feeding
+    zeros makes the residual EXACTLY zero -> bit-equal to the camera-only
+    network: ON/OFF is decided per frame by what you feed, one engine, one
+    checkpoint. The stem's last conv is zero-initialised, so warm starts
+    from a non-LiDAR checkpoint are behaviour-preserving; train with the
+    same modality dropout as v31 (the C6a depth input and this raster are
+    dropped together)."""
+    def __init__(self, *a, **k):
+        super().__init__(*a, **k)
+        self.lidar_stem = nn.Sequential(
+            nn.Conv2d(4, 64, 3, padding=1), nn.ReLU(inplace=True),
+            nn.Conv2d(64, 96, 3, padding=1), nn.ReLU(inplace=True),
+            nn.Conv2d(96, 96, 1))
+        nn.init.zeros_(self.lidar_stem[-1].weight)
+        nn.init.zeros_(self.lidar_stem[-1].bias)
+        self._lidar_bev = None
+
+    def bev_extra(self, bev):
+        if self._lidar_bev is None:
+            return bev
+        lb = self._lidar_bev.to(bev.dtype)
+        flag = (lb.abs().sum((1, 2, 3), keepdim=True) > 0).to(bev.dtype)
+        res = F.interpolate(self.lidar_stem(lb), bev.shape[-2:],
+                            mode="bilinear", align_corners=False)
+        return bev + flag * res
+
+    def forward(self, imgs, K, T_cam_ego, v0=None, prev_bev=None,
+                warp_theta=None, lidar=None, lidar_bev=None):
+        self._lidar_bev = lidar_bev
+        try:
+            return super().forward(imgs, K, T_cam_ego, v0, prev_bev,
+                                   warp_theta, lidar=lidar)
+        finally:
+            self._lidar_bev = None      # history compute_bev stays cam-only
+
+
+class DepthSegIPMNetV33(DepthSegIPMNetV32):
+    """v33: precision pass on user-visible failures.
+
+    1. Stationary flag reads the TEMPORAL trajectory feature (motion
+       residual included) instead of the single-frame detection stem — one
+       frame cannot tell parked from stopped from creeping, which capped
+       statAcc at ~0.68. Graft: old 128-ch weights map onto the det-feat
+       half of the 256-ch input, zeros elsewhere -> behaviour-preserving.
+    2. Trajectory head additionally sees the detached detection yaw
+       (sin/cos of the reg head) — a direct orientation prior for oncoming
+       traffic instead of re-deriving it from BEV smears.
+    (Occupancy near-FP suppression and crossing-yaw weighting live in the
+    shared losses/GT; see occ_loss, build_det_targets, filter v2.)"""
+    def __init__(self, *a, **k):
+        super().__init__(*a, **k)
+        # separate module: the inherited forward still runs the old
+        # 128-ch stat_head on the det stem; out[10] is then replaced.
+        # Freeze the old head — its output never reaches a loss, and DDP
+        # refuses parameters that produce no gradient.
+        for p_ in self.stat_head.parameters():
+            p_.requires_grad_(False)
+        self.stat_head2 = nn.Conv2d(256, 1, 1)
+        nn.init.zeros_(self.stat_head2.bias)
+        self.traj_head = nn.Conv2d(258, TRAJ_H * 2 * EGO_K + EGO_K, 1)
+
+    def traj_feat(self):
+        base = super().traj_feat()                    # caches self._tf too
+        self._tf = torch.cat([base, self._det_reg[:, 4:6].detach()], 1)
+        return self._tf
+
+    def forward(self, imgs, K, T_cam_ego, v0=None, prev_bev=None,
+                warp_theta=None, lidar=None, lidar_bev=None):
+        out = super().forward(imgs, K, T_cam_ego, v0, prev_bev, warp_theta,
+                              lidar=lidar, lidar_bev=lidar_bev)
+        # stationary flag (out[10]) recomputed on the temporal feature;
+        # _tf excludes the yaw channels appended for the traj head
+        out = list(out)
+        out[10] = self.stat_head2(self._tf[:, :256])
+        return tuple(out)
 
 
 MODELS = {"v1": IPMSegNet, "v2": IPMSegNetV2, "v3s": IPMSegNetV3,
@@ -1894,4 +2149,4 @@ MODELS = {"v1": IPMSegNet, "v2": IPMSegNetV2, "v3s": IPMSegNetV3,
           "v19": DepthSegIPMNetV19, "v20": DepthSegIPMNetV20,
           "v21": DepthSegIPMNetV21, "v22": DepthSegIPMNetV22,
           "v23": DepthSegIPMNetV23, "v24": DepthSegIPMNetV24,
-          "v25": DepthSegIPMNetV25, "v26": DepthSegIPMNetV26, "v27": DepthSegIPMNetV27, "v28": DepthSegIPMNetV28, "v29": DepthSegIPMNetV29, "v30": DepthSegIPMNetV30}
+          "v25": DepthSegIPMNetV25, "v26": DepthSegIPMNetV26, "v27": DepthSegIPMNetV27, "v28": DepthSegIPMNetV28, "v29": DepthSegIPMNetV29, "v30": DepthSegIPMNetV30, "v31": DepthSegIPMNetV31, "v32": DepthSegIPMNetV32, "v33": DepthSegIPMNetV33}

@@ -39,7 +39,7 @@ and a vector lane graph---and, equally importantly, the fully automated
 pipeline that builds it. \textbf{No human annotated a single box, mask,
 waypoint or light state, and no human wrote a single line of code}: every
 supervision signal is distilled offline from raw eight-camera recordings of
-the Co-MLOps Data Recording System by a fourteen-stage autolabel factory
+the Co-MLOps Data Recording System by a seventeen-stage autolabel factory
 built on the CoMET autolabeling foundation, and the complete system---the
 factory, the network, the trainer, the deployment stack, and this
 manuscript---was authored by an LLM agent (Claude Fable~5) operating
@@ -48,20 +48,25 @@ backbone with a \emph{depth-gated inverse perspective mapping}, a streaming
 temporal memory (three ego-motion-warped BEV slots covering 2.8\,s), and
 task routing that serves geometry heads from the single-frame BEV and motion
 heads from the fused BEV; it restricts itself to TensorRT-exportable
-operators (45.8\,M parameters) and runs all tasks in a single fp16 engine at
-$\sim$70\,ms per eight-camera frame on one L40S. A rolling-round training
-methodology interleaves data conversion, ground-truth refinement and
-training; we document its measurement-driven corrections---curvature-weighted
-imitation, camera-confirmation relaxation for vulnerable road users,
-near-range-first detection supervision, 3$\times$3-neighbourhood yaw targets,
-learned-fusion grafting for warm starts, and automatic exclusion of
-GNSS-dead indoor scenes detected from the sky fraction of 2D
-autolabels---each of which repaired a quantified failure mode. On a held-out
-recording day, \meteor{} reaches 0.283 BEV lane mIoU, 0.490 2D-segmentation
-mIoU, 1.60\,m depth MAE, 3\,s trajectory ADE of 0.66\,m (0.62\,m on curves,
-down from 2.31\,m), near-corridor vehicle recall of 0.67 with $6.3^\circ$
-yaw error, and 0.88 traffic-light accuracy---\emph{all without a single
-human label}.
+operators (45.9\,M parameters) and runs all tasks in a single fp16 engine at
+$\sim$70\,ms per eight-camera frame on one L40S. LiDAR, when present, is an
+\emph{optional} input on the very same weights: projected returns sharpen
+the predicted depth distribution elementwise, and feeding zeros is
+bit-identical to the camera-only network, so one engine serves both sensor
+configurations. A rolling-round training methodology interleaves data
+conversion, ground-truth refinement and training; we document its
+measurement-driven corrections---curvature-weighted imitation,
+camera-confirmation relaxation for vulnerable road users, near-range-first
+detection supervision, normalisation-statistics isolation for the temporal
+memory, $\varepsilon$-winner-takes-all against multimodal collapse, an
+explicit motion residual that halts oncoming-heading flips, and automatic
+exclusion of GNSS-dead indoor scenes---each of which repaired a quantified
+failure mode. On a held-out recording day, \meteor{} reaches 0.302 BEV lane
+mIoU, 0.535 2D-segmentation mIoU, 3\,s trajectory ADE of 0.73\,m (0.72\,m
+on curves, down from 2.31\,m), near-corridor vehicle recall of 0.72 with
+$5.8^\circ$ yaw error, and 0.86 traffic-light accuracy---\emph{all without
+a single human label}---and the unmodified engine transfers zero-shot to
+right-hand-traffic US recordings.
 \end{abstract}
 
 \section{Introduction}
@@ -325,6 +330,16 @@ from 0.3 to 0.15---their small 2D projections are dominated by geometric
 error, and the strict gate silently deleted a third of them; relaxing it
 raised VRU recall from 0.08 to 0.25 in one round.
 
+\subsection{Unknown objects from occupancy blobs}
+Cones, guide posts and debris matter for driving but are absent from the
+annotation taxonomy---no label source exists. The occupancy GT already
+localises them: small blobs of the generic \emph{obstacle} class
+($\le$2.4\,m$^2$ footprint, $\le$1.6\,m tall) are extracted per frame and
+their centroids become centre-point GT for a dedicated heatmap head that
+joins the 3D-box stream as a third class with a fixed
+$0.4{\times}0.4$\,m footprint. The factory thus \emph{invents} supervision
+for a class no annotator ever drew.
+
 \subsection{Ego-relevant traffic-light state}
 CoMET's TLR subnet already writes per-image light boxes with colour states
 into the 2D autolabels; we reduce them to one whole-image label per frame
@@ -390,6 +405,7 @@ through a shared ResNet-34~\citep{he2016resnet} with an FPN~\citep{lin2017fpn}
 that fuses all levels at stride 4 into a 160-channel feature $f$.
 
 \subsection{Depth-gated IPM}
+\label{sec:ipm}
 A fixed BEV grid ($800{\times}500$ at 0.2\,m; $\pm$80$\times$$\pm$50\,m,
 $z{=}0$) is projected into every camera by the calibrated $K,T$. At each
 projection we \texttt{grid\_sample} a 96-channel context feature $c$ and the
@@ -478,6 +494,38 @@ loss, and a cross-entropy trains the confidences toward the winner. The
 same widening applies to per-agent forecasting. Modes warm-start as copies
 of the previously trained single mode with symmetry-breaking noise.
 
+Pure winner-takes-all collapsed in practice: an initially slightly better
+mode won every frame, the losers received no gradient, and all three
+hypotheses converged to near-identical copies (one mode won 80/80 validation
+frames). Two changes restored diversity: $\varepsilon$-WTA
+($\varepsilon{=}0.1$ of the loss always flows to the losing modes) and a
+directionally diverse initialisation (straight / left / right lateral biases
+of $\pm0.8$\,m at 3\,s). Because only 7.5\% of moving frames turn more than
+4\,m laterally, turn frames are additionally oversampled $3\times$ by the
+per-epoch subset sampler.
+
+\subsection{Optional LiDAR input: one set of weights, two sensor configs}
+\label{sec:lidaropt}
+The network is camera-only, but LiDAR---already on the recording
+platform---can be accepted as an \emph{optional} input without a second
+model. Points are projected into the cameras as a sparse metric depth map
+(the same format as the depth GT), and wherever a return exists the
+predicted depth softmax is blended toward the measured bin,
+\[
+p' \;=\; (1-\alpha m)\,p \;+\; \alpha m\,\mathrm{tri}(d),
+\]
+with $\mathrm{tri}(d)$ the two-bin triangular encoding of the measured
+depth, $m$ the per-pixel return mask and $\alpha$ a learned scalar. All
+operations are elementwise, so the TensorRT graph is unchanged; feeding
+zeros makes $m\equiv 0$ and the network is \emph{bit-identical} to the
+camera-only model, so a single checkpoint and a single engine serve both
+sensor configurations. Training hides the LiDAR input on half the samples
+(modality dropout), which keeps normalisation statistics calibrated for
+both modes and lets LiDAR-assisted gradients regularise the camera-only
+path. The depth distribution is exactly where this architecture localises
+its uncertainty (Sec.~\ref{sec:ipm}), so the measurement is injected at
+the single point of maximum effect for near-zero cost.
+
 \section{Training}
 \label{sec:training}
 
@@ -496,15 +544,40 @@ cross-entropy returns NaN and destroys training within 50 steps.
 
 \subsection{Measurement-driven loss corrections}
 \label{sec:fixes}
-Three corrections were made \emph{after} quantifying a failure, and we report
-them as results in Sec.~\ref{sec:exp}: (i)~\textbf{curvature weighting}: 83\%
-of frames are near-straight and longitudinal waypoint magnitudes exceed
-lateral ones 18$\times$, so plain L1 learns a go-straight prior; we weight
-lateral errors 4$\times$ and scale each sample by $1+\min(|y_{3s}|,6)/1.5$.
+Every correction below was made \emph{after} quantifying a failure, and we
+report them as results in Sec.~\ref{sec:exp}: (i)~\textbf{curvature
+weighting}: 83\% of frames are near-straight and longitudinal waypoint
+magnitudes exceed lateral ones 18$\times$, so plain L1 learns a go-straight
+prior; we weight lateral errors 4$\times$ and scale each sample by
+$1+\min(|y_{3s}|,6)/1.5$.
 (ii)~\textbf{coverage-based thin-class rasterisation} and
 (iii)~\textbf{small-object retention} as described in Sec.~3.4, paired with
 per-class positive weights in both detection heads and a near-range
 ($<$20\,m) positive boost for vulnerable road users in the 3D head.
+(iv)~\textbf{Normalisation-statistics pollution}: with the 3-slot memory
+queue, each optimisation step runs the backbone three times on \emph{history}
+frames for every current frame, and $\sim$16\% of history slots are all-zero
+padding; BatchNorm running statistics were dominated by this off-distribution
+mixture and evaluation-mode accuracy collapsed within 50 steps while the
+training loss stayed healthy. Wrapping the history passes in
+\texttt{eval()} (they are inference, not supervision) fixed the collapse
+(step-50 probe mIoU $0.213\!\to\!0.265$, vehicle precision
+$0.48\!\to\!0.83$); a step-level metric probe every 500 steps ($\sim$90\,s)
+is what made a within-epoch failure visible at all.
+(v)~\textbf{Oncoming-heading flips}: forecast headings for same-direction
+traffic have a 1--2.5\% flip rate ($>$120$^\circ$ error at 3\,s), but
+oncoming traffic flips 21--23\% while the ego moves and \textbf{51\%} while
+the ego is stopped---the median error stays low, so the failure is a
+bimodal flip toward the ego-forward majority prior, invisible in mean
+metrics. The forecast stem's only direction cue was the temporal smear in
+the fused BEV. We now feed an explicit \emph{motion residual} (current BEV
+minus the ego-warped $t{-}0.4$\,s slot, gated to zero when the slot is
+empty), under which an oncoming vehicle reads as a signed dipole along its
+true motion, and weight oncoming-vehicle cells $2.5\times$ in the forecast
+loss (the same minority treatment as VRUs).
+(vi)~\textbf{Task starvation}: traffic-light accuracy regressed
+$0.88\!\to\!0.28$ when four new task losses were added in one round; raising
+its loss share restored it to $0.86$ with no cost to the priority tasks.
 
 \subsection{Rolling rounds}
 Training proceeds in $\sim$24\,h rounds on seven GPUs. Each round refreshes
@@ -535,18 +608,17 @@ All numbers below are single-model, single-pass; no test-time augmentation.
 \toprule
 Metric & Value\\
 \midrule
-BEV lane mIoU (8 classes + bg) & 0.283\\
-2D segmentation mIoU (21 classes) & 0.490\\
-Depth MAE (0--80\,m, 8 cams) & 1.60\,m\\
-3D det.\ near-corridor recall veh / VRU ($<$30\,m, $|y|<$12\,m) & 0.67 / 0.45\\
-3D det.\ yaw axis error / direction flips & $6.3^\circ$ / 11\%\\
-E2E trajectory ADE / FDE (3\,s) & 0.66\,m / 1.39\,m\\
-E2E curve ADE ($|y_{3s}|>2$\,m) & 0.62\,m\\
-Steering MAE / brake accuracy & 0.019\,rad / 0.78\\
-Agent forecast ADE (3\,s) / stationary-flag acc. & 1.83\,m / 0.69\\
-Traffic-light state accuracy & 0.88\\
-Risk-field L1 (all / high-risk cells) & 0.079 / 0.126\\
-Occupancy road IoU (0--10 / 10--20 / 20--40\,m) & 0.63 / 0.64 / 0.64\\
+BEV lane mIoU (8 classes + bg) & 0.302\\
+2D segmentation mIoU (21 classes) & 0.535\\
+3D det.\ vehicle precision / near-corridor recall & 0.85 / 0.72\\
+3D det.\ yaw axis error / direction flips & $5.8^\circ$ / 10\%\\
+3D det.\ VRU precision / near-corridor recall & 0.73 / 0.44\\
+E2E trajectory ADE / ADE$_\mathrm{curve}$ / FDE (3\,s) & 0.73\,m / 0.72\,m / 1.54\,m\\
+Steering MAE / brake accuracy & 0.018\,rad / 0.76\\
+Agent forecast ADE (3\,s) / stationary-flag acc. & 1.92\,m / 0.67\\
+Traffic-light state accuracy & 0.86\\
+Risk-field L1 (all / high-risk cells) & 0.083 / 0.221\\
+Occupancy-flow EPE moving / static & 1.40 / 0.22\,m/s\\
 \bottomrule
 \end{tabular}
 \end{table}
@@ -556,8 +628,25 @@ context: \textbf{every number is achieved without a single human label and
 without a single line of human-written code}, and the validation recording is
 from a different day and route than all training data; indoor (GNSS-dead)
 segments are excluded from both sides by the sky-fraction gate. The
-occupancy-flow and lane-graph heads were in their first training round at
-submission time and are reported qualitatively only. Fig.~\ref{fig:qual} shows qualitative output.
+lane-graph head has not yet left its floor (precision/recall $\approx$0.01;
+its anchored-slot decoder appears structurally unable to model the relational
+task and a query-decoder rework is queued) and is reported qualitatively
+only. Fig.~\ref{fig:qual} shows qualitative output.
+
+\subsection{Zero-shot cross-country generalisation}
+The training corpus is Japan-only (left-hand traffic, Japanese vehicles and
+traffic lights). Running the unmodified TensorRT engine on US recordings
+from the same camera platform---right-hand traffic, US vehicle types,
+horizontally-mounted signals, and 114\,km/h highway speeds absent from
+training---produces qualitatively correct multi-lane reconstruction, 3D
+detection of US trucks, and correct green-light state on the horizontal
+fixtures. We attribute this to the architectural split of
+Sec.~\ref{sec:ipm}: the image$\to$BEV correspondence is computed from
+calibration rather than learned from data, so it cannot break when the
+country changes; only appearance must transfer. Observed failure modes are
+consistent with that reading: over-extended road-surface segmentation on
+unfamiliar pavement colours and confident traffic-light states on
+signal-free highways---appearance-level errors, not geometric ones.
 
 \subsection{Curvature weighting for imitation}
 \label{sec:exp:curve}

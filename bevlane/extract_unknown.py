@@ -26,9 +26,22 @@ import numpy as np
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from bevlane.extract_gt import OUT  # noqa: E402
 
-KMAX = 32
+KMAX = 64
 MAX_AREA = 15          # cells (2.4 m^2)
 MAX_LAYERS = 4         # 1.6 m
+BLOCK = (2, 3, 7, 8)   # veh / 2wheel / veg / bldg block the line of sight
+
+
+def _los_clear(blocker, cy, cx):
+    """True if the ego (grid 100,100) has line of sight to (cy, cx):
+    LiDAR sees over/behind occluders that cameras cannot — supervising
+    camera-invisible blobs teaches score suppression, not detection."""
+    n = int(max(abs(cy - 100), abs(cx - 100)))
+    if n <= 2:
+        return True
+    ys = np.linspace(100, cy, n)[1:-2]
+    xs = np.linspace(100, cx, n)[1:-2]
+    return not blocker[ys.astype(np.int32), xs.astype(np.int32)].any()
 
 
 def process_scene(scene):
@@ -39,6 +52,7 @@ def process_scene(scene):
         F = 1 + max(fr["frame"] for fr in man["frames"])
         C = np.zeros((F, KMAX, 2), np.float16)
         N = np.zeros(F, np.uint8)
+        NI = np.zeros(F, np.uint8)     # occluded (ignore) entries after N
         tot = 0
         for fr in man["frames"]:
             if not fr.get("occ"):
@@ -49,8 +63,10 @@ def process_scene(scene):
                 continue
             obs = (occ == 1)
             ground = obs.any(0).astype(np.uint8)
+            # cells whose column holds >=2 occluder voxels block the LOS
+            blocker = (np.isin(occ, BLOCK).sum(0) >= 2)
             nlab, lab, stats, cent = cv2.connectedComponentsWithStats(ground)
-            cands = []
+            cands, blocked = [], []
             for j in range(1, nlab):
                 if stats[j, cv2.CC_STAT_AREA] > MAX_AREA:
                     continue
@@ -60,15 +76,29 @@ def process_scene(scene):
                 cy, cx = cent[j][1], cent[j][0]        # row, col
                 xe = 40.0 - cy * 0.4
                 ye = 40.0 - cx * 0.4
-                cands.append((xe * xe + ye * ye, xe, ye))
+                # occluded blobs become IGNORE, not background: the same
+                # cone flips between labeled/occluded across frames and
+                # punishing it as a negative teaches score suppression
+                # (measured: v2 halved the head's scores instead of
+                # helping)
+                if _los_clear(blocker, cy, cx):
+                    cands.append((xe * xe + ye * ye, xe, ye))
+                else:
+                    blocked.append((xe * xe + ye * ye, xe, ye))
             cands.sort()
+            blocked.sort()
             fi = fr["frame"]
-            for k, (_, xe, ye) in enumerate(cands[:KMAX]):
+            nv = min(len(cands), KMAX)
+            for k, (_, xe, ye) in enumerate(cands[:nv]):
                 C[fi, k] = (xe, ye)
-            N[fi] = min(len(cands), KMAX)
-            tot += int(N[fi])
+            ni = min(len(blocked), KMAX - nv)
+            for k, (_, xe, ye) in enumerate(blocked[:ni]):
+                C[fi, nv + k] = (xe, ye)
+            N[fi] = nv
+            NI[fi] = ni
+            tot += nv
         np.savez_compressed(os.path.join(out_dir, "unknown_obj.npz"),
-                            centers=C, n=N)
+                            centers=C, n=N, n_ign=NI)
         man["unknown_obj"] = "unknown_obj.npz"
         json.dump(man, open(mf, "w"))
         return f"[ok] {scene} unk={tot}"

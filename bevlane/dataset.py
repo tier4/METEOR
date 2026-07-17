@@ -25,8 +25,9 @@ class BevLaneDataset(Dataset):
                  with_bbox2d=False, with_ego=False, with_occ=False,
                  with_agenttraj=False, with_temporal=False, with_tl=False,
                  with_risk=False, with_lanegraph=False, temporal_hist=0,
-                 with_unknown=False):
+                 with_unknown=False, with_lidarbev=False):
         self.root = root
+        self.with_lidarbev = with_lidarbev
         self.gt_key = gt_key
         self.dontcare_sidewalk = dontcare_sidewalk
         self.with_depth = with_depth
@@ -271,21 +272,40 @@ class BevLaneDataset(Dataset):
             out.append(torch.tensor(ln, dtype=torch.int64))
             out.append(torch.from_numpy(la))
         if self.with_unknown:
-            uc = np.zeros((32, 2), np.float32)
+            UKM = 64
+            uc = np.zeros((UKM, 2), np.float32)
             un = 0
             if s not in self._unk_cache:
                 try:
                     z = np.load(os.path.join(self.root, s, "unknown_obj.npz"))
-                    self._unk_cache[s] = (z["centers"], z["n"])
+                    self._unk_cache[s] = (z["centers"], z["n"],
+                                          z["n_ign"] if "n_ign" in z
+                                          else None)
                 except Exception:
                     self._unk_cache[s] = None
             z = self._unk_cache[s]
             fi = f["frame"]
             if z is not None and fi < len(z[1]):
-                uc = z[0][fi].astype(np.float32)
-                un = int(z[1][fi])
+                c = z[0][fi].astype(np.float32)     # KMAX 32 (old) or 64
+                k = min(len(c), UKM)
+                uc[:k] = c[:k]
+                nv = min(int(z[1][fi]), k)
+                ni = min(int(z[2][fi]), k - nv) if z[2] is not None else 0
+                # packed: low byte = positives, high byte = ignore entries
+                # that follow them in uc (occluded blobs, v3 GT)
+                un = nv + (ni << 8)
             out.append(torch.from_numpy(uc))
             out.append(torch.tensor(un, dtype=torch.int64))
+        if self.with_lidarbev:
+            lb = np.zeros((4, 400, 250), np.float32)
+            p_ = f.get("lidar_bev")
+            if p_:
+                try:
+                    lb = np.load(os.path.join(self.root, s, p_)
+                                 )["lb"].astype(np.float32)
+                except Exception:
+                    pass
+            out.append(torch.from_numpy(lb))
         if self.with_temporal and self.temporal_hist > 0:
             # v29 memory queue: N history frames at fi-2, fi-6, fi-14
             HN = self.temporal_hist

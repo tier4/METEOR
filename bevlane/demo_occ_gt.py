@@ -13,31 +13,104 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from bevlane.extract_occ import GX, GY, GZ, OCC_NAMES, OCC_PAL, VOX  # noqa: E402
 
 
-def iso_render(occ, W=900, H=760):
-    """Painter's-algorithm isometric voxel rendering (ego at centre)."""
+def iso_render(occ, W=900, H=760, rng_m=24.0, drop=(8,), zmax_m=3.0):
+    """Painter's-algorithm isometric voxel rendering (ego at centre).
+
+    rng_m: half-extent shown (crop around ego). drop: classes hidden
+    (default 8 = building, which walls off the near field). zmax_m:
+    voxels above this height are hidden (tree canopy over the ego)."""
     img = np.zeros((H, W, 3), np.uint8)
-    zz, rr, cc = np.nonzero((occ > 0) & (occ != 255))
+    occ = np.asarray(occ)
+    n = min(int(rng_m / 0.4), occ.shape[1] // 2)
+    r0 = occ.shape[1] // 2 - n
+    zmax = min(int((zmax_m + 1.0) / 0.4), occ.shape[0])   # z0 = -1.0 m
+    occ = occ[:zmax, r0:r0 + 2 * n, r0:r0 + 2 * n]
+    keep = (occ > 0) & (occ != 255) & ~np.isin(occ, drop)
+    zz, rr, cc = np.nonzero(keep)
     if len(zz) == 0:
         return img
     cls = occ[zz, rr, cc]
     # iso axes: u along (col - row), v along (col + row)/2 - z
-    su, sv, sz = 3.0, 1.5, 5.0
+    su = W / (3.0 * n)                            # width-filling
+    sv, sz = su * 1.4, su * 0.8
     u = ((cc.astype(np.int32) - rr) * su * 0.75 + W // 2).astype(np.int32)
     v = ((cc.astype(np.int32) + rr) * sv * 0.75 * 0.5
-         - zz * sz + H * 0.28).astype(np.int32)
+         - zz * sz + H * 0.10).astype(np.int32)
     order = np.argsort((rr + cc) * GZ + zz)      # far -> near, low -> high
     u, v, zz2, cls = u[order], v[order], zz[order], cls[order]
     shade = (0.55 + 0.45 * zz2 / (GZ - 1))
     col = (OCC_PAL[cls][:, ::-1] * shade[:, None]).astype(np.uint8)
-    ok = (u >= 1) & (u < W - 2) & (v >= 1) & (v < H - 2)
+    # iso lattice: same-parity cells are 2*su*0.75 apart in u -> wide tiles
+    tw, th = max(2, int(su * 1.5) + 1), max(2, int(sv * 0.375) + 1)
+    ok = (u >= 1) & (u < W - tw) & (v >= 1) & (v < H - th)
     u, v, col = u[ok], v[ok], col[ok]
-    for k in range(len(u)):                      # 2x3 px voxel tiles
-        img[v[k]:v[k] + 2, u[k]:u[k] + 3] = col[k]
+    for k in range(len(u)):                      # voxel tiles
+        img[v[k]:v[k] + th, u[k]:u[k] + tw] = col[k]
     # ego marker
-    eu, ev = W // 2, int(GX * sv * 0.75 * 0.5 + H * 0.28 - sz)
-    cv2.drawMarker(img, ((0 + GX // 2 - GX // 2) * 0 + eu,
-                         int((GX // 2 + GY // 2) * sv * 0.75 * 0.5 + H * 0.28)),
+    cv2.drawMarker(img, (W // 2, int(2 * n * sv * 0.75 * 0.5 + H * 0.10)),
                    (0, 255, 0), cv2.MARKER_TRIANGLE_UP, 16, 2)
+    return img
+
+
+def cube_render(occ, W=900, H=760, rng_m=24.0, drop=(8,), zmax_m=3.0):
+    """Voxel-CUBE isometric rendering: each occupied voxel is a small box
+    (shaded top + two side faces) sitting on a metric ground grid — the
+    classic occupancy-grid look. Painter's algorithm far->near, low->high.
+    Same crop/hide conventions as iso_render."""
+    img = np.zeros((H, W, 3), np.uint8)
+    occ = np.asarray(occ)
+    n = min(int(rng_m / 0.4), occ.shape[1] // 2)
+    r0 = occ.shape[1] // 2 - n
+    zmax = min(int((zmax_m + 1.0) / 0.4), occ.shape[0])
+    occ = occ[:zmax, r0:r0 + 2 * n, r0:r0 + 2 * n]
+    su = W / (3.0 * n)
+    a, b = su * 0.75, su * 1.15 * 0.375
+    sz = su * 0.9
+    v0 = H * 0.14
+
+    def pt(r, c, z):
+        return (int((c - r) * a + W // 2), int((c + r) * b - z * sz + v0))
+
+    # ---- metric ground grid (every 4 m = 10 cells) ----
+    gcol = (60, 60, 60)
+    for g in range(0, 2 * n + 1, 10):
+        cv2.line(img, pt(g, 0, 0), pt(g, 2 * n, 0), gcol, 1, cv2.LINE_AA)
+        cv2.line(img, pt(0, g, 0), pt(2 * n, g, 0), gcol, 1, cv2.LINE_AA)
+    # ---- ground-class voxels as flat tiles (roads etc. stay flat) ----
+    FLAT = (5, 6)                       # road / sidewalk render as carpet
+    keep = (occ > 0) & (occ != 255) & ~np.isin(occ, drop)
+    flat_m = keep & np.isin(occ, FLAT)
+    cube_m = keep & ~np.isin(occ, FLAT)
+    zz, rr, cc = np.nonzero(flat_m)
+    order = np.argsort(rr + cc)
+    for k in order:
+        z, r, c = int(zz[k]), int(rr[k]), int(cc[k])
+        col = (OCC_PAL[occ[z, r, c]][::-1] * 0.55).astype(np.uint8).tolist()
+        p = np.array([pt(r, c, 0), pt(r + 1, c, 0),
+                      pt(r + 1, c + 1, 0), pt(r, c + 1, 0)], np.int32)
+        cv2.fillPoly(img, [p], col)
+    # ---- solid voxels as cubes ----
+    zz, rr, cc = np.nonzero(cube_m)
+    if len(zz):
+        order = np.argsort((rr + cc) * (occ.shape[0] + 1) + zz)
+        for k in order:
+            z, r, c = int(zz[k]), int(rr[k]), int(cc[k])
+            base = OCC_PAL[occ[z, r, c]][::-1].astype(np.float32)
+            shade = 0.6 + 0.4 * z / max(zmax - 1, 1)
+            top = np.clip(base * shade, 0, 255).astype(np.uint8).tolist()
+            left = np.clip(base * shade * 0.55, 0, 255).astype(np.uint8).tolist()
+            right = np.clip(base * shade * 0.75, 0, 255).astype(np.uint8).tolist()
+            t00, t10 = pt(r, c, z + 1), pt(r + 1, c, z + 1)
+            t11, t01 = pt(r + 1, c + 1, z + 1), pt(r, c + 1, z + 1)
+            b10, b11, b01 = pt(r + 1, c, z), pt(r + 1, c + 1, z), pt(r, c + 1, z)
+            cv2.fillPoly(img, [np.array([t10, t11, b11, b10], np.int32)], left)
+            cv2.fillPoly(img, [np.array([t01, t11, b11, b01], np.int32)], right)
+            tp = np.array([t00, t10, t11, t01], np.int32)
+            cv2.fillPoly(img, [tp], top)
+            cv2.polylines(img, [tp], True,
+                          tuple(int(v * 0.45) for v in top), 1)
+    cv2.drawMarker(img, pt(n, n, 0), (0, 255, 0),
+                   cv2.MARKER_TRIANGLE_UP, 16, 2)
     return img
 
 
