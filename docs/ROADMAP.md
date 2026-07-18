@@ -105,6 +105,29 @@ entries below are ordered by (value ÷ risk).
 
 | C7 | ✅ L1 IMPLEMENTED (bevlane/guardrail.py + demo --guard; HOLD state, fragment-tolerant, detailed reasons) — next: intervention-rate eval on val. **E2E guardrails (doer/checker safety channel)** | The 12 heads make a classic safety architecture nearly free: (L1) deterministic hard gates — spacetime collision check of the chosen path against predicted occupancy+flow+agent futures, red-light×stop-line gate, bicycle-model feasibility clamp, drivable/free containment; checker heads run on the RAW BEV route while E2E uses the fused route (partial input independence), and with LiDAR attached the raw-point near-field AEB is a **non-ML** last wall. (L2) = C1 risk-integral mode fallback (pick the safest of K=3). (L3) uncertainty monitors (mode spread, temporal path stability, depth/seg entropy OOD) trigger degraded mode. (L4) an independently generated in-lane-stop MRM path (centerline spline + decel profile) replaces vetoed plans. Measurable: correct-intervention vs false-intervention rate on val futures, per round. Runtime-only through L2; no retraining. |
 
+## E. Next-generation candidates (2026-07-18 brainstorm)
+
+Accuracy levers, grounded in measured weaknesses:
+
+| # | Item | Why / evidence | Cost |
+|---|---|---|---|
+| E1 | **Adverse-domain rounds (snow/night/rain)** | The unseen-drive demo showed snow segmented as sidewalk; mine domain slices by image statistics (brightness, wiper motion, white fraction) and oversample like C2 | S |
+| E2 | **Self-training on label-less recordings** | 342 scenes have no CoMET autolabels; the r28 model can pseudo-label them (2D seg / boxes / TL) and the factory can build BEV GT from its own predictions — closes the loop to "any recording is training data" | M |
+| E3 | **Temporal-consistency losses** (finish A2) | Box flicker: EMA/matching loss across the 3 memory slots at train time; runtime score EMA already trivially available | S |
+| E4 | **Per-agent velocity readout + TTC** | Occupancy flow exists but boxes carry no velocity output; a 2-ch reg head gives the guardrail true TTC instead of 0.5 s stepping | S |
+| E5 | **3D box height from occupancy** | Boxes are drawn with fixed height; the occ column already knows it — free supervision, better camera wireframes and truck handling | S |
+| E6 | **Route/intent conditioning for E2E** | K=3 covers geometry, but mode CHOICE at intersections is unobservable without intent; feed a 3-way route token (from future ego GT at train time, from navigation at runtime) — turns the planner into a commandable one | M |
+| E7 | **Confidence calibration for all heads** | Guard thresholds are hand-set; temperature-calibrate on val per head so VETO margins mean probabilities | S |
+| E8 | **Student distillation for Orin** | ResNet-18 + half-res student distilled from the v35 teacher (feature + output distillation); pairs with C4 INT8 and the IPM sector mask | L |
+| E9 | **Per-round video regression CI** | Render the fixed holdout scenes every round, diff metrics + frames automatically; catches user-visible regressions (flicker, phantom OCC) that scalar metrics miss | S |
+| E10 | **VLM-based demo triage** | Run a vision-language model over each round's demo video to auto-flag anomalies (wrong-way arrows, phantom boxes) — scales the "user watches the demo" loop | M |
+| E11 | **US 5% fine-tune round** | Zero-shot already works; measure how little US data closes the seg/TL gaps (transfer-efficiency experiment for new-region rollout) | S |
+| E12 | **Overtake/lane-change scenario metrics** | The overtake holdout demo showed parked-row stationary flags flickering in unseen domains; add scenario-sliced eval (overtake, cut-in, crossing) on the 150-scene holdout | S |
+
+Sequencing after r29 (B1–B4) and the full-corpus round: E3/E4/E5/E7 are
+one-round bundles (small, probe-measurable); E2 and E6 are the two big
+capability unlocks; E8+C4 is the deployment endgame.
+
 ## D. Data / infrastructure
 
 | # | Item | Note |

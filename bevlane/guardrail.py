@@ -30,10 +30,16 @@ K_MAX = 0.2                # 1/m max curvature bound (~tan(30deg)/2.8m)
 
 
 def _occ_ground(occ_pred):
-    """[Z,200,200] class grid -> ground-projected static blockers (0.4 m)."""
+    """[Z,200,200] class grid -> ground-projected static blockers (0.4 m).
+    The hood strip (x<5.5 m, |y|<1.6 m) is blanked: the ego's own hood
+    reflections produce persistent phantom obstacle voxels dead ahead
+    (the constant 3-4 m STATIC veto) — a known near-ego OCC FP mode that
+    the r27 GT cleanup targets; the guard must not consume it."""
     if occ_pred is None:
         return None
-    return np.isin(occ_pred, STATIC_OCC).any(0)
+    blk = np.isin(occ_pred, STATIC_OCC).any(0)
+    blk[86:101, 96:105] = False          # x in (0,5.6], |y|<=1.6 m
+    return blk
 
 
 def check_path(path, occ_pred, dets, det_offs, tl_probs, lane_argmax, v0):
@@ -141,3 +147,23 @@ def check_path(path, occ_pred, dets, det_offs, tl_probs, lane_argmax, v0):
                 "p_event": p_ev, "feasible": feas, "stop_path": stop}
     return {"verdict": "OK", "reason": "", "t_event": None,
             "p_event": None, "feasible": feas, "stop_path": None}
+
+
+def risk_pick(modes, confs, risk_map, lam=1.5):
+    """C1: pick the E2E mode by confidence minus the risk-field line
+    integral (risk_map [400,250] = fused crop x in [-40,40), y in
+    (-25,25], 0.2 m). Returns (best_idx, per_mode_scores, per_mode_risk)."""
+    scores, risks = [], []
+    for k in range(len(modes)):
+        wp = np.asarray(modes[k]).reshape(6, 2)
+        ri = 0.0
+        n = 0
+        for x, y in wp:
+            r, c = int((40.0 - x) / 0.2), int((25.0 - y) / 0.2)
+            if 0 <= r < risk_map.shape[0] and 0 <= c < risk_map.shape[1]:
+                ri += float(risk_map[r, c])
+                n += 1
+        ri = ri / max(n, 1)
+        risks.append(ri)
+        scores.append(float(confs[k]) - lam * ri)
+    return int(np.argmax(scores)), scores, risks

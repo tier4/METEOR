@@ -1809,7 +1809,9 @@ class DepthSegIPMNetV29(DepthSegIPMNetV28):
         wb = wps.gather(1, bidx).squeeze(1)          # [B,12,H,W]
         pd, gd = wb[:, 10:12], t[:, 10:12]
         gn = gd.norm(dim=1)
-        mov = (gn > 2.0) & (m[:, 10] > 0)
+        # 1.0 m: pedestrians average 2.58 m @3 s — a 2.0 m gate excluded
+        # half of them from direction supervision (vruHead stuck ~79 deg)
+        mov = (gn > 1.0) & (m[:, 10] > 0)
         if mov.any():
             cos = (pd * gd).sum(1) / (pd.norm(dim=1) * gn + 1e-3)
             dl = ((1.0 - cos) * m[:, 10])[mov].mean()
@@ -1982,7 +1984,7 @@ class DepthSegIPMNetV30(DepthSegIPMNetV29):
                                               (d2 < 3.0 ** 2).float())
                     continue
                 g = torch.exp(-(((ys - r) ** 2).view(-1, 1)
-                                + ((xs - c) ** 2).view(1, -1)) / (2 * 1.5 ** 2))
+                                + ((xs - c) ** 2).view(1, -1)) / (2 * 2.0 ** 2))
                 hm_t[b, 0] = torch.maximum(hm_t[b, 0], g)
                 npos += 1
         p = hm.float().sigmoid().clamp(1e-4, 1 - 1e-4)
@@ -2141,6 +2143,127 @@ class DepthSegIPMNetV33(DepthSegIPMNetV32):
         return tuple(out)
 
 
+class DepthSegIPMNetV34(DepthSegIPMNetV33):
+    """v34: unknown detection reworked (roadmap: fundamental fix).
+
+    The 1x1 head on the single-frame det stem could not accumulate
+    evidence for 0.4 m objects; the new head runs a small conv stem on the
+    TEMPORAL trajectory feature (motion residual + det feature, 256 ch) —
+    static cones integrate over the 2.8 s memory. Old head frozen (DDP).
+    Pair with radius-2.0 positives and --unk-w 1.0."""
+    def __init__(self, *a, **k):
+        super().__init__(*a, **k)
+        for p_ in self.unk_head.parameters():
+            p_.requires_grad_(False)
+        self.unk_stem = nn.Sequential(
+            nn.Conv2d(256, 64, 3, padding=1), nn.ReLU(inplace=True),
+            ConvBlock(64, 64))
+        self.unk_head2 = nn.Conv2d(64, 1, 1)
+        nn.init.constant_(self.unk_head2.bias, -2.19)
+
+    def forward(self, imgs, K, T_cam_ego, v0=None, prev_bev=None,
+                warp_theta=None, lidar=None, lidar_bev=None):
+        out = list(super().forward(imgs, K, T_cam_ego, v0, prev_bev,
+                                   warp_theta, lidar=lidar,
+                                   lidar_bev=lidar_bev))
+        out[17] = self.unk_head2(self.unk_stem(self._tf[:, :256]))
+        return tuple(out)
+
+
+class DepthSegIPMNetV35(DepthSegIPMNetV34):
+    """v35: the TRT-safe transformer quartet (roadmap B1-B4).
+
+    B1 lane graph: 24 learned queries, 2 decoder layers (self-attn +
+       cross-attn to 352 pooled BEV-ROI tokens) replace the anchored MLP.
+    B2 temporal: per-cell softmax gate over [cur|t-.4|t-1.2|t-2.8];
+       zero-init -> uniform -> exactly today's fusion at start.
+    B3 E2E: K=3 queries attend to the pooled BEV grid; zero-init residual
+       added to the ego output.
+    B4 agents (lite): scene-level interaction token from det features,
+       zero-init residual into the trajectory stem output.
+    All dense attention with static token counts: MatMul/Softmax only."""
+    def __init__(self, *a, **k):
+        super().__init__(*a, **k)
+        # old lane-graph decoder is replaced -> freeze (DDP refuses
+        # parameters that never receive gradient; lg_adj is reused live)
+        for mod_ in (self.lg_tower, self.lg_mlp, self.lg_pts, self.lg_meta):
+            for p_ in mod_.parameters():
+                p_.requires_grad_(False)
+        # B2
+        self.tgate = nn.Conv2d(96 * 4, 4, 1)
+        nn.init.zeros_(self.tgate.weight); nn.init.zeros_(self.tgate.bias)
+        # B1
+        self.lgq = nn.Embedding(LG_M, 256)
+        dl = nn.TransformerDecoderLayer(256, 4, 512, batch_first=True,
+                                        dropout=0.0)
+        self.lgdec = nn.TransformerDecoder(dl, 2)
+        self.lg_in = nn.Conv2d(96, 256, 1)
+        self.lg_pts2 = nn.Linear(256, LG_P * 2)
+        nn.init.normal_(self.lg_pts2.weight, std=1e-3)
+        with torch.no_grad():
+            b = torch.zeros(LG_P, 2)
+            b[:, 0] = torch.linspace(-4.0, 4.0, LG_P)
+            self.lg_pts2.bias.copy_((b / 30.0).reshape(-1))
+        self.lg_meta2 = nn.Linear(256, 4)
+        # B3
+        self.ego_q = nn.Embedding(3, 96)
+        self.ego_attn = nn.MultiheadAttention(96, 4, batch_first=True)
+        self.ego_delta = nn.Linear(3 * 96, 12 * EGO_K + EGO_K + 3)
+        nn.init.zeros_(self.ego_delta.weight); nn.init.zeros_(self.ego_delta.bias)
+        # B4 lite
+        self.agent_q = nn.Embedding(4, 128)
+        self.agent_attn = nn.MultiheadAttention(128, 4, batch_first=True)
+        self.agent_delta = nn.Conv2d(128, 256, 1)
+        nn.init.zeros_(self.agent_delta.weight); nn.init.zeros_(self.agent_delta.bias)
+
+    def temporal_fuse(self, bev):                      # B2
+        hb, th = self._prev
+        cat = [bev]
+        if hb is None:
+            cat += [torch.zeros_like(bev)] * HIST_N
+        else:
+            for i in range(HIST_N):
+                grid = F.affine_grid(th[:, i].to(bev.dtype), list(bev.shape),
+                                     align_corners=False)
+                cat.append(F.grid_sample(hb[:, i].to(bev.dtype), grid,
+                                         align_corners=False))
+        self._warped0 = cat[1]
+        g = self.tgate(torch.cat(cat, 1)).softmax(1)   # [B,4,H,W]
+        cat = [c * (4.0 * g[:, i:i + 1]) for i, c in enumerate(cat)]
+        return bev + self.tfuse3(torch.cat(cat, 1))
+
+    def forward(self, imgs, K, T_cam_ego, v0=None, prev_bev=None,
+                warp_theta=None, lidar=None, lidar_bev=None):
+        out = list(super().forward(imgs, K, T_cam_ego, v0, prev_bev,
+                                   warp_theta, lidar=lidar,
+                                   lidar_bev=lidar_bev))
+        B = out[0].shape[0]
+        # B3: ego residual from attention pooling over the fused BEV
+        tok = F.adaptive_avg_pool2d(self._fused_bev, (25, 16))             .flatten(2).transpose(1, 2)                # [B,400,96]
+        qa, _ = self.ego_attn(self.ego_q.weight.unsqueeze(0).expand(B, -1, -1),
+                              tok, tok)
+        out[7] = out[7] + self.ego_delta(qa.flatten(1))
+        # B4 lite: scene interaction token -> traj/stat features rerun
+        dt = F.adaptive_avg_pool2d(self._det_feat.detach(), (25, 16))             .flatten(2).transpose(1, 2)                # [B,400,128]
+        ag, _ = self.agent_attn(self.agent_q.weight.unsqueeze(0)
+                                .expand(B, -1, -1), dt, dt)
+        ctx = self.agent_delta(ag.mean(1)[:, :, None, None])
+        tf = self._tf[:, :256] + ctx
+        out[9] = self.traj_head(torch.cat(
+            [tf, self._det_reg[:, 4:6].detach()], 1))
+        out[10] = self.stat_head2(tf)
+        # B1: query-decoder lane graph replaces out[14..16]
+        roi = self._last_bev.detach()[:, :, 100:450, 125:375]
+        mem = F.adaptive_avg_pool2d(self.lg_in(roi), (22, 16))             .flatten(2).transpose(1, 2)                # [B,352,256]
+        emb = self.lgdec(self.lgq.weight.unsqueeze(0).expand(B, -1, -1), mem)
+        out[14] = self.lg_pts2(emb).view(B, LG_M, LG_P, 2) * 30.0             + self.lg_anchors.view(1, LG_M, 1, 2)
+        out[15] = self.lg_meta2(emb)
+        pair = torch.cat([emb.unsqueeze(2).expand(-1, -1, LG_M, -1),
+                          emb.unsqueeze(1).expand(-1, LG_M, -1, -1)], 3)
+        out[16] = self.lg_adj(pair)[..., 0]
+        return tuple(out)
+
+
 MODELS = {"v1": IPMSegNet, "v2": IPMSegNetV2, "v3s": IPMSegNetV3,
           "lss": LSSDepthNet, "v8": DepthGatedIPMNet, "v13": DepthSegIPMNet,
           "v13d": DepthSegIPMNetS4, "v14d": DepthSegIPMNetV14,
@@ -2149,4 +2272,4 @@ MODELS = {"v1": IPMSegNet, "v2": IPMSegNetV2, "v3s": IPMSegNetV3,
           "v19": DepthSegIPMNetV19, "v20": DepthSegIPMNetV20,
           "v21": DepthSegIPMNetV21, "v22": DepthSegIPMNetV22,
           "v23": DepthSegIPMNetV23, "v24": DepthSegIPMNetV24,
-          "v25": DepthSegIPMNetV25, "v26": DepthSegIPMNetV26, "v27": DepthSegIPMNetV27, "v28": DepthSegIPMNetV28, "v29": DepthSegIPMNetV29, "v30": DepthSegIPMNetV30, "v31": DepthSegIPMNetV31, "v32": DepthSegIPMNetV32, "v33": DepthSegIPMNetV33}
+          "v25": DepthSegIPMNetV25, "v26": DepthSegIPMNetV26, "v27": DepthSegIPMNetV27, "v28": DepthSegIPMNetV28, "v29": DepthSegIPMNetV29, "v30": DepthSegIPMNetV30, "v31": DepthSegIPMNetV31, "v32": DepthSegIPMNetV32, "v33": DepthSegIPMNetV33, "v34": DepthSegIPMNetV34, "v35": DepthSegIPMNetV35}
