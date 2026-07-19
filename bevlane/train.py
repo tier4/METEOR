@@ -244,14 +244,21 @@ def _temporal_inputs(model, batch, device, tmp_idx):
 
 
 def evaluate_ego(model, loader, device, ego_idx, max_batches=40,
+                 batch_stride=1, shard=(0, 1), raw=False,
                  tmp_idx=None):
     """E2E head metrics: trajectory ADE/FDE [m], steer MAE [rad],
     accel MAE [m/s^2], brake accuracy. Valid frames only."""
     model.eval()
     n = ade = fde = smae = amae = bacc = 0.0
     nc = adec = 0.0
+    done = 0
     for bi, batch in enumerate(loader):
-        if bi >= max_batches:
+        if bi % batch_stride:
+            continue
+        done += 1
+        if (done - 1) % shard[1] != shard[0]:
+            continue
+        if done > max_batches * shard[1]:
             break
         imgs, K, Tc = (t.to(device, non_blocking=True) for t in batch[:3])
         eg = batch[ego_idx].to(device, non_blocking=True)
@@ -282,6 +289,9 @@ def evaluate_ego(model, loader, device, ego_idx, max_batches=40,
         bacc += (((p[:, 14] > 0).float() == eg[:, 15]).float() * v).sum().item()
         n += v.sum().item()
     model.train()
+    if raw:
+        return torch.tensor([ade, fde, smae, amae, bacc, n,
+                             adec, nc], dtype=torch.float64, device=device)
     if n == 0:
         return None
     return {"ade": ade / n, "fde": fde / n, "steer": smae / n,
@@ -706,7 +716,7 @@ def main():
     ap.add_argument("--workers", type=int, default=6)
     ap.add_argument("--out", default="out/bevlane_ckpt")
     ap.add_argument("--limit-train", type=int, default=None)
-    ap.add_argument("--model", default="v1", choices=["v1", "v2", "v3s", "lss", "v8", "v13", "v13d", "v14d", "v15", "v16", "v17", "v18", "v19", "v20", "v21", "v22", "v23", "v24", "v25", "v26", "v27", "v28", "v29", "v30", "v31", "v32", "v33", "v34", "v35"])
+    ap.add_argument("--model", default="v1", choices=["v1", "v2", "v3s", "lss", "v8", "v13", "v13d", "v14d", "v15", "v16", "v17", "v18", "v19", "v20", "v21", "v22", "v23", "v24", "v25", "v26", "v27", "v28", "v29", "v30", "v31", "v32", "v33", "v34", "v35", "v36"])
     ap.add_argument("--depth-w", type=float, default=0.3)
     ap.add_argument("--seg2d-w", type=float, default=0.5)
     ap.add_argument("--seg2d-key", default="seg2d",
@@ -783,30 +793,30 @@ def main():
         os.makedirs(args.out, exist_ok=True)
 
     train_s, val_s = split_scenes(args.root)
-    use_depth = args.model in ("lss", "v8", "v13", "v13d", "v14d", "v15", "v16", "v17", "v18", "v19", "v20", "v21", "v22", "v23", "v24", "v25", "v26", "v27", "v28", "v29", "v30", "v31", "v32", "v33", "v34", "v35") and args.depth_w > 0
-    use_seg2d = args.model in ("v13", "v13d", "v14d", "v15", "v16", "v17", "v18", "v19", "v20", "v21", "v22", "v23", "v24", "v25", "v26", "v27", "v28", "v29", "v30", "v31", "v32", "v33", "v34", "v35") and args.seg2d_w > 0
+    use_depth = args.model in ("lss", "v8", "v13", "v13d", "v14d", "v15", "v16", "v17", "v18", "v19", "v20", "v21", "v22", "v23", "v24", "v25", "v26", "v27", "v28", "v29", "v30", "v31", "v32", "v33", "v34", "v35", "v36") and args.depth_w > 0
+    use_seg2d = args.model in ("v13", "v13d", "v14d", "v15", "v16", "v17", "v18", "v19", "v20", "v21", "v22", "v23", "v24", "v25", "v26", "v27", "v28", "v29", "v30", "v31", "v32", "v33", "v34", "v35", "v36") and args.seg2d_w > 0
     use_box = args.model == "v15" and args.box_w > 0
-    use_boxdet = args.model in ("v16", "v17", "v18", "v19", "v20", "v21", "v22", "v23", "v24", "v25", "v26", "v27", "v28", "v29", "v30", "v31", "v32", "v33", "v34", "v35") and args.box_w > 0
-    use_bbox2d = args.model in ("v17", "v18", "v19", "v20", "v21", "v22", "v23", "v24", "v25", "v26", "v27", "v28", "v29", "v30", "v31", "v32", "v33", "v34", "v35") and args.bbox2d_w > 0
-    use_ego = args.model in ("v18", "v19", "v20", "v21", "v22", "v23", "v24", "v25", "v26", "v27", "v28", "v29", "v30", "v31", "v32", "v33", "v34", "v35") and args.ego_w > 0
-    use_occ = args.model in ("v20", "v21", "v22", "v23", "v24", "v25", "v26", "v27", "v28", "v29", "v30", "v31", "v32", "v33", "v34", "v35") and args.occ_w > 0
-    use_traj = args.model in ("v21", "v22", "v23", "v24", "v25", "v26", "v27", "v28", "v29", "v30", "v31", "v32", "v33", "v34", "v35") and args.traj_w > 0
-    use_temporal = args.model in ("v22", "v23", "v24", "v25", "v26", "v27", "v28", "v29", "v30", "v31", "v32", "v33", "v34", "v35")
-    use_tl = args.model in ("v27", "v28", "v29", "v30", "v31", "v32", "v33", "v34", "v35") and args.tl_w > 0
-    use_risk = args.model in ("v28", "v29", "v30", "v31", "v32", "v33", "v34", "v35") and args.risk_w > 0
-    use_lg = args.model in ("v29", "v30", "v31", "v32", "v33", "v34", "v35") and args.lanegraph_w > 0
-    use_unk = args.model in ("v30", "v31", "v32", "v33", "v34", "v35") and args.unk_w > 0
+    use_boxdet = args.model in ("v16", "v17", "v18", "v19", "v20", "v21", "v22", "v23", "v24", "v25", "v26", "v27", "v28", "v29", "v30", "v31", "v32", "v33", "v34", "v35", "v36") and args.box_w > 0
+    use_bbox2d = args.model in ("v17", "v18", "v19", "v20", "v21", "v22", "v23", "v24", "v25", "v26", "v27", "v28", "v29", "v30", "v31", "v32", "v33", "v34", "v35", "v36") and args.bbox2d_w > 0
+    use_ego = args.model in ("v18", "v19", "v20", "v21", "v22", "v23", "v24", "v25", "v26", "v27", "v28", "v29", "v30", "v31", "v32", "v33", "v34", "v35", "v36") and args.ego_w > 0
+    use_occ = args.model in ("v20", "v21", "v22", "v23", "v24", "v25", "v26", "v27", "v28", "v29", "v30", "v31", "v32", "v33", "v34", "v35", "v36") and args.occ_w > 0
+    use_traj = args.model in ("v21", "v22", "v23", "v24", "v25", "v26", "v27", "v28", "v29", "v30", "v31", "v32", "v33", "v34", "v35", "v36") and args.traj_w > 0
+    use_temporal = args.model in ("v22", "v23", "v24", "v25", "v26", "v27", "v28", "v29", "v30", "v31", "v32", "v33", "v34", "v35", "v36")
+    use_tl = args.model in ("v27", "v28", "v29", "v30", "v31", "v32", "v33", "v34", "v35", "v36") and args.tl_w > 0
+    use_risk = args.model in ("v28", "v29", "v30", "v31", "v32", "v33", "v34", "v35", "v36") and args.risk_w > 0
+    use_lg = args.model in ("v29", "v30", "v31", "v32", "v33", "v34", "v35", "v36") and args.lanegraph_w > 0
+    use_unk = args.model in ("v30", "v31", "v32", "v33", "v34", "v35", "v36") and args.unk_w > 0
     # v31 reuses the depth4 GT tensor as the (train-time) LiDAR input
-    use_lidar = args.model in ("v31", "v32", "v33", "v34", "v35")
+    use_lidar = args.model in ("v31", "v32", "v33", "v34", "v35", "v36")
     # v32 additionally takes the pillar BEV raster (extract_lidar_bev.py)
-    use_lidarbev = args.model in ("v32", "v33", "v34", "v35")
-    use_flow = args.model in ("v29", "v30", "v31", "v32", "v33", "v34", "v35") and args.flow_w > 0
-    hist_n = 3 if args.model in ("v29", "v30", "v31", "v32", "v33", "v34", "v35") else 0
+    use_lidarbev = args.model in ("v32", "v33", "v34", "v35", "v36")
+    use_flow = args.model in ("v29", "v30", "v31", "v32", "v33", "v34", "v35", "v36") and args.flow_w > 0
+    hist_n = 3 if args.model in ("v29", "v30", "v31", "v32", "v33", "v34", "v35", "v36") else 0
     if args.train_list:                       # restrict train to a scene list
         keep = set(open(args.train_list).read().split())
         train_s = [s for s in train_s if s in keep]
     # v13d depth GT is stride-4 of 768 (108x192); resize any mixed-res depth
-    depth_hw = (108, 192) if args.model in ("v13d", "v14d", "v15", "v16", "v17", "v18", "v19", "v20", "v21", "v22", "v23", "v24", "v25", "v26", "v27", "v28", "v29", "v30", "v31", "v32", "v33", "v34", "v35") else None
+    depth_hw = (108, 192) if args.model in ("v13d", "v14d", "v15", "v16", "v17", "v18", "v19", "v20", "v21", "v22", "v23", "v24", "v25", "v26", "v27", "v28", "v29", "v30", "v31", "v32", "v33", "v34", "v35", "v36") else None
     tr = BevLaneDataset(args.root, train_s, gt_key=args.gt_key,
                         dontcare_sidewalk=args.dontcare_sidewalk,
                         with_depth=use_depth, augment=args.aug,
@@ -825,7 +835,7 @@ def main():
                         seg2d_key=args.seg2d_key)
     # NOTE: --limit-train no longer slices the dataset here; it is applied
     # per epoch by EpochSubsetSampler so each epoch sees fresh frames.
-    if is_main:
+    if True:   # all ranks: the distributed ADE probe shards the val set
         # val never needs depth GT (BEV mIoU eval only) -> with_depth=False
         va = BevLaneDataset(args.root, val_s, max_per_scene=8, gt_key=args.gt_key,
                             dontcare_sidewalk=args.dontcare_sidewalk,
@@ -846,7 +856,7 @@ def main():
               f"({100 * min(seen, len(tr)) / max(len(tr), 1):.0f}% expected "
               f"coverage)", flush=True)
         dv = DataLoader(va, batch_size=args.batch, shuffle=False,
-                        num_workers=4, pin_memory=True)
+                        num_workers=4 if is_main else 1, pin_memory=is_main)
         dv_lid = None
         if use_lidar:
             # separate minimal loader (imgs,K,T,gt,depth4) so the main val
@@ -921,7 +931,7 @@ def main():
                     drop_last=True, **dl_kw)
 
     mkw = {"n_seg": args.n_seg2d} \
-        if args.model in ("v13", "v13d", "v14d", "v15", "v16", "v17", "v18", "v19", "v20", "v21", "v22", "v23", "v24", "v25", "v26", "v27", "v28", "v29", "v30", "v31", "v32", "v33", "v34", "v35") else {}
+        if args.model in ("v13", "v13d", "v14d", "v15", "v16", "v17", "v18", "v19", "v20", "v21", "v22", "v23", "v24", "v25", "v26", "v27", "v28", "v29", "v30", "v31", "v32", "v33", "v34", "v35", "v36") else {}
     model = MODELS[args.model](**mkw).to(device)
     if args.init_ckpt:
         sd = torch.load(args.init_ckpt, map_location="cpu")["model"]
@@ -936,7 +946,7 @@ def main():
         model = torch.nn.parallel.DistributedDataParallel(
             model, device_ids=[local],
             find_unused_parameters=(args.seg_w == 0 or
-                                    (args.model in ("v13", "v13d", "v14d", "v15", "v16", "v17", "v18", "v19", "v20", "v21", "v22", "v23", "v24", "v25", "v26", "v27", "v28", "v29", "v30", "v31", "v32", "v33", "v34", "v35") and not use_seg2d)))
+                                    (args.model in ("v13", "v13d", "v14d", "v15", "v16", "v17", "v18", "v19", "v20", "v21", "v22", "v23", "v24", "v25", "v26", "v27", "v28", "v29", "v30", "v31", "v32", "v33", "v34", "v35", "v36") and not use_seg2d)))
     opt = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-4)
     total_steps = len(dl) * args.epochs
     sched = torch.optim.lr_scheduler.OneCycleLR(opt, max_lr=lr,
@@ -1050,7 +1060,9 @@ def main():
                                 ego_gt[:, 12] if use_ego else None, pb, theta,
                                 **({"lidar": lid} if use_lidar else {}),
                                 **({"lidar_bev": lidbev}
-                                   if use_lidarbev else {}))
+                                   if use_lidarbev else {}),
+                                **({"kin": rel_pose}
+                                   if args.model == "v36" else {}))
                 elif use_ego:
                     out = model(imgs, K, Tc, ego_gt[:, 12])
                 else:
@@ -1155,6 +1167,7 @@ def main():
             # re-syncs everyone.
             if args.val_every and step % args.val_every == 0:
                 if is_main:
+                    torch.cuda.empty_cache()
                     netq = model.module if ddp else model
                     iq = evaluate(netq, dv, device, max_batches=10)
                     mq = float(np.nanmean(list(iq.values())))
@@ -1183,9 +1196,38 @@ def main():
                                 f" vruRn={dq['vrun']:.2f}"
                                 f" yaw={dq['veh_yaw']:.1f}deg")
                     print(msg, flush=True)
+                # distributed ADE/ADEc probe: every rank evaluates its own
+                # shard of the val set (the other 7 GPUs used to idle here),
+                # sums are all-reduced, rank 0 prints -> 8x coverage at the
+                # same wall time
+                if use_ego and use_temporal:
+                    netq2 = model.module if ddp else model
+                    sums = evaluate_ego(
+                        netq2, dv, device,
+                        4 + int(use_seg2d) + 4 * int(use_traj),
+                        max_batches=12, batch_stride=3,
+                        shard=(rank if ddp else 0, world if ddp else 1),
+                        raw=True,
+                        tmp_idx=(4 + int(use_seg2d) + 4 * int(use_traj)
+                                 + int(use_ego) + int(use_occ)
+                                 + int(use_tl) + int(use_risk)
+                                 + 4 * int(use_lg) + 2 * int(use_unk)
+                                 + int(use_lidarbev)))
+                    torch.cuda.empty_cache()
+                    if ddp:
+                        dist.all_reduce(sums)
+                    if is_main:
+                        s_ = sums.cpu().numpy()
+                        if s_[5] > 0:
+                            ac = s_[6] / s_[7] if s_[7] > 0 else float("nan")
+                            print(f"[probeE2E ep{ep} step{step}] "
+                                  f"ADE={s_[0] / s_[5]:.3f} ADEc={ac:.3f} "
+                                  f"(n={int(s_[5])} nc={int(s_[7])})",
+                                  flush=True)
                 if ddp:
                     dist.barrier()
         if is_main:
+            torch.cuda.empty_cache()
             net = model.module if ddp else model
             ious = evaluate(net, dv, device)
             miou = float(np.nanmean(list(ious.values())))

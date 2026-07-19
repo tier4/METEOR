@@ -166,6 +166,31 @@ Highlights (full recipe in [docs/DATA_PIPELINE.md](docs/DATA_PIPELINE.md)):
 - **Quality gates** — scene-end trimming, stationary-spot exclusion, GT-coverage filters,
   intersection guards.
 
+## Data augmentation & sampling
+
+Photometric only, geometric never — the depth-gated IPM depends on exact
+camera calibration, so image-space flips/crops/rotations would silently
+break the camera-to-BEV correspondence. Each camera draws independently
+(`--aug`):
+
+| Augmentation | Range / rate | Purpose |
+|---|---|---|
+| Camera dropout | 1 of 6 surround cams zeroed, 15 % of samples | sensor-failure robustness |
+| Brightness scale | x U(0.7, 1.3) | exposure variation |
+| Brightness offset | + U(-0.08, 0.08) | black-level variation |
+| Contrast scale | x U(0.8, 1.25) around the mean | weather / lens flare |
+| Pixel noise | Gaussian sigma = 0.012 | sensor noise |
+| LiDAR modality dropout (v31+) | whole-sample, 50 % | one set of weights serves camera-only AND LiDAR-assisted inference |
+
+Independent per-camera draws double as cross-camera photometric
+inconsistency training. The temporal memory also sees naturally missing
+history slots (2.5-9 % of frames), which acts as temporal dropout.
+
+Distribution shaping happens at the sampler instead of the pixel level:
+a fresh random subset is drawn every epoch (full-corpus coverage across a
+round), turning frames (|lat@3s| > 4 m) are oversampled 3x, and the scenes
+the previous round was worst at (auto-mined, C2) are oversampled 2x.
+
 ## Results (validation, unseen recording)
 
 | Metric | Value |
