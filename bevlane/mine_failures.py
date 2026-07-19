@@ -22,7 +22,7 @@ from bevlane.dataset import BevLaneDataset  # noqa: E402
 from bevlane.model import MODELS, make_warp_theta  # noqa: E402
 
 
-def scene_score(m, scene):
+def scene_score(m, scene, mode="combo"):
     try:
         ds = BevLaneDataset("out/bevlane", [scene], gt_key="gt_vec",
                             with_ego=True, with_agenttraj=True,
@@ -78,6 +78,9 @@ def scene_score(m, scene):
             misses.append(miss / (hit + miss))
     if not ades and not misses:
         return None
+    if mode == "e2e":
+        arr = np.array(ades) if ades else np.zeros(1)
+        return float(arr.mean() + 2.0 * (arr > 1.5).mean())
     return (np.mean(ades) if ades else 0.0) / 2.0 \
         + (np.mean(misses) if misses else 0.0)
 
@@ -89,6 +92,8 @@ def main():
     ap.add_argument("--list", required=True)
     ap.add_argument("--sample", type=int, default=240)
     ap.add_argument("--frac", type=float, default=0.15)
+    ap.add_argument("--mode", default="combo", choices=["combo", "e2e"],
+                    help="e2e: longitudinal-ADE + tail emphasis (P3)")
     args = ap.parse_args()
     m = MODELS[args.model](n_seg=21).cuda().eval()
     sd = torch.load(args.ckpt, map_location="cpu")["model"]
@@ -100,7 +105,7 @@ def main():
     sample = scenes[::step][:args.sample]
     scored = []
     for i, s in enumerate(sample):
-        sc = scene_score(m, s)
+        sc = scene_score(m, s, args.mode)
         if sc is not None:
             scored.append((sc, s))
         if i % 40 == 0:

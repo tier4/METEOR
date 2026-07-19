@@ -1764,7 +1764,8 @@ class DepthSegIPMNetV29(DepthSegIPMNetV28):
         tw = getattr(self, "EGO_TW", None)
         if tw is not None:                      # v36: near horizons weighted
             err = err * tw.to(err.device).view(1, 1, 6, 1)
-        wp_ek = (err[..., 0] + 4.0 * err[..., 1]).mean(2) / 2.5  # [B,K]
+        lw = getattr(self, "EGO_LONG_W", 1.0)
+        wp_ek = (lw * err[..., 0] + 4.0 * err[..., 1]).mean(2) / 2.5  # [B,K]
         best = wp_ek.detach().argmin(1)
         e = self.EPS_WTA
         wp_e = ((1.0 - e) * wp_ek.gather(1, best[:, None])
@@ -2331,6 +2332,63 @@ class DepthSegIPMNetV37(DepthSegIPMNetV36):
         return tuple(out)
 
 
+class DepthSegIPMNetV38(DepthSegIPMNetV37):
+    """v38 (ADE P2+P3): risk-aware mode selection + longitudinal focus.
+
+    P2: each of the K=3 hypotheses integrates the model's own risk field
+    along its path; a zero-init learnable gate feeds -risk into the mode
+    logits, so the selector learns confidence x safety jointly (C1 moved
+    into training).
+    P3: longitudinal waypoint error weight 1.0 -> 2.0 (measured error is
+    0.43 m longitudinal vs 0.19 m lateral) and an auxiliary speed-profile
+    head (per-horizon speed regression on the pooled BEV) shapes the
+    representation the planner reads."""
+    EGO_LONG_W = 2.0
+
+    def __init__(self, *a, **k):
+        super().__init__(*a, **k)
+        self.risk_gate = nn.Parameter(torch.zeros(1))
+        self.vprof_head = nn.Linear(96, 6)
+        nn.init.zeros_(self.vprof_head.weight)
+        nn.init.zeros_(self.vprof_head.bias)
+
+    def forward(self, imgs, K, T_cam_ego, v0=None, prev_bev=None,
+                warp_theta=None, lidar=None, lidar_bev=None, kin=None,
+                intent=None):
+        out = list(super().forward(imgs, K, T_cam_ego, v0, prev_bev,
+                                   warp_theta, lidar=lidar,
+                                   lidar_bev=lidar_bev, kin=kin,
+                                   intent=intent))
+        e = out[7]
+        B = e.shape[0]
+        # P2: per-mode risk line integral (grid_sample on own risk head)
+        risk = out[12].float().sigmoid()               # [B,1,400,250]
+        wps = e[:, :36].view(B, 3, 6, 2).detach()      # coords only
+        gx = (25.0 - wps[..., 1]) / 25.0 - 0.0         # y -> [-1,1] approx
+        gx = -wps[..., 1] / 25.0
+        gy = (40.0 - wps[..., 0]) / 40.0 - 1.0         # x 0..80 -> [-1,1]
+        grid = torch.stack([gx, gy], -1).view(B, 3, 6, 2)
+        rs = F.grid_sample(risk, grid, align_corners=False,
+                           padding_mode="border")      # [B,1,3,6]
+        rint = rs.mean(3).squeeze(1)                   # [B,3]
+        e = e.clone()
+        e[:, 36:39] = e[:, 36:39] - self.risk_gate * rint.to(e.dtype)
+        out[7] = e
+        # P3: auxiliary speed profile (read by vprof_loss)
+        g = F.adaptive_avg_pool2d(self._fused_bev, 1).flatten(1)
+        self._vprof = self.vprof_head(g.float())
+        return tuple(out)
+
+    def vprof_loss(self, ego_gt):
+        """per-horizon speed regression vs GT waypoint arc steps."""
+        wp = ego_gt[:, :12].view(-1, 6, 2)
+        steps = torch.cat([wp[:, :1], wp[:, 1:] - wp[:, :-1]], 1)
+        v_gt = steps.norm(dim=2) / 0.5                 # m/s per horizon
+        valid = ego_gt[:, 16:17]
+        return (torch.abs(self._vprof - v_gt) * valid).sum() \
+            / valid.sum().clamp(min=1) / 6.0
+
+
 MODELS = {"v1": IPMSegNet, "v2": IPMSegNetV2, "v3s": IPMSegNetV3,
           "lss": LSSDepthNet, "v8": DepthGatedIPMNet, "v13": DepthSegIPMNet,
           "v13d": DepthSegIPMNetS4, "v14d": DepthSegIPMNetV14,
@@ -2339,4 +2397,4 @@ MODELS = {"v1": IPMSegNet, "v2": IPMSegNetV2, "v3s": IPMSegNetV3,
           "v19": DepthSegIPMNetV19, "v20": DepthSegIPMNetV20,
           "v21": DepthSegIPMNetV21, "v22": DepthSegIPMNetV22,
           "v23": DepthSegIPMNetV23, "v24": DepthSegIPMNetV24,
-          "v25": DepthSegIPMNetV25, "v26": DepthSegIPMNetV26, "v27": DepthSegIPMNetV27, "v28": DepthSegIPMNetV28, "v29": DepthSegIPMNetV29, "v30": DepthSegIPMNetV30, "v31": DepthSegIPMNetV31, "v32": DepthSegIPMNetV32, "v33": DepthSegIPMNetV33, "v34": DepthSegIPMNetV34, "v35": DepthSegIPMNetV35, "v36": DepthSegIPMNetV36, "v37": DepthSegIPMNetV37}
+          "v25": DepthSegIPMNetV25, "v26": DepthSegIPMNetV26, "v27": DepthSegIPMNetV27, "v28": DepthSegIPMNetV28, "v29": DepthSegIPMNetV29, "v30": DepthSegIPMNetV30, "v31": DepthSegIPMNetV31, "v32": DepthSegIPMNetV32, "v33": DepthSegIPMNetV33, "v34": DepthSegIPMNetV34, "v35": DepthSegIPMNetV35, "v36": DepthSegIPMNetV36, "v37": DepthSegIPMNetV37, "v38": DepthSegIPMNetV38}
