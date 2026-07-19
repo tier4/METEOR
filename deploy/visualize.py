@@ -19,7 +19,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from autolabel_bev import PALETTE  # noqa: E402
 from bevlane.demo_occ_gt import cube_render  # noqa: E402
 from bevlane.demo_rgbd_bev import (SURR, NARROW, draw_boxes2d,  # noqa: E402
-                                   draw_boxes_on_rgb)
+                                   draw_boxes_on_rgb, draw_path_ribbon)
 from bevlane.extract_seg2d import SEG21_PAL as _S21  # noqa: E402
 SEG2D_PAL = np.zeros((256, 3), np.uint8)
 SEG2D_PAL[:21] = _S21[:, ::-1]
@@ -64,6 +64,9 @@ def compose_frame(imgs, K, T, out, v0, boxes, scene, fi, guard=None):
     except Exception:
         pass
     det7 = [b[:7] for b in boxes]
+    e_ = out["ego"][0]
+    conf_ = np.exp(e_[36:39]) / np.exp(e_[36:39]).sum()
+    ego12 = e_[int(conf_.argmax()) * 12:(int(conf_.argmax()) + 1) * 12]
     # ---- top block: RGB + seg overlay + boxes ----
     for k, chn in enumerate(CAM8):
         ci = CAM8_TO_IDX[chn]
@@ -75,6 +78,9 @@ def compose_frame(imgs, K, T, out, v0, boxes, scene, fi, guard=None):
                                   interpolation=cv2.INTER_NEAREST)]
         img = cv2.addWeighted(img, 0.62, ov, 0.38, 0)
         draw_boxes_on_rgb(img, det7, K[ci], T[ci], cw, ch)
+        if chn == "CAM_FRONT_WIDE":         # demo-identical path ribbon
+            draw_path_ribbon(img, ego12, K[ci], T[ci], cw, ch,
+                             reset=(fi == 0))
         if b2d is not None and ci < len(b2d):
             draw_boxes2d(img, b2d[ci], cw, ch)
         if chn in NARROW:
