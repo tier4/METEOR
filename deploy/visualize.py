@@ -195,8 +195,11 @@ def compose_frame(imgs, K, T, out, v0, boxes, scene, fi, guard=None):
                         cv2.LINE_AA)
         elif len(pts) > 1:
             cv2.polylines(bev, [np.array(pts, np.int32).reshape(-1, 1, 2)],
-                          False, col, 3 if k == kb else 1, cv2.LINE_AA)
-            if k != kb:
+                          False, col, 2 if k == kb else 1, cv2.LINE_AA)
+            if k == kb:
+                for p_ in pts[1:]:          # demo: dot at every waypoint
+                    cv2.circle(bev, p_, 3, col, -1)
+            else:
                 cv2.putText(bev, f"{conf3[k]:.2f}", pts[-1],
                             cv2.FONT_HERSHEY_SIMPLEX, 0.38, col, 1,
                             cv2.LINE_AA)
