@@ -88,10 +88,14 @@ def scale_K(K, w0, h0):
     return K
 
 
-def build_engine_from_onnx(onnx_path):
+def build_engine_from_onnx(onnx_path, compat=False):
     """--onnx convenience: build (or reuse) a cached fp16 engine next to
-    the ONNX file, using the TensorRT Python API directly (no trtexec)."""
-    eng = os.path.splitext(onnx_path)[0] + "_fp16.engine"
+    the ONNX file, using the TensorRT Python API directly (no trtexec).
+    compat=True builds a version/hardware-compatible engine (runs on newer
+    TensorRT and any Ampere+ GPU, e.g. build on L40S -> deploy on Orin) at
+    some throughput cost; cached separately as *_compat.engine."""
+    suff = "_fp16_compat.engine" if compat else "_fp16.engine"
+    eng = os.path.splitext(onnx_path)[0] + suff
     if os.path.exists(eng) and \
             os.path.getmtime(eng) >= os.path.getmtime(onnx_path):
         print(f"[engine] reusing cached {eng}", flush=True)
@@ -112,6 +116,10 @@ def build_engine_from_onnx(onnx_path):
     config = builder.create_builder_config()
     config.set_memory_pool_limit(trt.MemoryPoolType.WORKSPACE, 8 << 30)
     config.set_flag(trt.BuilderFlag.FP16)
+    if compat:
+        config.set_flag(trt.BuilderFlag.VERSION_COMPATIBLE)
+        config.hardware_compatibility_level = \
+            trt.HardwareCompatibilityLevel.AMPERE_PLUS
     blob = builder.build_serialized_network(network, config)
     if blob is None:
         sys.exit("TensorRT build failed")
@@ -143,6 +151,9 @@ def main():
                     help="t4dataset scene directory OR dataset root")
     ap.add_argument("--out", default="out/t4_infer")
     ap.add_argument("--video", default=None)
+    ap.add_argument("--compat", action="store_true",
+                    help="build a version/hardware-compatible engine "
+                    "(portable across TensorRT versions and Ampere+ GPUs)")
     ap.add_argument("--display", action="store_true",
                     help="live visualisation window while inferring "
                     "(q quits, space pauses)")
@@ -153,7 +164,7 @@ def main():
     if not args.engine and not args.onnx:
         sys.exit("need --engine or --onnx")
     if not args.engine:
-        args.engine = build_engine_from_onnx(args.onnx)
+        args.engine = build_engine_from_onnx(args.onnx, args.compat)
     if args.display and not os.environ.get("DISPLAY"):
         print("[warn] --display requested but no $DISPLAY; continuing "
               "without a window", flush=True)

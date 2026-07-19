@@ -77,7 +77,12 @@ class MeteorRT:
         assert _TRT, "tensorrt / pycuda not available"
         logger = trt.Logger(trt.Logger.WARNING)
         with open(engine_path, "rb") as f:
-            self.engine = trt.Runtime(logger).deserialize_cuda_engine(f.read())
+            rt_ = trt.Runtime(logger)
+            try:                    # accept version-compatible engines
+                rt_.engine_host_code_allowed = True
+            except AttributeError:
+                pass
+            self.engine = rt_.deserialize_cuda_engine(f.read())
         self.ctx = self.engine.create_execution_context()
         self.host, self.dev, self.shapes = {}, {}, {}
         self._zeroed = False

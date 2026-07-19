@@ -54,8 +54,9 @@ static std::vector<char> readFile(const std::string& p) {
 }
 
 // ---------------------------------------------------------------- engine
-static std::string buildEngine(const std::string& onnx) {
-  std::string eng = onnx.substr(0, onnx.rfind('.')) + "_fp16.engine";
+static std::string buildEngine(const std::string& onnx, bool compat) {
+  std::string eng = onnx.substr(0, onnx.rfind('.')) +
+                    (compat ? "_fp16_compat.engine" : "_fp16.engine");
   std::ifstream probe(eng);
   if (probe.good()) {
     std::cout << "[engine] reusing cached " << eng << "\n";
@@ -75,6 +76,11 @@ static std::string buildEngine(const std::string& onnx) {
   auto* cfg = builder->createBuilderConfig();
   cfg->setMemoryPoolLimit(nvinfer1::MemoryPoolType::kWORKSPACE, 8ull << 30);
   cfg->setFlag(nvinfer1::BuilderFlag::kFP16);
+  if (compat) {  // portable across TRT versions and Ampere+ GPUs (Orin)
+    cfg->setFlag(nvinfer1::BuilderFlag::kVERSION_COMPATIBLE);
+    cfg->setHardwareCompatibilityLevel(
+        nvinfer1::HardwareCompatibilityLevel::kAMPERE_PLUS);
+  }
   auto* ser = builder->buildSerializedNetwork(*net, *cfg);
   if (!ser) { std::cerr << "build failed\n"; exit(1); }
   std::ofstream out(eng, std::ios::binary);
@@ -199,6 +205,7 @@ struct Runner {
   explicit Runner(const std::string& path) {
     auto blob = readFile(path);
     rt = nvinfer1::createInferRuntime(gLogger);
+    rt->setEngineHostCodeAllowed(true);   // version-compatible engines
     eng = rt->deserializeCudaEngine(blob.data(), blob.size());
     ctx = eng->createExecutionContext();
     cudaStreamCreate(&stream);
@@ -245,6 +252,7 @@ struct Box { int cls; float sc, x, y, l, w, yaw; };
 int main(int argc, char** argv) {
   std::string onnx, engine, t4d, video;
   int limit = 0;
+  bool compat = false;
   for (int i = 1; i < argc; ++i) {
     std::string a = argv[i];
     auto nxt = [&]() { return std::string(argv[++i]); };
@@ -253,10 +261,11 @@ int main(int argc, char** argv) {
     else if (a == "--t4d") t4d = nxt();
     else if (a == "--video") video = nxt();
     else if (a == "--limit") limit = std::stoi(nxt());
+    else if (a == "--compat") compat = true;
   }
   if (engine.empty() && onnx.empty()) { std::cerr << "need --onnx/--engine\n"; return 1; }
   if (t4d.empty()) { std::cerr << "need --t4d\n"; return 1; }
-  if (engine.empty()) engine = buildEngine(onnx);
+  if (engine.empty()) engine = buildEngine(onnx, compat);
 
   Scene sc = loadScene(t4d);
   std::cout << sc.sampleTokens.size() << " samples\n";
