@@ -845,7 +845,7 @@ def main():
     ap.add_argument("--train-bg", action="store_true",
                     help="supervise unlabeled(0) as background class")
     ap.add_argument("--dontcare-sidewalk", action="store_true")
-    ap.add_argument("--gt-key", default="gt", choices=["gt", "gt_vec"],
+    ap.add_argument("--gt-key", default="gt", choices=["gt", "gt_vec", "gt_cons"],
                     help="gt = raster autolabel; gt_vec = hybrid vector-line GT")
     args = ap.parse_args()
 

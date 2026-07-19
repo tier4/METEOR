@@ -113,6 +113,10 @@ class BevLaneDataset(Dataset):
         gt = cv2.imread(os.path.join(self.root, s, f[self.gt_key]), 0)
         if gt is None:
             return self.__getitem__((i + 1) % len(self.items))
+        if self.gt_key == "gt_cons":
+            gt = gt.copy()
+            gt[gt == 255] = 0     # consensus-ignore -> this codebase's 0
+
         if self.dontcare_sidewalk:
             gt = gt.copy()
             gt[gt == 2] = 0    # sidewalk -> don't care (ignored like bg)
