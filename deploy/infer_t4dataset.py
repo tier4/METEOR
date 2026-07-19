@@ -171,7 +171,7 @@ def run_scene(args, root):
     if args.video:
         vw = cv2.VideoWriter(args.video.replace(".mp4", "_raw.mp4"),
                              cv2.VideoWriter_fourcc(*"mp4v"), 10,
-                             (IMG_W * 2, IMG_H * 2))
+                             (1920, 1080))
 
     frames = ordered[::args.stride]
     if args.limit:
@@ -242,6 +242,13 @@ def run_scene(args, root):
             occ=out["occ"][0].argmax(0).astype(np.uint8))
 
         if vw is not None or args.display:
+            from deploy.visualize import compose_frame
+            vboxes = [(int(b["cls"] == "vru"), b["score"], b["x"], b["y"],
+                       b["l"], b["w"], b["yaw"],
+                       bool(b.get("stationary"))) for b in boxes]
+            g = compose_frame(np.stack(imgs), K_t[0], T_t[0], out,
+                              float(v0), vboxes, name, fi)
+        if False:
             g = np.zeros((IMG_H * 2, IMG_W * 2, 3), np.uint8)
             g[:IMG_H, :IMG_W] = imgs[0]
             g[:IMG_H, IMG_W:] = imgs[6]
@@ -279,15 +286,16 @@ def run_scene(args, root):
             cv2.putText(g, "TensorRT engine | t4dataset raw input", (10, IMG_H * 2 - 12),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.6, (200, 200, 200), 1,
                         cv2.LINE_AA)
-            if vw is not None:
-                vw.write(g)
-            if args.display:
-                cv2.imshow("METEOR live", g)
-                k = cv2.waitKey(1) & 0xFF
-                if k == ord('q'):
-                    break
-                if k == ord(' '):
-                    cv2.waitKey(0)
+            pass
+        if vw is not None:
+            vw.write(g)
+        if args.display:
+            cv2.imshow("METEOR live", g)
+            kq = cv2.waitKey(1) & 0xFF
+            if kq == ord('q'):
+                break
+            if kq == ord(' '):
+                cv2.waitKey(0)
         n += 1
         if n % 20 == 0:
             print(f"{n}/{len(frames)} frames", flush=True)
