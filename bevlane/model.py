@@ -2305,6 +2305,32 @@ class DepthSegIPMNetV36(DepthSegIPMNetV35):
         return tuple(out)
 
 
+class DepthSegIPMNetV37(DepthSegIPMNetV36):
+    """v37 (roadmap E6): route-intent conditioning for the planner.
+
+    intent [B,3] one-hot (straight / left / right); zero vector = no
+    navigation available (trained with 30% intent dropout so the
+    unconditioned mode stays strong). Zero-init delta on the ego output:
+    the intent biases BOTH the waypoints and the K=3 mode logits — the
+    measured 0.24 m selection gap is mostly wrong-branch picks at
+    intersections, which navigation resolves for free at runtime."""
+    def __init__(self, *a, **k):
+        super().__init__(*a, **k)
+        self.intent_delta = nn.Linear(3, 12 * EGO_K + EGO_K + 3)
+        nn.init.zeros_(self.intent_delta.weight)
+        nn.init.zeros_(self.intent_delta.bias)
+
+    def forward(self, imgs, K, T_cam_ego, v0=None, prev_bev=None,
+                warp_theta=None, lidar=None, lidar_bev=None, kin=None,
+                intent=None):
+        out = list(super().forward(imgs, K, T_cam_ego, v0, prev_bev,
+                                   warp_theta, lidar=lidar,
+                                   lidar_bev=lidar_bev, kin=kin))
+        if intent is not None:
+            out[7] = out[7] + self.intent_delta(intent.to(out[7].dtype))
+        return tuple(out)
+
+
 MODELS = {"v1": IPMSegNet, "v2": IPMSegNetV2, "v3s": IPMSegNetV3,
           "lss": LSSDepthNet, "v8": DepthGatedIPMNet, "v13": DepthSegIPMNet,
           "v13d": DepthSegIPMNetS4, "v14d": DepthSegIPMNetV14,
@@ -2313,4 +2339,4 @@ MODELS = {"v1": IPMSegNet, "v2": IPMSegNetV2, "v3s": IPMSegNetV3,
           "v19": DepthSegIPMNetV19, "v20": DepthSegIPMNetV20,
           "v21": DepthSegIPMNetV21, "v22": DepthSegIPMNetV22,
           "v23": DepthSegIPMNetV23, "v24": DepthSegIPMNetV24,
-          "v25": DepthSegIPMNetV25, "v26": DepthSegIPMNetV26, "v27": DepthSegIPMNetV27, "v28": DepthSegIPMNetV28, "v29": DepthSegIPMNetV29, "v30": DepthSegIPMNetV30, "v31": DepthSegIPMNetV31, "v32": DepthSegIPMNetV32, "v33": DepthSegIPMNetV33, "v34": DepthSegIPMNetV34, "v35": DepthSegIPMNetV35, "v36": DepthSegIPMNetV36}
+          "v25": DepthSegIPMNetV25, "v26": DepthSegIPMNetV26, "v27": DepthSegIPMNetV27, "v28": DepthSegIPMNetV28, "v29": DepthSegIPMNetV29, "v30": DepthSegIPMNetV30, "v31": DepthSegIPMNetV31, "v32": DepthSegIPMNetV32, "v33": DepthSegIPMNetV33, "v34": DepthSegIPMNetV34, "v35": DepthSegIPMNetV35, "v36": DepthSegIPMNetV36, "v37": DepthSegIPMNetV37}
