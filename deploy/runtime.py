@@ -33,7 +33,7 @@ except Exception:                        # pragma: no cover
 INPUTS = ["imgs", "K", "T_cam_ego", "v0", "hist_bev", "hist_theta"]
 OUTPUTS = ["lane", "depth", "seg2d", "hm", "reg", "hm2d", "reg2d",
            "ego", "occ", "traj", "stationary", "tl", "risk", "flow",
-           "lg_pts", "lg_meta", "lg_adj", "raw_bev"]
+           "lg_pts", "lg_meta", "lg_adj", "unk", "raw_bev"]
 HIST_OFFS = (2, 6, 14)          # slots at t-0.4 / -1.2 / -2.8 s (5 Hz frames)
 MEAN = np.array([0.485, 0.456, 0.406], np.float32)
 STD = np.array([0.229, 0.224, 0.225], np.float32)
@@ -80,6 +80,7 @@ class MeteorRT:
             self.engine = trt.Runtime(logger).deserialize_cuda_engine(f.read())
         self.ctx = self.engine.create_execution_context()
         self.host, self.dev, self.shapes = {}, {}, {}
+        self._zeroed = False
         for i in range(self.engine.num_io_tensors):
             nm = self.engine.get_tensor_name(i)
             shp = tuple(self.engine.get_tensor_shape(nm))
@@ -116,6 +117,13 @@ class MeteorRT:
                 continue
             hb[0, i] = h[0]
             ht[0, i] = make_warp_theta(h[1], pose)[0]
+        if not self._zeroed:
+            for nm_ in list(self.host):
+                self.host[nm_][:] = 0
+                cuda.memcpy_htod_async(self.dev[nm_], self.host[nm_],
+                                       self.stream)
+            self.stream.synchronize()
+            self._zeroed = True
         feed = {"imgs": imgs, "K": K, "T_cam_ego": T_cam_ego,
                 "v0": np.array([v0], np.float32),
                 "hist_bev": hb, "hist_theta": ht}
@@ -125,10 +133,11 @@ class MeteorRT:
             cuda.memcpy_htod_async(self.dev[nm], self.host[nm], self.stream)
         self.ctx.execute_async_v3(self.stream.handle)
         out = {}
-        for nm in OUTPUTS:
+        outs = [nm for nm in OUTPUTS if nm in self.shapes]
+        for nm in outs:
             cuda.memcpy_dtoh_async(self.host[nm], self.dev[nm], self.stream)
         self.stream.synchronize()
-        for nm in OUTPUTS:
+        for nm in outs:
             out[nm] = self.host[nm].reshape(self.shapes[nm]).copy()
         self._hist[self._t] = (out["raw_bev"][0], pose)
         for k in [k for k in self._hist if k < self._t - max(HIST_OFFS)]:

@@ -99,7 +99,16 @@ def build_engine_from_onnx(onnx_path):
     print(f"[engine] building {eng} from {onnx_path} (trtexec --fp16, "
           "one-time, ~minutes)", flush=True)
     import subprocess
-    r = subprocess.run(["trtexec", f"--onnx={onnx_path}",
+    import shutil
+    trtexec = os.environ.get("TRTEXEC", "trtexec")
+    if not shutil.which(trtexec):
+        for cand in ("/home/umedan/TensorRT-8.6.0.12/bin/trtexec",
+                     "/usr/src/tensorrt/bin/trtexec",
+                     "/opt/tensorrt/bin/trtexec"):
+            if os.path.exists(cand):
+                trtexec = cand
+                break
+    r = subprocess.run([trtexec, f"--onnx={onnx_path}",
                         f"--saveEngine={eng}", "--fp16"],
                        capture_output=True, text=True)
     if r.returncode or not os.path.exists(eng):
