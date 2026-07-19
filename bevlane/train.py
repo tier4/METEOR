@@ -12,6 +12,7 @@ import time
 import numpy as np
 import torch
 import torch.distributed as dist
+import math
 import torch.nn.functional as F
 from torch.utils.data import DataLoader, DistributedSampler
 
@@ -222,6 +223,73 @@ def evaluate_seg2d(model, loader, device, n_cls, max_batches=40):
 
 
 @torch.no_grad()
+
+def bev_rotation_aug(theta_max_deg, Tc, gt, det_boxes, det_n, traj_gt,
+                     ego_gt, occ_gt, risk_gt, lg_pts, unk_c, rel_pose,
+                     p_apply=0.5):
+    """BEV-space rotation augmentation: rotate the EGO FRAME, not pixels.
+
+    T_cam_ego absorbs the rotation, so the projected BEV features are
+    rebuilt exactly by the geometry (no feature interpolation, image-space
+    heads untouched); every BEV-space GT is rotated by the same angle.
+    Physically = the same scene recorded with the rig yawed by theta."""
+    B = Tc.shape[0]
+    dev = Tc.device
+    th = (torch.rand(B, device=dev) * 2 - 1) * math.radians(theta_max_deg)
+    th = th * (torch.rand(B, device=dev) < p_apply).float()
+    c, s = th.cos(), th.sin()
+    # 1. extrinsics: p_old = Rz(th) p_new -> Tc' = Tc @ Rz(th)
+    R = torch.zeros(B, 4, 4, device=dev, dtype=Tc.dtype)
+    R[:, 0, 0] = c; R[:, 0, 1] = -s
+    R[:, 1, 0] = s; R[:, 1, 1] = c
+    R[:, 2, 2] = 1; R[:, 3, 3] = 1
+    Tc = Tc @ R[:, None]
+    # 2D rotation for points expressed in NEW frame: p_new = R(-th) p_old
+    def rot_pts(xy):                     # [...,2] (x,y)
+        shp = [B] + [1] * (xy.dim() - 2)
+        cc, ss = c.view(shp), s.view(shp)
+        x, y = xy[..., 0], xy[..., 1]
+        return torch.stack([cc * x + ss * y, -ss * x + cc * y], -1)
+    # 2. label rasters via inverse-rotated sampling grid
+    def rot_raster(r, fill, nearest=True):
+        if r is None:
+            return None
+        r4 = r.float().unsqueeze(1) if r.dim() == 3 else r.float()
+        A = torch.zeros(B, 2, 3, device=dev, dtype=torch.float32)
+        A[:, 0, 0] = c; A[:, 0, 1] = -s * (r4.shape[2] / r4.shape[3])
+        A[:, 1, 0] = s * (r4.shape[3] / r4.shape[2]); A[:, 1, 1] = c
+        g = F.affine_grid(A, list(r4.shape), align_corners=False)
+        out = F.grid_sample(r4 + 1.0, g, mode="nearest" if nearest
+                            else "bilinear", padding_mode="zeros",
+                            align_corners=False)
+        res = torch.where(out < 0.5, torch.full_like(out, fill + 1.0),
+                          out) - 1.0
+        return res.squeeze(1).to(r.dtype) if r.dim() == 3 else res.to(r.dtype)
+    gt = rot_raster(gt, 0)
+    risk_gt = rot_raster(risk_gt, 0, nearest=False)         if risk_gt is not None else None
+    if occ_gt is not None:
+        occ_gt = rot_raster(occ_gt, 255)
+    # 3. boxes / futures / ego path / graph points / unknown centres
+    if det_boxes is not None:
+        det_boxes = det_boxes.clone()
+        det_boxes[..., 1:3] = rot_pts(det_boxes[..., 1:3])
+        det_boxes[..., 5] = det_boxes[..., 5] - th[:, None]
+        if traj_gt is not None:
+            traj_gt = rot_pts(traj_gt)
+    if ego_gt is not None:
+        ego_gt = ego_gt.clone()
+        ego_gt[:, :12] = rot_pts(ego_gt[:, :12].view(B, 6, 2)).reshape(B, 12)
+    if lg_pts is not None:
+        lg_pts = rot_pts(lg_pts)
+    if unk_c is not None:
+        unk_c = rot_pts(unk_c)
+    if rel_pose is not None:
+        rel_pose = rel_pose.clone()
+        rel_pose[..., :2] = rot_pts(rel_pose[..., :2])
+    return (Tc, gt, det_boxes, traj_gt, ego_gt, occ_gt, risk_gt, lg_pts,
+            unk_c, rel_pose)
+
+
 def _temporal_inputs(model, batch, device, tmp_idx):
     if tmp_idx is None:
         return None, None
@@ -744,6 +812,10 @@ def main():
     ap.add_argument("--turn-oversample", type=float, default=1.0,
                     help="draw weight for turn frames (|lat@3s|>4m)")
     ap.add_argument("--unk-w", type=float, default=0.0)
+    ap.add_argument("--bev-rot-aug", type=float, default=0.0,
+                    help="BEV-frame rotation augmentation: max |yaw| in "
+                    "degrees rotated into the extrinsics + all BEV GT "
+                    "(images and camera-space heads untouched)")
     ap.add_argument("--mined-oversample", type=float, default=1.0,
                     help="C2: weight boost for scenes in out/mined_scenes.txt")
     ap.add_argument("--lidar-drop", type=float, default=0.5,
@@ -1012,6 +1084,11 @@ def main():
                                                    batch[bi + 2])
             else:
                 prev_imgs = rel_pose = prev_valid = None
+            if args.bev_rot_aug > 0:
+                (Tc, gt, det_boxes, traj_gt, ego_gt, occ_gt, risk_gt,
+                 lg_pts_gt, unk_c, rel_pose) = bev_rotation_aug(
+                    args.bev_rot_aug, Tc, gt, det_boxes, det_n, traj_gt,
+                    ego_gt, occ_gt, risk_gt, lg_pts_gt, unk_c, rel_pose)
             if use_temporal and hist_n > 0:
                 # v29 memory queue: N history BEVs, each in its own no_grad
                 # + autocast region (r12 autocast-cache lesson).

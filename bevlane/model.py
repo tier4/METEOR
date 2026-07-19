@@ -1761,6 +1761,9 @@ class DepthSegIPMNetV29(DepthSegIPMNetV28):
         Kn = EGO_K
         wps = ego[:, :12 * Kn].view(-1, Kn, 6, 2)
         err = torch.abs(wps - gt[:, :12].view(-1, 1, 6, 2))
+        tw = getattr(self, "EGO_TW", None)
+        if tw is not None:                      # v36: near horizons weighted
+            err = err * tw.to(err.device).view(1, 1, 6, 1)
         wp_ek = (err[..., 0] + 4.0 * err[..., 1]).mean(2) / 2.5  # [B,K]
         best = wp_ek.detach().argmin(1)
         e = self.EPS_WTA
@@ -1771,7 +1774,7 @@ class DepthSegIPMNetV29(DepthSegIPMNetV28):
         cw = 1.0 + gt[:, 11:12].abs().clamp(max=6.0) / 1.5
         nw = (cw * valid).sum().clamp(min=1)
         wl = (wp_e * cw * valid).sum() / nw
-        cl = (ce * valid).sum() / n
+        cl = (ce * valid).sum() / n * getattr(self, "EGO_CE_MULT", 1.0)
         # r22: mode-confidence CE weighted up 0.3 -> 0.6 (winner confidence
         # was stuck near 1/3 = undecided while modes specialise)
         o = 12 * Kn + Kn
@@ -2264,6 +2267,44 @@ class DepthSegIPMNetV35(DepthSegIPMNetV34):
         return tuple(out)
 
 
+class DepthSegIPMNetV36(DepthSegIPMNetV35):
+    """v36 (ADE round, r30): the planner finally learns longitudinal state.
+
+    1. Kinematic-history input: per-slot ego displacements/yaw-rates from
+       the memory-queue rel poses (already in the batch) + v0 -> 7-dim
+       feature -> zero-init residual on the ego output. Without it the
+       planner guessed accel/brake state (measured: 0.43 m longitudinal
+       vs 0.19 m lateral error).
+    2. Mode-selection pressure: EGO_CE_MULT 2x (best-of-3 is 0.52 m but
+       the picked mode is 0.76 m -> selection gap 0.24 m).
+    3. Time-weighted waypoints: near horizons x1.5 -> ADE-aligned."""
+    EGO_CE_MULT = 2.0
+    EGO_TW = torch.tensor([1.5, 1.35, 1.2, 1.05, 0.95, 0.9])
+
+    def __init__(self, *a, **k):
+        super().__init__(*a, **k)
+        self.kin_delta = nn.Linear(7, 12 * EGO_K + EGO_K + 3)
+        nn.init.zeros_(self.kin_delta.weight)
+        nn.init.zeros_(self.kin_delta.bias)
+
+    def forward(self, imgs, K, T_cam_ego, v0=None, prev_bev=None,
+                warp_theta=None, lidar=None, lidar_bev=None, kin=None):
+        out = list(super().forward(imgs, K, T_cam_ego, v0, prev_bev,
+                                   warp_theta, lidar=lidar,
+                                   lidar_bev=lidar_bev))
+        B = out[0].shape[0]
+        f = torch.zeros(B, 7, device=out[0].device, dtype=out[7].dtype)
+        if v0 is not None:
+            f[:, 0] = v0.view(-1).to(f.dtype) / 15.0
+        if kin is not None:                     # [B,3,3] rel (tx,ty,dyaw)
+            dts = torch.tensor([0.4, 1.2, 2.8], device=f.device,
+                               dtype=f.dtype)
+            f[:, 1:4] = kin[..., :2].norm(dim=2).to(f.dtype) / dts / 15.0
+            f[:, 4:7] = kin[..., 2].to(f.dtype) / dts
+        out[7] = out[7] + self.kin_delta(f)
+        return tuple(out)
+
+
 MODELS = {"v1": IPMSegNet, "v2": IPMSegNetV2, "v3s": IPMSegNetV3,
           "lss": LSSDepthNet, "v8": DepthGatedIPMNet, "v13": DepthSegIPMNet,
           "v13d": DepthSegIPMNetS4, "v14d": DepthSegIPMNetV14,
@@ -2272,4 +2313,4 @@ MODELS = {"v1": IPMSegNet, "v2": IPMSegNetV2, "v3s": IPMSegNetV3,
           "v19": DepthSegIPMNetV19, "v20": DepthSegIPMNetV20,
           "v21": DepthSegIPMNetV21, "v22": DepthSegIPMNetV22,
           "v23": DepthSegIPMNetV23, "v24": DepthSegIPMNetV24,
-          "v25": DepthSegIPMNetV25, "v26": DepthSegIPMNetV26, "v27": DepthSegIPMNetV27, "v28": DepthSegIPMNetV28, "v29": DepthSegIPMNetV29, "v30": DepthSegIPMNetV30, "v31": DepthSegIPMNetV31, "v32": DepthSegIPMNetV32, "v33": DepthSegIPMNetV33, "v34": DepthSegIPMNetV34, "v35": DepthSegIPMNetV35}
+          "v25": DepthSegIPMNetV25, "v26": DepthSegIPMNetV26, "v27": DepthSegIPMNetV27, "v28": DepthSegIPMNetV28, "v29": DepthSegIPMNetV29, "v30": DepthSegIPMNetV30, "v31": DepthSegIPMNetV31, "v32": DepthSegIPMNetV32, "v33": DepthSegIPMNetV33, "v34": DepthSegIPMNetV34, "v35": DepthSegIPMNetV35, "v36": DepthSegIPMNetV36}
