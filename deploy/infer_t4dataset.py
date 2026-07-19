@@ -243,11 +243,42 @@ def run_scene(args, root):
 
         if vw is not None or args.display:
             from deploy.visualize import compose_frame
+            from bevlane.guardrail import check_path
             vboxes = [(int(b["cls"] == "vru"), b["score"], b["x"], b["y"],
                        b["l"], b["w"], b["yaw"],
                        bool(b.get("stationary"))) for b in boxes]
+            guard = None
+            try:
+                kb_ = int(ego_conf.argmax())
+                path6 = ego_paths[kb_]
+                tm_ = out["traj"][0]
+                offs_ = []
+                for b_ in vboxes:
+                    rr_ = int((80.0 - b_[2]) / 0.4)
+                    cc_ = int((50.0 - b_[3]) / 0.4)
+                    o_ = np.zeros((6, 2), np.float32)
+                    if 0 <= rr_ < tm_.shape[-2] and 0 <= cc_ < tm_.shape[-1]:
+                        v_ = tm_[:, rr_, cc_]
+                        if v_.shape[0] >= 39:
+                            kk_ = int(v_[36:39].argmax())
+                            o_ = v_[kk_ * 12:(kk_ + 1) * 12].reshape(6, 2)
+                        else:
+                            o_ = v_[:12].reshape(6, 2)
+                    offs_.append(o_)
+                opz = out["occ"][0]
+                oex = np.exp(opz - opz.max(0, keepdims=True))
+                opp = oex / oex.sum(0, keepdims=True)
+                ocls = (opp[1:].argmax(0) + 1).astype(np.uint8)
+                oconf = 1.0 - opp[0]
+                othr = np.where((ocls == 7) | (ocls == 8), 0.92, 0.55)
+                occ_cls = np.where(oconf > othr, ocls, 0).astype(np.uint8)
+                lane_am = out["lane"][0].argmax(0).astype(np.uint8)
+                guard = check_path(path6, occ_cls, vboxes, offs_, tl_p,
+                                   lane_am, float(v0))
+            except Exception:
+                guard = None
             g = compose_frame(np.stack(imgs), K_t[0], T_t[0], out,
-                              float(v0), vboxes, name, fi)
+                              float(v0), vboxes, name, fi, guard=guard)
         if False:
             g = np.zeros((IMG_H * 2, IMG_W * 2, 3), np.uint8)
             g[:IMG_H, :IMG_W] = imgs[0]

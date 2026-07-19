@@ -20,7 +20,9 @@ from autolabel_bev import PALETTE  # noqa: E402
 from bevlane.demo_occ_gt import cube_render  # noqa: E402
 from bevlane.demo_rgbd_bev import (SURR, NARROW, draw_boxes2d,  # noqa: E402
                                    draw_boxes_on_rgb)
-from bevlane.extract_seg2d import SEG21_PAL  # noqa: E402
+from bevlane.extract_seg2d import SEG21_PAL as _S21  # noqa: E402
+SEG2D_PAL = np.zeros((256, 3), np.uint8)
+SEG2D_PAL[:21] = _S21[:, ::-1]
 from bevlane.model import DepthSegIPMNetV17  # noqa: E402
 from bevlane.postproc import (crop_bev, draw_ego_and_grid,  # noqa: E402
                               thin_road_edge)
@@ -69,7 +71,7 @@ def compose_frame(imgs, K, T, out, v0, boxes, scene, fi, guard=None):
         x, y = c * cw, 40 + r * (ch + 4)
         img = cv2.resize(imgs[ci], (cw, ch))
         sg = seg[ci].argmax(0).astype(np.uint8)
-        ov = SEG21_PAL[cv2.resize(sg, (cw, ch),
+        ov = SEG2D_PAL[cv2.resize(sg, (cw, ch),
                                   interpolation=cv2.INTER_NEAREST)]
         img = cv2.addWeighted(img, 0.62, ov, 0.38, 0)
         draw_boxes_on_rgb(img, det7, K[ci], T[ci], cw, ch)
@@ -142,6 +144,32 @@ def compose_frame(imgs, K, T, out, v0, boxes, scene, fi, guard=None):
             ((0, 215, 255) if cls_ == 0 else (255, 0, 255))
         cv2.polylines(bev, [np.array(cor, np.int32).reshape(-1, 1, 2)],
                       True, col, 2)
+        # heading tick centre -> front edge (demo-identical)
+        cxp, cyp = xy2px(xe, ye)
+        fxp, fyp = xy2px(xe + (l / 2) * cb, ye + (l / 2) * sb)
+        cv2.line(bev, (cxp, cyp), (fxp, fyp), col, 2)
+        # predicted 3 s agent future from the traj head
+        tm = out["traj"][0]
+        rr = int((80.0 - xe) / 0.4)
+        cc2 = int((50.0 - ye) / 0.4)
+        if not st and 0 <= rr < tm.shape[-2] and 0 <= cc2 < tm.shape[-1]:
+            v_ = tm[:, rr, cc2]
+            if v_.shape[0] >= 39:
+                kb_ = int(v_[36:39].argmax())
+                wps = v_[kb_ * 12:(kb_ + 1) * 12].reshape(6, 2)
+            else:
+                wps = v_[:12].reshape(6, 2)
+            pts_ = [(cxp, cyp)]
+            for dx_, dy_ in wps:
+                fx_, fy_ = xe + dx_, ye + dy_
+                if abs(fx_) > 60 or abs(fy_) > 25:
+                    break
+                pts_.append(xy2px(fx_, fy_))
+            if len(pts_) > 1:
+                cv2.polylines(bev, [np.array(pts_, np.int32
+                                             ).reshape(-1, 1, 2)],
+                              False, col, 1, cv2.LINE_AA)
+                cv2.circle(bev, pts_[-1], 3, col, -1)
     e = out["ego"][0]
     paths = e[:36].reshape(3, 6, 2)
     conf3 = np.exp(e[36:39]) / np.exp(e[36:39]).sum()
@@ -201,6 +229,23 @@ def compose_frame(imgs, K, T, out, v0, boxes, scene, fi, guard=None):
             cv2.putText(bev, guard["reason"], (6, BH2 - 118),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.42, (0, 80, 255), 1,
                         cv2.LINE_AA)
+            if guard.get("p_event") is not None:
+                ex_, ey_ = guard["p_event"]
+                if abs(ex_) < 60 and abs(ey_) < 25:
+                    cv2.drawMarker(bev, xy2px(ex_, ey_), (0, 0, 255),
+                                   cv2.MARKER_TILTED_CROSS, 18, 3)
+            if guard.get("stop_path") is not None:
+                sp_ = [xy2px(0, 0)]
+                for gx_, gy_ in guard["stop_path"]:
+                    if abs(gx_) > 60 or abs(gy_) > 25:
+                        break
+                    sp_.append(xy2px(gx_, gy_))
+                cv2.polylines(bev, [np.array(sp_, np.int32
+                                             ).reshape(-1, 1, 2)],
+                              False, (0, 200, 255), 2, cv2.LINE_AA)
+                cv2.putText(bev, "MRM stop", sp_[-1],
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.45,
+                            (0, 200, 255), 1, cv2.LINE_AA)
     frame[40:40 + BH2, VW - BW2:] = bev
     cv2.putText(frame, "pred BEV+bbox+E2E +-25x+-60m", (VW - BW2, 28),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.62, (255, 255, 255), 2,
