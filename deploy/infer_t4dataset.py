@@ -88,18 +88,67 @@ def scale_K(K, w0, h0):
     return K
 
 
+def build_engine_from_onnx(onnx_path):
+    """--onnx convenience: build (or reuse) a cached fp16 engine next to
+    the ONNX file via stock trtexec. Returns the engine path."""
+    eng = os.path.splitext(onnx_path)[0] + "_fp16.engine"
+    if os.path.exists(eng) and \
+            os.path.getmtime(eng) >= os.path.getmtime(onnx_path):
+        print(f"[engine] reusing cached {eng}", flush=True)
+        return eng
+    print(f"[engine] building {eng} from {onnx_path} (trtexec --fp16, "
+          "one-time, ~minutes)", flush=True)
+    import subprocess
+    r = subprocess.run(["trtexec", f"--onnx={onnx_path}",
+                        f"--saveEngine={eng}", "--fp16"],
+                       capture_output=True, text=True)
+    if r.returncode or not os.path.exists(eng):
+        sys.exit("trtexec failed:\n" + r.stdout[-2000:] + r.stderr[-2000:])
+    return eng
+
+
+def scene_dirs(t4d):
+    """--t4d accepts a single scene dir OR a dataset root of scenes."""
+    t4d = t4d.rstrip("/")
+    if os.path.isdir(os.path.join(t4d, "annotation")):
+        return [t4d]
+    subs = [os.path.join(t4d, d) for d in sorted(os.listdir(t4d))
+            if os.path.isdir(os.path.join(t4d, d, "annotation"))]
+    if not subs:
+        sys.exit(f"{t4d}: no t4dataset scenes found")
+    return subs
+
+
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--engine", required=True)
-    ap.add_argument("--scene", required=True, help="t4dataset scene directory")
+    ap.add_argument("--engine", default=None,
+                    help="prebuilt TensorRT engine")
+    ap.add_argument("--onnx", default=None,
+                    help="ONNX file: builds/reuses a cached fp16 engine")
+    ap.add_argument("--t4d", "--scene", dest="t4d", required=True,
+                    help="t4dataset scene directory OR dataset root")
     ap.add_argument("--out", default="out/t4_infer")
     ap.add_argument("--video", default=None)
+    ap.add_argument("--display", action="store_true",
+                    help="live visualisation window while inferring "
+                    "(q quits, space pauses)")
     ap.add_argument("--stride", type=int, default=2, help="keyframe stride")
     ap.add_argument("--limit", type=int, default=0)
     ap.add_argument("--thresh", type=float, default=0.45)
     args = ap.parse_args()
+    if not args.engine and not args.onnx:
+        sys.exit("need --engine or --onnx")
+    if not args.engine:
+        args.engine = build_engine_from_onnx(args.onnx)
+    if args.display and not os.environ.get("DISPLAY"):
+        print("[warn] --display requested but no $DISPLAY; continuing "
+              "without a window", flush=True)
+        args.display = False
+    for root in scene_dirs(args.t4d):
+        run_scene(args, root)
 
-    root = args.scene.rstrip("/")
+
+def run_scene(args, root):
     name = os.path.basename(root)
     ordered, by_sample, calib, egop = load_scene(root)
     missing = [c for c in CAMS if c not in calib]
@@ -192,7 +241,7 @@ def main():
             risk=(1 / (1 + np.exp(-out["risk"][0, 0])) * 255).astype(np.uint8),
             occ=out["occ"][0].argmax(0).astype(np.uint8))
 
-        if vw is not None:
+        if vw is not None or args.display:
             g = np.zeros((IMG_H * 2, IMG_W * 2, 3), np.uint8)
             g[:IMG_H, :IMG_W] = imgs[0]
             g[:IMG_H, IMG_W:] = imgs[6]
@@ -230,7 +279,15 @@ def main():
             cv2.putText(g, "TensorRT engine | t4dataset raw input", (10, IMG_H * 2 - 12),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.6, (200, 200, 200), 1,
                         cv2.LINE_AA)
-            vw.write(g)
+            if vw is not None:
+                vw.write(g)
+            if args.display:
+                cv2.imshow("METEOR live", g)
+                k = cv2.waitKey(1) & 0xFF
+                if k == ord('q'):
+                    break
+                if k == ord(' '):
+                    cv2.waitKey(0)
         n += 1
         if n % 20 == 0:
             print(f"{n}/{len(frames)} frames", flush=True)

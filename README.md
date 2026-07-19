@@ -282,9 +282,12 @@ the runtime rings back on the next frame.
 python3 deploy/export_onnx.py --ckpt ckpt.pt --out meteor_v29.onnx --check --fp16
 trtexec --onnx=meteor_v29.onnx --saveEngine=meteor_v29_fp16.engine --fp16
 
-# 2) run it straight on a raw t4dataset scene — no GT, no PyTorch
-python3 deploy/infer_t4dataset.py --engine meteor_v29_fp16.engine \
-        --scene /path/to/t4dataset/<scene> --out out/infer --video out/infer.mp4
+# 2) run it straight on raw t4dataset data — no GT, no PyTorch.
+#    --onnx builds (and caches) the fp16 engine for you; --t4d accepts a
+#    single scene OR a whole dataset root; --display opens a live window
+#    (q = quit, space = pause) while streaming inference.
+python3 deploy/infer_t4dataset.py --onnx meteor_v29.onnx \
+        --t4d /path/to/t4dataset --display --video out/infer.mp4
 ```
 
 `infer_t4dataset.py` reads `annotation/*.json` + `data/CAM_*` directly, rebuilds
