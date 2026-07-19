@@ -90,29 +90,34 @@ def scale_K(K, w0, h0):
 
 def build_engine_from_onnx(onnx_path):
     """--onnx convenience: build (or reuse) a cached fp16 engine next to
-    the ONNX file via stock trtexec. Returns the engine path."""
+    the ONNX file, using the TensorRT Python API directly (no trtexec)."""
     eng = os.path.splitext(onnx_path)[0] + "_fp16.engine"
     if os.path.exists(eng) and \
             os.path.getmtime(eng) >= os.path.getmtime(onnx_path):
         print(f"[engine] reusing cached {eng}", flush=True)
         return eng
-    print(f"[engine] building {eng} from {onnx_path} (trtexec --fp16, "
-          "one-time, ~minutes)", flush=True)
-    import subprocess
-    import shutil
-    trtexec = os.environ.get("TRTEXEC", "trtexec")
-    if not shutil.which(trtexec):
-        for cand in ("/home/umedan/TensorRT-8.6.0.12/bin/trtexec",
-                     "/usr/src/tensorrt/bin/trtexec",
-                     "/opt/tensorrt/bin/trtexec"):
-            if os.path.exists(cand):
-                trtexec = cand
-                break
-    r = subprocess.run([trtexec, f"--onnx={onnx_path}",
-                        f"--saveEngine={eng}", "--fp16"],
-                       capture_output=True, text=True)
-    if r.returncode or not os.path.exists(eng):
-        sys.exit("trtexec failed:\n" + r.stdout[-2000:] + r.stderr[-2000:])
+    import tensorrt as trt
+    print(f"[engine] building {eng} from {onnx_path} "
+          "(TensorRT python API, fp16, one-time, ~minutes)", flush=True)
+    logger = trt.Logger(trt.Logger.WARNING)
+    builder = trt.Builder(logger)
+    network = builder.create_network(
+        1 << int(trt.NetworkDefinitionCreationFlag.EXPLICIT_BATCH))
+    parser = trt.OnnxParser(network, logger)
+    with open(onnx_path, "rb") as f:
+        if not parser.parse(f.read()):
+            msgs = "\n".join(str(parser.get_error(i))
+                             for i in range(parser.num_errors))
+            sys.exit(f"ONNX parse failed:\n{msgs}")
+    config = builder.create_builder_config()
+    config.set_memory_pool_limit(trt.MemoryPoolType.WORKSPACE, 8 << 30)
+    config.set_flag(trt.BuilderFlag.FP16)
+    blob = builder.build_serialized_network(network, config)
+    if blob is None:
+        sys.exit("TensorRT build failed")
+    with open(eng, "wb") as f:
+        f.write(blob)
+    print(f"[engine] saved {eng}", flush=True)
     return eng
 
 
