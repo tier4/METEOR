@@ -31,23 +31,28 @@ def process_scene(scene):
         out_dir = os.path.join(OUT, scene)
         mf = os.path.join(out_dir, "manifest.json")
         man = json.load(open(mf))
+        if man.get("gt_cons_v") == 2:
+            return f"[skip] {scene}: already v2"
         os.makedirs(os.path.join(out_dir, "gt_cons"), exist_ok=True)
         n = 0
         for fr in man["frames"]:
             if "gt" not in fr or "gt_vec" not in fr:
                 continue
             dst = f"gt_cons/{fr['frame']:04d}.png"
-            if os.path.exists(os.path.join(out_dir, dst)):
-                fr["gt_cons"] = dst
-                continue
+
             a = cv2.imread(os.path.join(out_dir, fr["gt"]), 0)
             b = cv2.imread(os.path.join(out_dir, fr["gt_vec"]), 0)
             if a is None or b is None or a.shape != b.shape:
                 continue
             cons = np.where(a == b, b, 255).astype(np.uint8)
+            # road_edge (6): thin line, half-cell offsets make the two
+            # generations disagree almost everywhere (measured IoU 0.14)
+            # -> inherit the vector render's edge instead of erasing it
+            cons[b == 6] = 6
             cv2.imwrite(os.path.join(out_dir, dst), cons)
             fr["gt_cons"] = dst
             n += 1
+        man["gt_cons_v"] = 2
         json.dump(man, open(mf, "w"))
         return f"[ok] {scene} n={n}"
     except Exception as e:
