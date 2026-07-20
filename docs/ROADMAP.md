@@ -1,5 +1,47 @@
 # METEOR — candidate list for future rounds
 
+## Implementation ledger (updated 2026-07-20)
+
+### Shipped — model/training rounds
+| Round | Date | Model | What went in |
+|---|---|---|---|
+| r20 | 07-15 | v29 | K=3 WTA multimodal, 3-slot memory queue, lane-graph slots, occ flow; BN-stats isolation fix; per-epoch subset sampler (14%→100% corpus) |
+| r21 | 07-15 | v29 | eps-WTA + diverse mode init (mode-collapse fix); class-aware forecasting (det-feature concat, VRU x2.5) |
+| r22 | 07-16 | v29 | occ dynamic-shadow GT filter; turn oversample x3; tl-w 0.6 (TL 0.28→0.86) |
+| r23 | 07-16..17 | v30/v31 | unknown-object head (occ-blob GT); **C6a optional LiDAR depth-sharpening** (single weights, modality dropout); forecasting motion residual + oncoming x2.5 |
+| r25 | 07-17 | v32 | **C6b LiDAR pillar BEV branch** (host raster, flag-gated residual, zeros = camera-only bit-equal) |
+| r27 | 07-18 | v33 | precision pass: temporal stationary head, det-yaw + heading loss for oncoming, crossing-yaw weight, occ near-ego FP penalty + GT v2 free assertion, edge-weighted depth CE |
+| r28 | 07-18 | v34 | unknown rework (temporal stem, radius 2.0, unk-w 1.0); **C2 failure mining** (mined x2); VRU direction-gate fix |
+| r29/r30 | 07-18..19 | v35/v36 | **B1-B4 TRT-safe transformers** (lane-graph query decoder, temporal slot gate, E2E attention pooling, agent-interaction lite); **ADE pack**: kinematic history, 2x mode-CE, time-weighted waypoints |
+| r31 | 07-19..20 | v37 | **consensus GT v2** (gt_cons; GT-vs-GT ceiling measured at mIoU 0.452, road_edge inherited); **E6 intent tokens**; BEV rotation aug ±10°; ego-w 1.2; distributed ADE probe (8-rank) |
+| r32 | 07-20 (running) | v38 | **C1 risk-integral mode selection (in-training)**; longitudinal 2x weight; speed-profile aux head; e2e-mode mining; 4,547 scenes |
+
+### Shipped — infrastructure / deployment
+| Item | Date | Detail |
+|---|---|---|
+| L1 guardrails (C7) | 07-17..18 | spacetime collision / red-light / feasibility / drivable + MRM stop path; HOLD state; hood-ghost masking; demo --guard |
+| Occupancy voxel-cube renderer | 07-17 | metric grid + shaded cubes (both demos) |
+| Sharp depth (display + loss) | 07-17 | top-mode expectation; edge-weighted CE (r27+) |
+| v36 ONNX export + engines | 07-19 | direct-trace exporter (ORT parity 1.1e-4); Python-API engine build (no trtexec); version/HW-compatible engines (--compat, Ampere+); one runtime for v29/v36 engines |
+| Demo-identical TRT visualization | 07-19 | deploy/visualize.py shares the PyTorch demo's palettes/helpers (ribbon, agent trajectories, waypoint dots, guard/MRM) |
+| C++ TensorRT runtime | 07-19 | deploy/cpp: engine build, t4dataset parsing, temporal ring, overlay video |
+| Watchdog auto-recovery | 07-19 | crash-detect + relaunch from newest ckpt + completion markers (round chains gated on markers) |
+| Drive-level test holdout | 07-18 | 150 scenes permanently excluded; curve/overtake unseen-drive demos |
+
+### Planned
+| Item | Target | Detail |
+|---|---|---|
+| r33 = v39 decoupled E2E head | after r32 (~07-21) | heading x speed-profile composition (implemented 07-20, zero-gate verified); full corpus ~5.15k scenes (conversion completes ~07-21 AM) |
+| ADE <= 0.5 gate | r32/r33 | probeE2E ledger; fallback = selection-margin loss, then ego-GT smoothing for 0.3s |
+| Unknown decode calibration | r33 | threshold 0.25 -> P/R sweep target P>=0.5 R>=0.3 |
+| Boundary-tolerant thin-class metric (3b) | this week | consensus-GT companion metric |
+| Guardrail intervention-rate eval | this week | correct vs false interventions on val futures |
+| GT factory 3c/3d | after conversion idle | sub-cell alignment; pose re-smoothing (days, factory re-run) |
+| B1 verdict | r32 eval | if [valLane] still 0.01 after transformer decoder, redesign GT+matching before more training |
+| INT8 + IPM sector mask + E8 distillation | next week | Orin productisation path |
+| E2 self-training | after M1 | pseudo-label the 342 autolabel-less scenes |
+
+
 Living list of what we could do next, why, and what it would cost. Nothing
 here is committed work; each entry is sized so it can be picked up
 independently. Ordered within each section by (expected value ÷ risk).
