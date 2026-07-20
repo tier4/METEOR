@@ -2434,6 +2434,104 @@ class DepthSegIPMNetV39(DepthSegIPMNetV38):
         return tuple(out)
 
 
+class BEVSegRefiner(nn.Module):
+    """Post-hoc BEV-seg sharpener / far-range completer (roadmap 3f, r33).
+
+    The single-frame lane head drops out past ~50 m: the measured failure is
+    not blur but *missing* prediction (recall collapse), because the wide
+    cameras give <2 px per 0.2 m cell there. This module takes the FROZEN
+    main model's BEV-seg logits and predicts a residual correction. Its U-Net
+    has a wide receptive field (down to s16 = 3.2 m/cell) so it can propagate
+    the confident near-range structure forward into the far field, using the
+    learned prior that lanes / edges / crosswalks are spatially continuous.
+    The far-range GT it is trained against is trustworthy: gt_cons is built by
+    accumulating each place over the whole drive, so 50-80 m is fully labelled
+    even though a single frame can't see it.
+
+    Design guarantees:
+      * residual + zero-init last conv  -> identity at init, so it can only
+        add to the frozen output; near-range accuracy is preserved by
+        construction (the "never degrade Seg/Det/E2E" priority).
+      * input is the 9-channel logit map (+ a forward-range channel), so it is
+        a standalone net: deployable as its own ONNX/TRT engine chained after
+        the main graph, and trainable without touching the frozen backbone.
+      * optional raw-BEV context (ctx_ch>0) lets it also read the weak far
+        evidence the seg head discarded; off by default for deployability.
+    """
+
+    def __init__(self, n_cls=N_CLASSES, ctx_ch=0, width=48):
+        super().__init__()
+        self.n_cls = n_cls
+        self.ctx_ch = ctx_ch
+        cin = n_cls + 1 + ctx_ch          # +1 = forward-range position channel
+
+        def enc(ci, co):
+            return nn.Sequential(
+                nn.Conv2d(ci, co, 3, stride=2, padding=1, bias=False),
+                nn.BatchNorm2d(co), nn.ReLU(inplace=True), ConvBlock(co, co))
+
+        self.stem = nn.Sequential(
+            nn.Conv2d(cin, width, 3, padding=1, bias=False),
+            nn.BatchNorm2d(width), nn.ReLU(inplace=True))
+        self.d1 = enc(width, width * 2)          # s2
+        self.d2 = enc(width * 2, width * 3)       # s4
+        self.d3 = enc(width * 3, width * 4)       # s8
+        self.d4 = enc(width * 4, width * 4)       # s16 (wide RF ~ >80 m)
+        self.u4 = nn.Conv2d(width * 4, width * 4, 1)
+        self.m3 = ConvBlock(width * 4, width * 4)
+        self.u3 = nn.Conv2d(width * 4, width * 3, 1)
+        self.m2 = ConvBlock(width * 3, width * 3)
+        self.u2 = nn.Conv2d(width * 3, width * 2, 1)
+        self.m1 = ConvBlock(width * 2, width * 2)
+        self.u1 = nn.Conv2d(width * 2, width, 1)
+        self.out = nn.Sequential(
+            nn.Conv2d(width, width, 3, padding=1, bias=False),
+            nn.BatchNorm2d(width), nn.ReLU(inplace=True),
+            nn.Conv2d(width, n_cls, 1))
+        nn.init.zeros_(self.out[-1].weight)      # identity at init
+        nn.init.zeros_(self.out[-1].bias)
+        self._rng_cache = {}
+
+    def _range_chan(self, h, w, device, dtype):
+        key = (h, w, device, dtype)
+        c = self._rng_cache.get(key)
+        if c is None:
+            # row r -> forward distance x = 80 - r*0.2 (BEV convention);
+            # encode x/80 in [~-1,1], broadcast across columns so the net
+            # knows where the ~50 m dropout boundary sits
+            x = (BEV_XH - (torch.arange(h, device=device, dtype=dtype) + 0.5)
+                 * (2 * BEV_XH / h)) / BEV_XH
+            c = x.view(1, 1, h, 1).expand(1, 1, h, w).contiguous()
+            self._rng_cache[key] = c
+        return c
+
+    def forward(self, seg_logits, ctx=None):
+        """seg_logits [B,n_cls,H,W] from the frozen model (detached upstream).
+        ctx: optional [B,ctx_ch,H,W] raw-BEV context. Returns refined logits
+        (same shape) = frozen logits + learned residual."""
+        B, _, H, W = seg_logits.shape
+        rng = self._range_chan(H, W, seg_logits.device,
+                               seg_logits.dtype).expand(B, 1, H, W)
+        parts = [seg_logits, rng]
+        if self.ctx_ch and ctx is not None:
+            parts.append(ctx)
+        x = torch.cat(parts, 1)
+        s0 = self.stem(x)
+        s1 = self.d1(s0)
+        s2 = self.d2(s1)
+        s3 = self.d3(s2)
+        s4 = self.d4(s3)
+
+        def up(u, skip):
+            return F.interpolate(u, size=skip.shape[-2:], mode="bilinear",
+                                 align_corners=False)
+        y3 = self.m3(s3 + up(self.u4(s4), s3))
+        y2 = self.m2(s2 + up(self.u3(y3), s2))
+        y1 = self.m1(s1 + up(self.u2(y2), s1))
+        y0 = s0 + up(self.u1(y1), s0)
+        return seg_logits + self.out(y0)
+
+
 MODELS = {"v1": IPMSegNet, "v2": IPMSegNetV2, "v3s": IPMSegNetV3,
           "lss": LSSDepthNet, "v8": DepthGatedIPMNet, "v13": DepthSegIPMNet,
           "v13d": DepthSegIPMNetS4, "v14d": DepthSegIPMNetV14,
