@@ -38,7 +38,8 @@ from bevlane.model import (DepthGatedIPMNet, DepthSegIPMNet,  # noqa: E402
                            DepthSegIPMNetV30, DepthSegIPMNetV31,
                            DepthSegIPMNetV32, DepthSegIPMNetV33,
                            DepthSegIPMNetV34, DepthSegIPMNetV35,
-                           DepthSegIPMNetV36)
+                           DepthSegIPMNetV36, DepthSegIPMNetV37,
+                           DepthSegIPMNetV38, DepthSegIPMNetV39)
 
 DET10_ABBR = ["obs", "car", "trk", "bus", "bcy", "mcy", "ped", "pnt", "tl", "ts"]
 
@@ -214,6 +215,7 @@ def label(img, txt, color=(255, 255, 255)):
 
 
 _BEVQ = {}
+_SEGACC = {}
 
 
 def main():
@@ -223,7 +225,11 @@ def main():
     ap.add_argument("--out", default="out/demo_rgbd_bev.mp4")
     ap.add_argument("--fps", type=int, default=15)
     ap.add_argument("--no-thin", action="store_true")
-    ap.add_argument("--model", default="v8", choices=["v8", "v13", "v13d", "v14d", "v15", "v16", "v17", "v18", "v19", "v20", "v21", "v22", "v23", "v24", "v25", "v26", "v27", "v28", "v29", "v30", "v31", "v32", "v33", "v34", "v35", "v36"],
+    ap.add_argument("--seg-fuse", action="store_true",
+                    help="ego-warped log-odds fusion of BEV seg over time "
+                         "(<=45 m; measured: stability .83->.93, "
+                         "crosswalk 20-40m +.06)")
+    ap.add_argument("--model", default="v8", choices=["v8", "v13", "v13d", "v14d", "v15", "v16", "v17", "v18", "v19", "v20", "v21", "v22", "v23", "v24", "v25", "v26", "v27", "v28", "v29", "v30", "v31", "v32", "v33", "v34", "v35", "v36", "v37", "v38", "v39"],
                     help="v8=DepthGatedIPMNet(512) / v13=DepthSegIPMNet(768) / v13d=stride-4 depth")
     ap.add_argument("--show-seg2d", action="store_true",
                     help="alpha-blend predicted 2D seg over RGB panels")
@@ -264,9 +270,12 @@ def main():
             "v33": DepthSegIPMNetV33,
             "v34": DepthSegIPMNetV34,
             "v35": DepthSegIPMNetV35,
-            "v36": DepthSegIPMNetV36}.get(args.model, DepthGatedIPMNet)
+            "v36": DepthSegIPMNetV36,
+            "v37": DepthSegIPMNetV37,
+            "v38": DepthSegIPMNetV38,
+            "v39": DepthSegIPMNetV39}.get(args.model, DepthGatedIPMNet)
     mkw = {"n_seg": args.n_seg2d} if args.model in (
-        "v13", "v13d", "v14d", "v15", "v16", "v17", "v18", "v19", "v20", "v21", "v22", "v23", "v25", "v26", "v27", "v28", "v29", "v30", "v31", "v32", "v33", "v34", "v35", "v36") else {}
+        "v13", "v13d", "v14d", "v15", "v16", "v17", "v18", "v19", "v20", "v21", "v22", "v23", "v25", "v26", "v27", "v28", "v29", "v30", "v31", "v32", "v33", "v34", "v35", "v36", "v37", "v38", "v39") else {}
     m = mcls(**mkw).cuda().eval()
     if args.n_seg2d == 21:      # csv taxonomy: Cityscapes-like colours (BGR)
         from bevlane.extract_seg2d import SEG21_PAL
@@ -274,7 +283,7 @@ def main():
         SEG2D_PAL[:21] = SEG21_PAL[:, ::-1]
     m.load_state_dict(torch.load(args.ckpt, map_location="cpu")["model"])
     dbins = torch.arange(m.D) * m.D_STEP + m.D_MIN
-    infer_hw = args.infer_hw or ("none" if args.model in ("v13", "v13d", "v14d", "v15", "v16", "v17", "v18", "v19", "v20", "v21", "v22", "v23", "v25", "v26", "v27", "v28", "v29", "v30", "v31", "v32", "v33", "v34", "v35", "v36") else "288x512")
+    infer_hw = args.infer_hw or ("none" if args.model in ("v13", "v13d", "v14d", "v15", "v16", "v17", "v18", "v19", "v20", "v21", "v22", "v23", "v25", "v26", "v27", "v28", "v29", "v30", "v31", "v32", "v33", "v34", "v35", "v36", "v37", "v38", "v39") else "288x512")
     ih, iw = (None, None) if infer_hw == "none" else \
         (int(infer_hw.split("x")[0]), int(infer_hw.split("x")[1]))
 
@@ -309,7 +318,7 @@ def main():
                 imgs_m = imgs
             s_pre, f_pre = ds.items[i]
             v0_t = None
-            if args.model in ("v18", "v19", "v20", "v21", "v22", "v23", "v25", "v26", "v27", "v28", "v29", "v30", "v31", "v32", "v33", "v34", "v35", "v36"):  # v0
+            if args.model in ("v18", "v19", "v20", "v21", "v22", "v23", "v25", "v26", "v27", "v28", "v29", "v30", "v31", "v32", "v33", "v34", "v35", "v36", "v37", "v38", "v39"):  # v0
                 try:
                     z = np.load(os.path.join("out/bevlane", s_pre,
                                              "ego_motion.npz"))
@@ -317,7 +326,7 @@ def main():
                 except Exception:
                     v0_t = torch.zeros(1)
             pb = th = None
-            if args.model in ("v22", "v23", "v25", "v26", "v27", "v28", "v29", "v30", "v31", "v32", "v33", "v34", "v35", "v36"):
+            if args.model in ("v22", "v23", "v25", "v26", "v27", "v28", "v29", "v30", "v31", "v32", "v33", "v34", "v35", "v36", "v37", "v38", "v39"):
                 fi_cur = f_pre["frame"]
                 if _BEVQ.get("scene") != s_pre:
                     _BEVQ.clear(); _BEVQ["scene"] = s_pre
@@ -337,7 +346,7 @@ def main():
                                               -sp * (pc_[0] - pp_[0])
                                               + cp * (pc_[1] - pp_[1]), dy]],
                                             dtype=torch.float32).cuda()
-                    if args.model in ("v29", "v30", "v31", "v32", "v33", "v34", "v35", "v36"):  # 3-slot queue
+                    if args.model in ("v29", "v30", "v31", "v32", "v33", "v34", "v35", "v36", "v37", "v38", "v39"):  # 3-slot queue
                         pbs, ths = [], []
                         for off in (2, 6, 14):
                             hb = _BEVQ.get(fi_cur - off)
@@ -372,13 +381,13 @@ def main():
                 except Exception:
                     pass
             with torch.no_grad(), torch.autocast("cuda", torch.float16):
-                if args.model in ("v22", "v23", "v25", "v26", "v27", "v28", "v29", "v30", "v31", "v32", "v33", "v34", "v35", "v36"):
+                if args.model in ("v22", "v23", "v25", "v26", "v27", "v28", "v29", "v30", "v31", "v32", "v33", "v34", "v35", "v36", "v37", "v38", "v39"):
                     out = m(imgs_m[None].cuda(), K[None].cuda(),
                             T[None].cuda(),
                             v0_t.cuda() if v0_t is not None else None, pb, th,
                             **lid_kw)
                     _BEVQ[f_pre["frame"]] = m._last_bev.detach().float()
-                    keep = 14 if args.model in ("v29", "v30", "v31", "v32", "v33", "v34", "v35", "v36") else 2
+                    keep = 14 if args.model in ("v29", "v30", "v31", "v32", "v33", "v34", "v35", "v36", "v37", "v38", "v39") else 2
                     for kk in [k for k in _BEVQ
                                if isinstance(k, int)
                                and k < f_pre["frame"] - keep]:
@@ -391,6 +400,25 @@ def main():
                              T[None].cuda()))
             seg, dlog = out[0], out[1]        # v13 returns (seg, depth, seg2d)
             pred = seg.argmax(1)[0].cpu().numpy().astype(np.uint8)
+            if args.seg_fuse:
+                # temporal log-odds fusion in the ego frame (static classes):
+                # fused for x<=45 m, raw beyond (pose noise misregisters
+                # thin lines at long range)
+                try:
+                    lp = torch.log_softmax(seg.float(), 1)
+                    if _SEGACC.get("scene") == s_pre:
+                        rl = _rel(_SEGACC["fi"])
+                        if rl is not None:
+                            thw = make_warp_theta(rl)
+                            gr = F.affine_grid(thw, list(lp.shape),
+                                               align_corners=False)
+                            lp = lp + 0.7 * F.grid_sample(
+                                _SEGACC["acc"], gr, align_corners=False)
+                    _SEGACC.update(scene=s_pre, fi=f_pre["frame"], acc=lp)
+                    fpred = lp.argmax(1)[0].cpu().numpy().astype(np.uint8)
+                    pred[175:] = fpred[175:]
+                except Exception:
+                    pass
             if not args.no_thin:
                 pred = thin_road_edge(pred)
             if args.model == "v15" and len(out) > 3:   # box occupancy overlay
@@ -401,7 +429,7 @@ def main():
             if args.show_seg2d and isinstance(out, tuple) and len(out) > 2:
                 seg2d_pred = out[2].argmax(2)[0].cpu().numpy().astype(np.uint8)
             det_boxes = None
-            if args.model in ("v16", "v17", "v18", "v19", "v20", "v21", "v22", "v23", "v25", "v26", "v27", "v28", "v29", "v30", "v31", "v32", "v33", "v34", "v35", "v36") and len(out) > 4:
+            if args.model in ("v16", "v17", "v18", "v19", "v20", "v21", "v22", "v23", "v25", "v26", "v27", "v28", "v29", "v30", "v31", "v32", "v33", "v34", "v35", "v36", "v37", "v38", "v39") and len(out) > 4:
                 if args.model == "v30" and len(out) >= 18:
                     unk_boxes = m.decode_unknown(out[17].float())[0]
                 else:
@@ -410,7 +438,7 @@ def main():
                     out[3].float(), out[4].float(), thresh=0.25, topk=64)[0]
                     if d[1] > (0.45 if d[0] == 0 else 0.25)] + unk_boxes
             ego_modes = None
-            if args.model in ("v29", "v30", "v31", "v32", "v33", "v34", "v35", "v36") and len(out) >= 8:
+            if args.model in ("v29", "v30", "v31", "v32", "v33", "v34", "v35", "v36", "v37", "v38", "v39") and len(out) >= 8:
                 _e = out[7][0].float().cpu().numpy()
                 _pr = np.exp(_e[36:39]) / np.exp(_e[36:39]).sum()
                 _k = int(_pr.argmax())
@@ -423,19 +451,19 @@ def main():
                 out = out[:7] + (torch.from_numpy(np.concatenate(
                     [_e[_k * 12:(_k + 1) * 12], _e[39:42]]))[None],) + out[8:]
             ego_pred = out[7][0].float().cpu().numpy() \
-                if args.model in ("v18", "v19", "v20", "v21", "v22", "v23", "v25", "v26", "v27", "v28", "v29", "v30", "v31", "v32", "v33", "v34", "v35", "v36") and len(out) >= 8 else None
+                if args.model in ("v18", "v19", "v20", "v21", "v22", "v23", "v25", "v26", "v27", "v28", "v29", "v30", "v31", "v32", "v33", "v34", "v35", "v36", "v37", "v38", "v39") and len(out) >= 8 else None
             traj_map = out[9][0].float().cpu() \
-                if args.model in ("v21", "v22", "v23", "v25", "v26", "v27", "v28", "v29", "v30", "v31", "v32", "v33", "v34", "v35", "v36") and len(out) >= 10 else None
+                if args.model in ("v21", "v22", "v23", "v25", "v26", "v27", "v28", "v29", "v30", "v31", "v32", "v33", "v34", "v35", "v36", "v37", "v38", "v39") and len(out) >= 10 else None
             stat_map = out[10][0, 0].float().cpu() \
-                if args.model in ("v26", "v27", "v28", "v29", "v30", "v31", "v32", "v33", "v34", "v35", "v36") and len(out) >= 11 else None
+                if args.model in ("v26", "v27", "v28", "v29", "v30", "v31", "v32", "v33", "v34", "v35", "v36", "v37", "v38", "v39") and len(out) >= 11 else None
             risk_map = out[12][0, 0].float().sigmoid().cpu().numpy() \
-                if args.model in ("v28", "v29", "v30", "v31", "v32", "v33", "v34", "v35", "v36") and len(out) >= 13 else None
+                if args.model in ("v28", "v29", "v30", "v31", "v32", "v33", "v34", "v35", "v36", "v37", "v38", "v39") and len(out) >= 13 else None
             tl_state = None
-            if args.model in ("v27", "v28", "v29", "v30", "v31", "v32", "v33", "v34", "v35", "v36") and len(out) >= 12:
+            if args.model in ("v27", "v28", "v29", "v30", "v31", "v32", "v33", "v34", "v35", "v36", "v37", "v38", "v39") and len(out) >= 12:
                 p_tl = out[11][0].float().softmax(0)
                 tl_state = (int(p_tl.argmax()), float(p_tl.max()))
             occ_pred = None
-            if args.model in ("v20", "v21", "v22", "v23", "v25", "v26", "v27", "v28", "v29", "v30", "v31", "v32", "v33", "v34", "v35", "v36") and len(out) >= 9:
+            if args.model in ("v20", "v21", "v22", "v23", "v25", "v26", "v27", "v28", "v29", "v30", "v31", "v32", "v33", "v34", "v35", "v36", "v37", "v38", "v39") and len(out) >= 9:
                 op = out[8][0].float().softmax(0)      # [C,Z,H,W]
                 conf = 1.0 - op[0]                      # P(occupied)
                 cls = (op[1:].argmax(0) + 1).to(torch.uint8)
@@ -448,7 +476,7 @@ def main():
                                        torch.zeros_like(cls)) \
                     .cpu().numpy().astype(np.uint8)
             boxes2d = None
-            if args.model in ("v17", "v18", "v19", "v20", "v21", "v22", "v23", "v25", "v26", "v27", "v28", "v29", "v30", "v31", "v32", "v33", "v34", "v35", "v36") and len(out) >= 7:
+            if args.model in ("v17", "v18", "v19", "v20", "v21", "v22", "v23", "v25", "v26", "v27", "v28", "v29", "v30", "v31", "v32", "v33", "v34", "v35", "v36", "v37", "v38", "v39") and len(out) >= 7:
                 if isinstance(out[5], (list, tuple)):   # v19 multi-scale
                     boxes2d = m.decode_boxes2d_ms(
                         [t[0].float() for t in out[5]],
@@ -732,7 +760,7 @@ def main():
                             (BW2 - 136, 46), cv2.FONT_HERSHEY_SIMPLEX,
                             0.5, tcl[ti], 2 if ti else 1, cv2.LINE_AA)
             cv2.putText(bev, "pred BEV+bbox+E2E +-25x+-60m"
-                        if args.model in ("v18", "v19", "v20", "v21", "v22", "v23", "v25", "v26", "v27", "v28", "v29", "v30", "v31", "v32", "v33", "v34", "v35", "v36") else
+                        if args.model in ("v18", "v19", "v20", "v21", "v22", "v23", "v25", "v26", "v27", "v28", "v29", "v30", "v31", "v32", "v33", "v34", "v35", "v36", "v37", "v38", "v39") else
                         ("pred BEV+bbox +-25x+-60m" if args.model in ("v15", "v16", "v17")
                          else "pred BEV +-25x+-60m"), (6, 24),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 255), 2, cv2.LINE_AA)
@@ -749,6 +777,8 @@ def main():
                             cv2.FONT_HERSHEY_SIMPLEX, 0.5, (220, 220, 220), 1,
                             cv2.LINE_AA)
             mode_tag = "LIDAR ON" if args.lidar else "camera-only"
+            if args.seg_fuse:
+                mode_tag += "  |  seg-EMA<=45m"
             cv2.putText(frame, f"{scene.split('+0900_')[-1]}  f{f['frame']:03d}  |  "
                         f"6/8-cam -> Depth + BEV (+-25x+-60m)  |  no GT  |  "
                         f"{mode_tag}",
