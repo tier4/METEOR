@@ -2389,6 +2389,51 @@ class DepthSegIPMNetV38(DepthSegIPMNetV37):
             / valid.sum().clamp(min=1) / 6.0
 
 
+class DepthSegIPMNetV39(DepthSegIPMNetV38):
+    """v39: truly DECOUPLED E2E head (shape x speed composition).
+
+    A parallel decoder predicts, per mode, a heading profile phi(t) [3,6]
+    and a speed profile v(t) [3,6]; waypoints are composed by cumulative
+    integration wp_i = wp_{i-1} + 0.5 * v_i * (cos phi_i, sin phi_i)
+    (cumsum only -> TRT-safe). A zero-init gate blends it with the
+    original entangled regression, so longitudinal accuracy can be
+    optimised independently of path shape without losing the r32
+    behaviour at start."""
+    def __init__(self, *a, **k):
+        super().__init__(*a, **k)
+        self.dec_head = nn.Linear(96, 36)      # [3 modes x (6 phi + 6 v)]
+        nn.init.zeros_(self.dec_head.weight)
+        with torch.no_grad():
+            b = torch.zeros(36)
+            b[18:] = 5.0                       # v init ~5 m/s
+            self.dec_head.bias.copy_(b)
+        self.dec_gate = nn.Parameter(torch.zeros(1))
+
+    def forward(self, imgs, K, T_cam_ego, v0=None, prev_bev=None,
+                warp_theta=None, lidar=None, lidar_bev=None, kin=None,
+                intent=None):
+        out = list(super().forward(imgs, K, T_cam_ego, v0, prev_bev,
+                                   warp_theta, lidar=lidar,
+                                   lidar_bev=lidar_bev, kin=kin,
+                                   intent=intent))
+        e = out[7]
+        B = e.shape[0]
+        g = F.adaptive_avg_pool2d(self._fused_bev, 1).flatten(1).float()
+        d = self.dec_head(g).view(B, 3, 12)
+        phi = d[:, :, :6]
+        v = F.softplus(d[:, :, 6:])
+        step = 0.5 * v
+        dx = step * torch.cos(phi)
+        dy = step * torch.sin(phi)
+        wp_dec = torch.stack([dx.cumsum(2), dy.cumsum(2)], -1)  # [B,3,6,2]
+        wps = e[:, :36].view(B, 3, 6, 2)
+        gate = torch.tanh(self.dec_gate)
+        e = e.clone()
+        e[:, :36] = (wps + gate * (wp_dec.to(e.dtype) - wps)).reshape(B, 36)
+        out[7] = e
+        return tuple(out)
+
+
 MODELS = {"v1": IPMSegNet, "v2": IPMSegNetV2, "v3s": IPMSegNetV3,
           "lss": LSSDepthNet, "v8": DepthGatedIPMNet, "v13": DepthSegIPMNet,
           "v13d": DepthSegIPMNetS4, "v14d": DepthSegIPMNetV14,
@@ -2397,4 +2442,4 @@ MODELS = {"v1": IPMSegNet, "v2": IPMSegNetV2, "v3s": IPMSegNetV3,
           "v19": DepthSegIPMNetV19, "v20": DepthSegIPMNetV20,
           "v21": DepthSegIPMNetV21, "v22": DepthSegIPMNetV22,
           "v23": DepthSegIPMNetV23, "v24": DepthSegIPMNetV24,
-          "v25": DepthSegIPMNetV25, "v26": DepthSegIPMNetV26, "v27": DepthSegIPMNetV27, "v28": DepthSegIPMNetV28, "v29": DepthSegIPMNetV29, "v30": DepthSegIPMNetV30, "v31": DepthSegIPMNetV31, "v32": DepthSegIPMNetV32, "v33": DepthSegIPMNetV33, "v34": DepthSegIPMNetV34, "v35": DepthSegIPMNetV35, "v36": DepthSegIPMNetV36, "v37": DepthSegIPMNetV37, "v38": DepthSegIPMNetV38}
+          "v25": DepthSegIPMNetV25, "v26": DepthSegIPMNetV26, "v27": DepthSegIPMNetV27, "v28": DepthSegIPMNetV28, "v29": DepthSegIPMNetV29, "v30": DepthSegIPMNetV30, "v31": DepthSegIPMNetV31, "v32": DepthSegIPMNetV32, "v33": DepthSegIPMNetV33, "v34": DepthSegIPMNetV34, "v35": DepthSegIPMNetV35, "v36": DepthSegIPMNetV36, "v37": DepthSegIPMNetV37, "v38": DepthSegIPMNetV38, "v39": DepthSegIPMNetV39}
