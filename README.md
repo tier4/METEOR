@@ -121,6 +121,11 @@ its ingredients are machine-made:
 | <img src="docs/media/detail_bev.png" alt="BEV generation"/> | <img src="docs/media/detail_temporal.png" alt="temporal memory"/> |
 | <img src="docs/media/detail_e2e.png" alt="E2E planning + guardrails"/> | <img src="docs/media/detail_heads.png" alt="perception heads"/> |
 
+**Layer-level head architectures** (channels / resolutions match `bevlane/model.py`):
+
+<img src="docs/media/headarch_geometry.png" alt="head architectures: geometry"/>
+<img src="docs/media/headarch_motion.png" alt="head architectures: motion and planning"/>
+
 The signature block is the **depth-gated IPM**: BEV grid points are projected into every
 camera (K/T), context features are `grid_sample`d, and each sample is **gated by the
 predicted depth probability at its true range** — depth acts as a learned visibility valve

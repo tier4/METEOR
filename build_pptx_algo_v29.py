@@ -159,7 +159,9 @@ for ttl, sub, img in (
     ("詳細: BEV生成", "depth-gated IPM + オプションLiDAR (C6a/C6b) — ゼロ入力=カメラオンリーbit一致", "detail_bev.png"),
     ("詳細: 時系列メモリとtask routing", "3スロット+B2ゲート・幾何=RAW/動的=FUSED・運動残差", "detail_temporal.png"),
     ("詳細: E2E計画スタック+ガードレール", "意図・運動学・B3・リスク統合選択・v39デカップリング・C7", "detail_e2e.png"),
-    ("詳細: 知覚ヘッド群", "3D検出・unknown・予測・B1レーングラフ・OCC+flow", "detail_heads.png")):
+    ("詳細: 知覚ヘッド群", "3D検出・unknown・予測・B1レーングラフ・OCC+flow", "detail_heads.png"),
+    ("ヘッド構造 I: 幾何系", "レイヤーレベル — レーン/深度/2D/3D箱+unknown/OCC/レーングラフ", "headarch_geometry.png"),
+    ("ヘッド構造 II: 動的・計画系", "レイヤーレベル — 予測/E2E(v36-39)/TL/リスク/B2・B4/LiDARブランチ", "headarch_motion.png")):
     s = slide(ttl, sub)
     pic(s, f"docs/media/{img}", 0.9, 1.6, w=11.5)
 
