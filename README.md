@@ -114,6 +114,13 @@ its ingredients are machine-made:
 <img src="docs/media/architecture.png" width="880" alt="METEOR architecture"/>
 </div>
 
+### Task-level detail diagrams
+
+| | |
+|---|---|
+| <img src="docs/media/detail_bev.png" alt="BEV generation"/> | <img src="docs/media/detail_temporal.png" alt="temporal memory"/> |
+| <img src="docs/media/detail_e2e.png" alt="E2E planning + guardrails"/> | <img src="docs/media/detail_heads.png" alt="perception heads"/> |
+
 The signature block is the **depth-gated IPM**: BEV grid points are projected into every
 camera (K/T), context features are `grid_sample`d, and each sample is **gated by the
 predicted depth probability at its true range** — depth acts as a learned visibility valve

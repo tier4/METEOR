@@ -151,8 +151,17 @@ bullets(s, [
 ], y=1.45, size=18)
 
 # 3 architecture --------------------------------------------------------
-s = slide("全体アーキテクチャ (v29)", "8 cam → depth-gated IPM → BEV 96ch → 3-slot memory → 12 heads")
+s = slide("全体アーキテクチャ (v38/v39)", "8 cam → depth-gated IPM → BEV 96ch → 3-slot memory → 12 heads + optional LiDAR/intent")
 pic(s, "docs/media/architecture.png", 0.65, 1.5, w=12.0)
+
+# 3.1-3.4 task detail diagrams -------------------------------------------
+for ttl, sub, img in (
+    ("詳細: BEV生成", "depth-gated IPM + オプションLiDAR (C6a/C6b) — ゼロ入力=カメラオンリーbit一致", "detail_bev.png"),
+    ("詳細: 時系列メモリとtask routing", "3スロット+B2ゲート・幾何=RAW/動的=FUSED・運動残差", "detail_temporal.png"),
+    ("詳細: E2E計画スタック+ガードレール", "意図・運動学・B3・リスク統合選択・v39デカップリング・C7", "detail_e2e.png"),
+    ("詳細: 知覚ヘッド群", "3D検出・unknown・予測・B1レーングラフ・OCC+flow", "detail_heads.png")):
+    s = slide(ttl, sub)
+    pic(s, f"docs/media/{img}", 0.9, 1.6, w=11.5)
 
 # 4 BEV generation ------------------------------------------------------
 s = slide("BEV生成: 深度ゲート IPM", "学習するのは「どの画素を信じるか」だけ")

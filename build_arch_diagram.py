@@ -50,7 +50,8 @@ def arrow(x1, y1, x2, y2, lw=1.6, col=DARK):
 box(1, 62, 17, 12, "8 cameras", "3ch 432×768\nWIDE/L/R/NARROW ×F/B", fc=IN, fs=11)
 box(1, 46, 17, 8.5, "Calibration K/T", "used by IPM only", fc=IN, fs=10.5)
 box(1, 33, 17, 8.5, "Speed v0", "used by E2E only", fc=IN, fs=10.5)
-box(1, 18, 17, 9.5, "Ego pose", "→ warp θ ×3 slots", fc=IN, fs=10.5)
+box(1, 18, 17, 9.5, "Ego pose", "→ warp θ ×3 slots\n+ kin history (v36)", fc=IN, fs=10.5)
+box(1, 4, 17, 11, "OPTIONAL inputs", "LiDAR depth / pillar raster\nroute intent (nav)\nzeros = camera-only,\nbit-equal", fc=IN, fs=9.5, sfs=8.0)
 
 # ---- image branch ----
 box(23, 62, 20, 12, "ResNet-34 + FPN",
@@ -70,7 +71,7 @@ box(84, 40, 22, 12.5, "Depth-gated IPM",
     "project (K/T) · grid_sample\n· gather — parameter-free", fc=OP, fs=11.5)
 box(111, 52, 17, 9.5, "RAW BEV", "96ch 800×500 @0.2 m\nsingle frame", fc=OP,
     fs=10.5, sfs=8.6)
-box(111, 33, 17, 11.5, "Temporal fuse", "tfuse3 · 0.6M\nzero-init = identity",
+box(111, 33, 17, 11.5, "Temporal fuse", "tfuse3 + per-cell slot\ngate (B2)",
     fc=MEM, fs=10.5, sfs=8.6)
 box(111, 16, 17, 10.5, "Memory queue", "t−0.4 / 1.2 / 2.8 s\nBEVs, ego-warped",
     fc=MEM, fs=10, sfs=8.4)
@@ -83,11 +84,11 @@ box(152, 70, 36, 10.5, "3D Box head", "CenterPoint @s2 · 2.1M",
     out="→ oriented boxes: veh + VRU", sfs=8.8)
 box(152, 58, 36, 10.5, "Occupancy + flow", "16z×200×200 · 0.75M",
     out="→ 10-class voxels + velocity", sfs=8.8)
-box(152, 46, 36, 10.5, "Lane-graph decoder", "24 anchored slots · 1.4M",
+box(152, 46, 36, 10.5, "Lane-graph decoder", "B1 query decoder (24q, 2L attn)",
     out="→ vector chains + adjacency", sfs=8.8)
 
 # ---- motion heads (from FUSED BEV) ----
-box(152, 32, 36, 10.5, "E2E head (K=3)", "pyramid+MLP(·, v0) · 4.0M",
+box(152, 32, 36, 10.5, "E2E head (K=3)", "attn-pool + intent/kin +\nrisk-integral selection (v38)",
     out="→ 3 paths + conf · steer/accel/brake", fc=E2E, sfs=8.4)
 box(152, 20, 36, 10.5, "Agent forecast (K=3)", "+ class feature · 0.5M",
     out="→ per-agent 3 s ×3 + parked flag", fc=E2E, sfs=8.6)
@@ -111,6 +112,7 @@ for hy in (87, 75, 63, 51):               # raw BEV -> geometry heads
 for hy in (37, 25, 13):                   # fused BEV -> motion heads
     arrow(147, 38, 152, hy, col=AMBER, lw=1.3)
 arrow(18, 37, 152, 34, lw=1.2)            # v0 -> E2E
+arrow(18, 9, 84, 42, lw=1.2, col=AMBER)   # optional LiDAR -> IPM/BEV
 
 # streaming feedback: the raw BEV returns as next frame's history.
 # Routed through the clear gap between the IPM box (ends x=106.6) and the
