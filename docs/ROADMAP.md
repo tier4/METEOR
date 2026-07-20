@@ -3,18 +3,32 @@
 ## Implementation ledger (updated 2026-07-20)
 
 ### Shipped — model/training rounds
-| Round | Date | Model | What went in |
+(🔴 = measured, significant win; effect column = held-out val, before → after)
+
+| Round | Date | What went in | Measured effect |
 |---|---|---|---|
-| r20 | 07-15 | v29 | K=3 WTA multimodal, 3-slot memory queue, lane-graph slots, occ flow; BN-stats isolation fix; per-epoch subset sampler (14%→100% corpus) |
-| r21 | 07-15 | v29 | eps-WTA + diverse mode init (mode-collapse fix); class-aware forecasting (det-feature concat, VRU x2.5) |
-| r22 | 07-16 | v29 | occ dynamic-shadow GT filter; turn oversample x3; tl-w 0.6 (TL 0.28→0.86) |
-| r23 | 07-16..17 | v30/v31 | unknown-object head (occ-blob GT); **C6a optional LiDAR depth-sharpening** (single weights, modality dropout); forecasting motion residual + oncoming x2.5 |
-| r25 | 07-17 | v32 | **C6b LiDAR pillar BEV branch** (host raster, flag-gated residual, zeros = camera-only bit-equal) |
-| r27 | 07-18 | v33 | precision pass: temporal stationary head, det-yaw + heading loss for oncoming, crossing-yaw weight, occ near-ego FP penalty + GT v2 free assertion, edge-weighted depth CE |
-| r28 | 07-18 | v34 | unknown rework (temporal stem, radius 2.0, unk-w 1.0); **C2 failure mining** (mined x2); VRU direction-gate fix |
-| r29/r30 | 07-18..19 | v35/v36 | **B1-B4 TRT-safe transformers** (lane-graph query decoder, temporal slot gate, E2E attention pooling, agent-interaction lite); **ADE pack**: kinematic history, 2x mode-CE, time-weighted waypoints |
-| r31 | 07-19..20 | v37 | **consensus GT v2** (gt_cons; GT-vs-GT ceiling measured at mIoU 0.452, road_edge inherited); **E6 intent tokens**; BEV rotation aug ±10°; ego-w 1.2; distributed ADE probe (8-rank) |
-| r32 | 07-20 (running) | v38 | **C1 risk-integral mode selection (in-training)**; longitudinal 2x weight; speed-profile aux head; e2e-mode mining; 4,547 scenes |
+| r20 | 07-15 | 🔴 **BN-stats isolation for the memory queue** | step-50 probe mIoU **0.213→0.265**, vehP **0.48→0.83** (collapse eliminated) |
+| r20 | 07-15 | 🔴 **Per-epoch subset sampler** | corpus utilisation **14%→100%** at zero compute cost |
+| r21 | 07-15 | 🔴 **eps-WTA + diverse mode init** | K=3 collapse fixed: 1 mode won 80/80 → 3 distinct hypotheses at intersections |
+| r21 | 07-15 | Class-aware forecasting (det-feat concat, VRU x2.5) | vruADE improved; heading root-caused (75.9° → later fixes) |
+| r22 | 07-16 | 🔴 **tl-w 0.6 (task-starvation fix)** | TL accuracy **0.28→0.86** |
+| r22 | 07-16 | occ dynamic-shadow GT filter | near-ego phantom-vehicle GT (18% of near voxels) removed from supervision |
+| r23 | 07-17 | 🔴 **Forecast motion residual + oncoming x2.5** | vehHead **34°→23°** (by r28); oncoming-flip regime (21–51%) broken |
+| r23 | 07-17 | C6a optional LiDAR (depth sharpening) | +lidar ≈ +0.001 mIoU (small; enabled the C6b path) — single-weights dual-mode proven bit-equal |
+| r25 | 07-17 | 🔴 **C6b LiDAR pillar branch** | +lidar delta **+0.001 → +0.004..0.007** and widening |
+| r27 | 07-18 | 🔴 **Crossing-yaw weight + heading loss** | yaw **5.8°→4.7–5.1°**, direction flips **10%→8%** |
+| r27 | 07-18 | 🔴 **TL red recovery** | red class **0.38→0.75** |
+| r27 | 07-18 | Edge-weighted depth CE + top-mode display | object boundaries visibly sharp (display verified; IPM-side effect unquantified) |
+| r28 | 07-18 | 🔴 **VRU direction-gate fix (2.0→1.0 m)** | vruHead **74°→63°** |
+| r28 | 07-18 | C2 failure mining x2 | agentADE best **1.72 m** in the mined round (attribution shared with data growth) |
+| r28→r32 | 07-18.. | v34 unknown rework + v3 GT (occluded→ignore) | [valUnk] **0.00 → P 0.28..0.69** (first useful signal; recall still low) |
+| r29/r30 | 07-19 | 🔴 **B3 attention pooling + ADE pack (time weights)** | ADEc **0.53→0.41 m** (record) |
+| r31 | 07-19 | 🔴 **E6 intent tokens + ego-w 1.2** | probeE2E ADE **0.78→0.67** |
+| r31 | 07-19 | 🔴 **Consensus GT v2 (+ ceiling measurement)** | GT-vs-GT ceiling quantified (mIoU 0.452, laneline 0.19 → plateau explained); laneline probe **0.14→0.162** on clean labels |
+| r31 | 07-19 | BEV rotation aug ±10°; distributed ADE probe | probe coverage **x8** at same wall time; rotation effect judged at r32 end |
+| r32 | 07-20 | C1 in-training risk selection; longitudinal 2x; v(t) aux head | running — gate: ADE ≤ 0.55 |
+
+Unresolved despite attempts: lane graph P/R 0.01 (B1 transformer decoder pending verdict), BEV lane mIoU (GT-noise-limited — see consensus GT), ADE absolute ≤0.5 (in progress, 0.67 now).
 
 ### Shipped — infrastructure / deployment
 | Item | Date | Detail |
