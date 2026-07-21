@@ -229,6 +229,9 @@ def main():
                     help="ego-warped log-odds fusion of BEV seg over time "
                          "(<=45 m; measured: stability .83->.93, "
                          "crosswalk 20-40m +.06)")
+    ap.add_argument("--refiner-ckpt", default=None,
+                    help="apply a trained BEVSegRefiner to the BEV-seg logits "
+                         "(far-range completion; measured road 40-80m +.14)")
     ap.add_argument("--model", default="v8", choices=["v8", "v13", "v13d", "v14d", "v15", "v16", "v17", "v18", "v19", "v20", "v21", "v22", "v23", "v24", "v25", "v26", "v27", "v28", "v29", "v30", "v31", "v32", "v33", "v34", "v35", "v36", "v37", "v38", "v39"],
                     help="v8=DepthGatedIPMNet(512) / v13=DepthSegIPMNet(768) / v13d=stride-4 depth")
     ap.add_argument("--show-seg2d", action="store_true",
@@ -282,6 +285,17 @@ def main():
         SEG2D_PAL[:] = 0
         SEG2D_PAL[:21] = SEG21_PAL[:, ::-1]
     m.load_state_dict(torch.load(args.ckpt, map_location="cpu")["model"])
+    refiner = None
+    if args.refiner_ckpt:
+        from bevlane.model import BEVSegRefiner, N_CLASSES
+        ck = torch.load(args.refiner_ckpt, map_location="cpu")
+        ra = ck.get("args", {})
+        refiner = BEVSegRefiner(N_CLASSES, ctx_ch=ra.get("ctx", 0),
+                                width=ra.get("width", 48)).cuda().eval()
+        refiner.load_state_dict(ck["refiner"])
+        refiner._ctx = ra.get("ctx", 0)
+        print(f"[refiner] loaded {args.refiner_ckpt} "
+              f"(ctx={ra.get('ctx', 0)}, epoch={ck.get('epoch')})", flush=True)
     dbins = torch.arange(m.D) * m.D_STEP + m.D_MIN
     infer_hw = args.infer_hw or ("none" if args.model in ("v13", "v13d", "v14d", "v15", "v16", "v17", "v18", "v19", "v20", "v21", "v22", "v23", "v25", "v26", "v27", "v28", "v29", "v30", "v31", "v32", "v33", "v34", "v35", "v36", "v37", "v38", "v39") else "288x512")
     ih, iw = (None, None) if infer_hw == "none" else \
@@ -399,6 +413,11 @@ def main():
                            m(imgs_m[None].cuda(), K[None].cuda(),
                              T[None].cuda()))
             seg, dlog = out[0], out[1]        # v13 returns (seg, depth, seg2d)
+            if refiner is not None:           # far-range completion refiner
+                with torch.autocast("cuda", torch.float16):
+                    ctx = m.lane_input().float() if getattr(
+                        refiner, "_ctx", 0) else None
+                    seg = refiner(seg.float(), ctx)
             pred = seg.argmax(1)[0].cpu().numpy().astype(np.uint8)
             if args.seg_fuse:
                 # temporal log-odds fusion in the ego frame (static classes):
