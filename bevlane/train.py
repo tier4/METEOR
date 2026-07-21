@@ -103,12 +103,26 @@ def lovasz_softmax(logits, gt, classes=None, ignore=0):
     return total / max(n, 1)
 
 
-def boundary_weight(gt, radius=2, w=4.0):
-    """Per-pixel weight map: `w` on cells within `radius` of a class boundary."""
+def boundary_weight(gt, radius=2, w=4.0, ignore_unlabeled=False):
+    """Per-pixel weight map: `w` on cells within `radius` of a class boundary.
+
+    ignore_unlabeled: exclude boundaries against class 0 (unlabeled / black).
+    That edge is just the moving rim of the observed BEV area, not a real
+    semantic boundary; weighting it trains the model to draw a sharp,
+    frame-unstable line against the don't-care region. With this on, a cell
+    is a boundary only when its neighborhood holds >=2 LABELED classes."""
     g = gt.float().unsqueeze(1)
-    mx = F.max_pool2d(g, 2 * radius + 1, 1, radius)
-    mn = -F.max_pool2d(-g, 2 * radius + 1, 1, radius)
-    bnd = (mx != mn).float().squeeze(1)      # neighborhood has >1 label
+    if ignore_unlabeled:
+        # min over labeled cells only: push class 0 to a large value so it is
+        # never the neighborhood minimum (black cannot create an edge)
+        gpos = torch.where(g == 0, torch.full_like(g, 1e4), g)
+        mx = F.max_pool2d(g, 2 * radius + 1, 1, radius)          # black=0 low
+        mn = -F.max_pool2d(-gpos, 2 * radius + 1, 1, radius)     # ignores black
+        bnd = ((mx != mn) & (mx > 0) & (mn < 1e3)).float().squeeze(1)
+    else:
+        mx = F.max_pool2d(g, 2 * radius + 1, 1, radius)
+        mn = -F.max_pool2d(-g, 2 * radius + 1, 1, radius)
+        bnd = (mx != mn).float().squeeze(1)      # neighborhood has >1 label
     return 1.0 + (w - 1.0) * bnd
 
 
@@ -828,6 +842,11 @@ def main():
                     help="extra loss weight at far rows (linear, max 1+far_w)")
     ap.add_argument("--boundary-w", type=float, default=0.0,
                     help="extra CE weight near class boundaries (sharpening)")
+    ap.add_argument("--seg-ignore-unlabeled", action="store_true",
+                    help="treat BEV-seg class 0 (black/unlabeled) as strict "
+                         "don't-care: exclude it from boundary weighting so "
+                         "the moving rim of the observed area is not trained "
+                         "(black is already ignored by CE/dice/tversky/lovasz)")
     ap.add_argument("--lovasz-w", type=float, default=0.0,
                     help="Lovasz-Softmax loss weight (IoU-direct, sharp edges)")
     ap.add_argument("--tversky-w", type=float, default=0.0,
@@ -1226,8 +1245,9 @@ def main():
                             / ((H2 - 1) / 2)
                         wmap = wmap * wrow.view(1, -1, 1)
                     if args.boundary_w > 0:      # sharpen class boundaries
-                        wmap = wmap * boundary_weight(gt, radius=2,
-                                                      w=1 + args.boundary_w)
+                        wmap = wmap * boundary_weight(
+                            gt, radius=2, w=1 + args.boundary_w,
+                            ignore_unlabeled=args.seg_ignore_unlabeled)
                     loss = loss + args.seg_w * (ce * wmap).mean()
                 if args.dice_w > 0:
                     loss = loss + args.dice_w * dice_loss(
