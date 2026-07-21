@@ -116,3 +116,31 @@ vegetation / building / pole+sign, 255 = never observed.
 - **Scene selection** — indoor/underground scenes are detected by panoptic
   `sky` counts (NDT pose drift makes speed-based filtering unreliable);
   pose-jump frames are discarded.
+
+## Data cleansing (ego localization & near-field road)
+
+Cross-vehicle recordings need three independent checks before/after conversion
+(portable to any t4dataset batch — thresholds derive from pose rate + sensor
+geometry, not from a specific dataset):
+
+- **Ego-pose yaw convention** (`bevlane/clean_ego_pose.py`) — some recordings
+  express the ego forward axis along body +y instead of +x, so the pose yaw sits a
+  constant 90° off the true heading; left uncorrected the map accumulation and every
+  ego-frame crop are rotated 90°. Detected by the median heading-vs-motion error and
+  fixed **per scene** (measured offset rounded to a multiple of 90°; a blanket
+  correction breaks scenes that were already right). Non-destructive: writes a clean
+  mirror and repoints the read root.
+- **Broken localization** (`bevlane/scan_pose_quality.py`, reads the *corrected*
+  poses) — **teleport**: consecutive high-rate pose steps > 8 m (NDT/GNSS jumps) →
+  smeared, unusable map → excluded; **drift**: median heading-vs-motion error > 20°
+  with no jump → mild lane-line ghosting → watch-list, usually kept. Detect jumps by
+  step *distance*, not speed (near-duplicate timestamps give false speed spikes).
+- **Near-field road holes** (fill in `autolabel_bev.process_scene`, `EGO_FILL_R`;
+  post-process `bevlane/fill_ego_path.py`) — near the ego the LiDAR is blind
+  (< ~1.4 m) and the ground just beyond projects onto the hood / into the nadir gap
+  between the outward cameras, so the driven strip gets no panoptic label. Motion
+  backfills it from earlier distant views; where the ego dwells (lights, congestion,
+  parking) it stays empty. The ego is by definition on drivable surface → **stamp
+  ROAD into UNLABELED cells within half a lane of the trajectory** (never overwrites
+  an observed class). Scenes whose ego never travels enough (< ~10 m) to form a road
+  corridor are excluded (BEV is only a near-field blob).

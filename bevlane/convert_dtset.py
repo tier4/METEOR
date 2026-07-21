@@ -11,8 +11,9 @@ import subprocess
 import sys
 from concurrent.futures import ProcessPoolExecutor
 
-B = "/home/umedan/work/BevLane"
-PY = "/home/umedan/comet_venv/bin/python3"
+B = os.environ.get("METEOR_DIR",
+                   os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+PY = os.environ.get("METEOR_PY", sys.executable)
 ENV = dict(os.environ, BEVLANE_ROOT=f"{B}/out/allroot", OMP_NUM_THREADS="1",
            OPENBLAS_NUM_THREADS="1", MKL_NUM_THREADS="1")
 

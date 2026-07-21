@@ -55,6 +55,7 @@ PAINT_ORDER = [ROAD, PARKING, SIDEWALK, CROSSWALK, ROAD_EDGE, MARKING, STOPLINE,
 THIN_PRIORITY = [ROAD_EDGE, MARKING, STOPLINE, LANELINE]
 THIN_CLASSES = np.array([ROAD_EDGE, MARKING, STOPLINE, LANELINE], dtype=np.uint8)
 AREA_CLASSES = [ROAD, SIDEWALK, PARKING, CROSSWALK]
+EGO_FILL_R = 1.75    # m: half a lane; road stamped under the ego path (blind zone)
 
 PALETTE = np.array([
     [0, 0, 0],        # unlabeled
@@ -312,6 +313,24 @@ def process_scene(scene_dir, out_dir, stride=10, max_frames=None, res=0.1,
 
     # ---- rasterize
     bev = rasterize(counts)
+
+    # ego-path road fill: near the ego the LiDAR is blind (< ~1.4 m) and the
+    # ground just beyond it projects onto the hood / into the nadir gap between
+    # the outward cameras, so the driven strip gets no panoptic label and reads
+    # as a hole. Normally motion backfills it from earlier distant views; where
+    # the ego dwells (lights, congestion, parking) it stays empty. The ego is by
+    # definition on drivable surface -> stamp ROAD into UNLABELED cells within
+    # half a lane of the trajectory (never overwrites an observed class).
+    ego_fill = np.zeros((H, W), np.uint8)
+    tix_f = ((traj[:, 0] - xmin) / res).astype(np.int32)
+    tiy_f = ((traj[:, 1] - ymin) / res).astype(np.int32)
+    r_px = max(1, int(round(EGO_FILL_R / res)))
+    for x, y in zip(tix_f, tiy_f):
+        cv2.circle(ego_fill, (int(x), int(y)), r_px, 1, -1)
+    fillm = (ego_fill > 0) & (bev == UNLABELED)
+    bev[fillm] = ROAD
+    min_dist[fillm] = np.minimum(min_dist[fillm], 0.0)  # keep in <=20 m mask
+
     np.save(os.path.join(out_dir, "bev_label.npy"), bev)
     np.savez_compressed(os.path.join(out_dir, "bev_counts.npz"), counts=counts,
                         min_dist=min_dist)
