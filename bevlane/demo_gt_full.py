@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
-"""Full GT visualisation video: all 6 supervision targets, no model.
+"""Full GT visualisation video: all 8 supervision targets, no model.
 
 Top 2x4 grid: cached RGB + 21-class seg2d21 GT overlay + 10-class 2D bbox GT.
+Middle 2x4 grid: dense metric depth GT (stride-4, TURBO 0-80 m, black=invalid).
+Bottom: 3D occupancy GT (voxel-cube isometric + top-down) with class legend.
 Right column: BEV gt_vec (+-25 x +-60 m) + oriented 3D-box GT outlines +
 E2E GT (green trajectory waypoints, v0/steer/accel/brake gauges).
 """
@@ -16,23 +18,49 @@ import numpy as np
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from autolabel_bev import PALETTE  # noqa: E402
+from bevlane.demo_occ_gt import cube_render  # noqa: E402
 from bevlane.extract_bbox2d import CAT2DET, DET10_PAL  # noqa: E402
+from bevlane.extract_occ import OCC_NAMES, OCC_PAL  # noqa: E402
 from bevlane.extract_seg2d import CAMS, SEG21_PAL  # noqa: E402
 from bevlane.postproc import crop_bev, draw_ego_and_grid, thin_road_edge  # noqa: E402
 
 DET10_ABBR = ["obs", "car", "trk", "bus", "bcy", "mcy", "ped", "pnt", "tl", "ts"]
 CAM8 = ["CAM_FRONT_LEFT", "CAM_FRONT_WIDE", "CAM_FRONT_RIGHT", "CAM_FRONT_NARROW",
         "CAM_BACK_LEFT", "CAM_BACK_WIDE", "CAM_BACK_RIGHT", "CAM_BACK_NARROW"]
+DCAMS = ["CAM_FRONT_WIDE", "CAM_FRONT_LEFT", "CAM_FRONT_RIGHT",
+         "CAM_BACK_WIDE", "CAM_BACK_LEFT", "CAM_BACK_RIGHT",
+         "CAM_FRONT_NARROW", "CAM_BACK_NARROW"]
 GTP = np.zeros((256, 3), np.uint8)
 GTP[:len(PALETTE)] = PALETTE
 
 
+def occ_topdown(occ, size):
+    """Top-down occupancy: highest occupied voxel wins, +x forward = up."""
+    img = np.zeros((occ.shape[1], occ.shape[2], 3), np.uint8)
+    img[(occ != 255).any(0)] = (35, 35, 35)          # observed free
+    for z in range(occ.shape[0]):
+        o = occ[z]
+        m = (o > 0) & (o != 255)
+        img[m] = OCC_PAL[o[m]][:, ::-1]
+    img = cv2.resize(img, (size, size), interpolation=cv2.INTER_NEAREST)
+    cv2.drawMarker(img, (size // 2, size // 2), (0, 255, 0),
+                   cv2.MARKER_TRIANGLE_UP, 14, 2)
+    return img
+
+
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--scenes", nargs="+", required=True)
+    ap.add_argument("--scenes", nargs="+")
     ap.add_argument("--out", default="out/demo_gt_full.mp4")
     ap.add_argument("--fps", type=int, default=15)
+    ap.add_argument("--frame-stride", type=int, default=1,
+                    help="sample every Nth manifest frame (dataset-wide overview)")
+    ap.add_argument("--scenes-file", help="read scene list from a file instead")
     args = ap.parse_args()
+    if args.scenes_file:
+        args.scenes = [s for s in open(args.scenes_file).read().split() if s]
+    if not args.scenes:
+        ap.error("provide --scenes or --scenes-file")
     VW, VH = 1920, 1080
     raw = args.out.replace(".mp4", "_raw.mp4")
     vw = cv2.VideoWriter(raw, cv2.VideoWriter_fourcc(*"mp4v"), args.fps, (VW, VH))
@@ -45,7 +73,7 @@ def main():
         except Exception:
             ego = None
         cw, ch = 373, 210
-        for f in man["frames"]:
+        for f in man["frames"][::args.frame_stride]:
             fi = f["frame"]
             seg = None
             if f.get("seg2d21"):
@@ -58,6 +86,23 @@ def main():
                 try:
                     z = np.load(f"{root}/" + f["bbox2d"])
                     bb2 = (z["boxes"], z["counts"])
+                except Exception:
+                    pass
+            dep = None
+            if f.get("depth4"):
+                try:
+                    d6 = np.load(f"{root}/" + f["depth4"])["depth"].astype(np.float32)
+                    if f.get("depth4n"):
+                        dn = np.load(f"{root}/" + f["depth4n"])["depth"].astype(np.float32)
+                    else:
+                        dn = np.zeros((2,) + d6.shape[1:], np.float32)
+                    dep = np.concatenate([d6, dn], 0)
+                except Exception:
+                    pass
+            occ = None
+            if f.get("occ"):
+                try:
+                    occ = np.load(f"{root}/" + f["occ"])["occ"]
                 except Exception:
                     pass
             frame = np.zeros((VH, VW, 3), np.uint8)
@@ -98,6 +143,49 @@ def main():
             cv2.putText(frame, "RGB + GT: 21cls 2D Seg overlay + 10cls 2D BBox",
                         (10, 28), cv2.FONT_HERSHEY_SIMPLEX, 0.6,
                         (220, 220, 220), 1, cv2.LINE_AA)
+
+            # ---- depth GT grid (2x4, same cam layout as RGB) ----
+            dw, dh, dy0 = 280, 158, 505
+            if dep is not None:
+                for k, chn in enumerate(CAM8):
+                    r, c = divmod(k, 4)
+                    d = dep[DCAMS.index(chn)]
+                    dc = cv2.applyColorMap(
+                        np.clip(d / 80 * 255, 0, 255).astype(np.uint8),
+                        cv2.COLORMAP_TURBO)
+                    dc[d <= 0.1] = (0, 0, 0)          # invalid = black
+                    dc = cv2.resize(dc, (dw, dh), interpolation=cv2.INTER_NEAREST)
+                    cv2.putText(dc, chn.split("CAM_")[-1], (6, 16),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.4,
+                                (255, 255, 255), 1, cv2.LINE_AA)
+                    frame[dy0 + r * dh:dy0 + (r + 1) * dh,
+                          8 + c * dw:8 + (c + 1) * dw] = dc
+            cv2.putText(frame, "depth GT (stride-4 dense, TURBO 0-80m, black=invalid)",
+                        (10, dy0 - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.55,
+                        (220, 220, 220), 1, cv2.LINE_AA)
+
+            # ---- 3D occupancy GT: top-down + voxel-cube isometric ----
+            if occ is not None:
+                td = occ_topdown(occ, 316)
+                frame[dy0:dy0 + 316, 1150:1150 + 316] = td
+                cv2.putText(frame, "occ GT top-down +-40m", (1150, dy0 - 10),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.55,
+                            (220, 220, 220), 1, cv2.LINE_AA)
+                cube = cube_render(occ, W=700, H=238, rng_m=24.0)
+                frame[832:832 + 238, 8:8 + 700] = cube
+                cv2.putText(frame, "occ GT voxels (iso, +-24m, z<3m, bldg hidden)",
+                            (10, 852), cv2.FONT_HERSHEY_SIMPLEX, 0.55,
+                            (220, 220, 220), 1, cv2.LINE_AA)
+                for li, nm in enumerate(OCC_NAMES):
+                    r, c = divmod(li, 4)
+                    x0, y0 = 740 + c * 190, 880 + r * 34
+                    col = tuple(int(v) for v in OCC_PAL[li][::-1])
+                    cv2.rectangle(frame, (x0, y0), (x0 + 20, y0 + 20), col, -1)
+                    cv2.rectangle(frame, (x0, y0), (x0 + 20, y0 + 20),
+                                  (90, 90, 90), 1)
+                    cv2.putText(frame, nm, (x0 + 28, y0 + 16),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.48,
+                                (200, 200, 200), 1, cv2.LINE_AA)
 
             # ---- BEV GT column ----
             gt = cv2.imread(f"{root}/" + f.get("gt_vec", "_"), 0)
@@ -187,7 +275,7 @@ def main():
                             cv2.LINE_AA)
                 frame[40:40 + BH2, VW - BW2 - 8:VW - 8] = bev
             cv2.putText(frame, f"{scene.split('+0900_')[-1]}  f{fi:03d}  |  "
-                        "GROUND TRUTH (all 6 tasks)", (10, VH - 18),
+                        "GROUND TRUTH (all 8 tasks)", (740, VH - 40),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.62, (0, 255, 0), 1, cv2.LINE_AA)
             vw.write(frame)
             n += 1
