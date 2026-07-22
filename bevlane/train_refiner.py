@@ -82,6 +82,10 @@ def main():
                     help="raw-BEV context channels into refiner (0=off, 96=on)")
     ap.add_argument("--far-w", type=float, default=3.0,
                     help="extra CE weight ramp toward the far rows")
+    ap.add_argument("--bg-w", type=float, default=0.5,
+                    help="class-0 (black/background) loss weight; >0 trains "
+                         "black as a real class so road does not bleed into "
+                         "the unobserved background (0 = don't-care)")
     ap.add_argument("--lovasz-w", type=float, default=0.3)
     ap.add_argument("--workers", type=int, default=4)
     ap.add_argument("--limit-train", type=int, default=0)
@@ -139,7 +143,13 @@ def main():
               f"val {len(va)} / {len(val_s)} scenes; world={world} lr={lr:.1e}",
               flush=True)
 
+    # class 0 (black / unlabeled) is trained as a REAL class here, not
+    # don't-care: give it a moderate weight so the refiner learns to predict
+    # background off-road instead of bleeding road into the unobserved area.
+    # gt_cons labels road out to ~80 m (drive-accumulated), so far-range road
+    # completion is preserved while the off-road region is pushed to black.
     cw = CLASS_W.clone().to(device)
+    cw[0] = args.bg_w
     opt = torch.optim.AdamW(net0.parameters(), lr=lr, weight_decay=1e-4)
     steps = args.epochs * (args.limit_train or len(dl))
     sched = torch.optim.lr_scheduler.OneCycleLR(
@@ -161,12 +171,11 @@ def main():
                 ctx = frozen.lane_input().float() if args.ctx else None
             with torch.autocast("cuda", torch.float16):
                 ref = refiner(logits, ctx)
-                # class 0 (black / unlabeled) is skipped by CE (ignore_index)
-                # but kept in the mean() denominator: normalizing it OUT made
-                # the refiner over-predict road into the mostly-black far field
-                # (road bled into the background), so we revert to plain mean.
+                # black (class 0) trained as a real class (ignore nothing):
+                # weighted by cw[0]=args.bg_w so the refiner is penalised for
+                # predicting road in the unobserved background -> no road bleed.
                 ce = F.cross_entropy(ref.float(), gt, weight=cw,
-                                     ignore_index=0, reduction="none")
+                                     ignore_index=-100, reduction="none")
                 H2 = ce.shape[-2]
                 rows = torch.arange(H2, device=device, dtype=ce.dtype)
                 # ramp toward the top rows (far forward = row 0)
