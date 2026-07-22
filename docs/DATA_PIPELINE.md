@@ -132,9 +132,15 @@ geometry, not from a specific dataset):
   mirror and repoints the read root.
 - **Broken localization** (`bevlane/scan_pose_quality.py`, reads the *corrected*
   poses) — **teleport**: consecutive high-rate pose steps > 8 m (NDT/GNSS jumps) →
-  smeared, unusable map → excluded; **drift**: median heading-vs-motion error > 20°
-  with no jump → mild lane-line ghosting → watch-list, usually kept. Detect jumps by
-  step *distance*, not speed (near-duplicate timestamps give false speed spikes).
+  smeared, unusable map → excluded; **yaw-bias**: a *consistent* signed heading-vs-
+  motion offset (|median signed| > 6°) → the whole scene's ego-frame GT (BEV, box
+  yaw, trajectory) is rotated by that angle → excluded; **drift**: large median
+  *absolute* heading error > 20° with no jump/bias (variable, e.g. heavy low-speed
+  maneuvering) → mild ghosting → watch-list, usually kept. Two detection pitfalls:
+  detect jumps by step *distance* not speed (near-duplicate timestamps give false
+  speed spikes), and use the *signed* median for bias — a ~10° constant bias hides
+  under the 20° absolute-error threshold but stands out once turning noise (which
+  averages to ~0) is not folded in by an absolute value.
 - **Near-field road holes** (fill in `autolabel_bev.process_scene`, `EGO_FILL_R`;
   post-process `bevlane/fill_ego_path.py`) — near the ego the LiDAR is blind
   (< ~1.4 m) and the ground just beyond projects onto the hood / into the nadir gap
