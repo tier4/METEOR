@@ -260,10 +260,16 @@ def main():
                     loss = loss + args.e2e_w * frozen.ego_loss(
                         r["ego"].float(), ego_gt)
             opt.zero_grad(set_to_none=True)
-            if not torch.isfinite(loss):        # skip a bad batch, don't poison
+            # DDP-safe non-finite guard: ALL ranks must agree, else a rank that
+            # skips backward() deadlocks the others on the grad all-reduce.
+            fin = torch.tensor([float(torch.isfinite(loss))], device=device)
+            if ddp:
+                dist.all_reduce(fin, op=dist.ReduceOp.MIN)   # 0 if any rank bad
+            if fin.item() < 1.0:
                 sched.step(); step += 1
                 if is_main:
-                    print(f"ep{ep} step{step} SKIP non-finite loss", flush=True)
+                    print(f"ep{ep} step{step} SKIP non-finite (all ranks)",
+                          flush=True)
                 continue
             scaler.scale(loss).backward()
             scaler.unscale_(opt)                 # clip in true grad scale
