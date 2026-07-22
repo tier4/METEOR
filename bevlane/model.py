@@ -2532,6 +2532,135 @@ class BEVSegRefiner(nn.Module):
         return seg_logits + self.out(y0)
 
 
+class BEVBoxRefiner(nn.Module):
+    """Residual refiner for the 3D-box head (roadmap 3f, multi-task).
+
+    The box head is a dense BEV representation too (CenterPoint: a centre
+    heatmap + per-cell box regression on the 400x250 det grid), so the same
+    residual-U-Net recipe as the seg refiner applies. It sharpens the centre
+    peaks (recall/precision, esp. far range) and corrects the box regression
+    (size / heading). Input is the FROZEN [hm(2) + reg(6)] maps + a range
+    channel; zero-init last conv => identity at start, so it can only add to
+    the frozen detection (never degrades it)."""
+
+    def __init__(self, width=32):
+        super().__init__()
+        cin = 8 + 1                      # hm(2) + reg(6) + forward-range
+
+        def enc(ci, co):
+            return nn.Sequential(
+                nn.Conv2d(ci, co, 3, stride=2, padding=1, bias=False),
+                nn.BatchNorm2d(co), nn.ReLU(inplace=True), ConvBlock(co, co))
+
+        self.stem = nn.Sequential(
+            nn.Conv2d(cin, width, 3, padding=1, bias=False),
+            nn.BatchNorm2d(width), nn.ReLU(inplace=True))
+        self.d1 = enc(width, width * 2)          # s2
+        self.d2 = enc(width * 2, width * 3)       # s4
+        self.d3 = enc(width * 3, width * 4)       # s8 (wide RF over the grid)
+        self.u3 = nn.Conv2d(width * 4, width * 3, 1)
+        self.m2 = ConvBlock(width * 3, width * 3)
+        self.u2 = nn.Conv2d(width * 3, width * 2, 1)
+        self.m1 = ConvBlock(width * 2, width * 2)
+        self.u1 = nn.Conv2d(width * 2, width, 1)
+        self.out = nn.Sequential(
+            nn.Conv2d(width, width, 3, padding=1, bias=False),
+            nn.BatchNorm2d(width), nn.ReLU(inplace=True),
+            nn.Conv2d(width, 8, 1))
+        nn.init.zeros_(self.out[-1].weight)
+        nn.init.zeros_(self.out[-1].bias)
+        self._rng = {}
+
+    def _range(self, h, w, device, dtype):
+        c = self._rng.get((h, w, device, dtype))
+        if c is None:
+            x = (BEV_XH - (torch.arange(h, device=device, dtype=dtype) + 0.5)
+                 * (2 * BEV_XH / h)) / BEV_XH
+            c = x.view(1, 1, h, 1).expand(1, 1, h, w).contiguous()
+            self._rng[(h, w, device, dtype)] = c
+        return c
+
+    def forward(self, hm, reg):
+        x = torch.cat([hm, reg], 1)
+        B, _, H, W = x.shape
+        rng = self._range(H, W, x.device, x.dtype).expand(B, 1, H, W)
+        y = torch.cat([x, rng], 1)
+        s0 = self.stem(y)
+        s1 = self.d1(s0)
+        s2 = self.d2(s1)
+        s3 = self.d3(s2)
+
+        def up(u, skip):
+            return F.interpolate(u, size=skip.shape[-2:], mode="bilinear",
+                                 align_corners=False)
+        y2 = self.m2(s2 + up(self.u3(s3), s2))
+        y1 = self.m1(s1 + up(self.u2(y2), s1))
+        y0 = s0 + up(self.u1(y1), s0)
+        res = self.out(y0)
+        return hm + res[:, :2], reg + res[:, 2:]
+
+
+class E2ERefiner(nn.Module):
+    """Residual second-stage planner for the E2E head (roadmap 3f, multi-task).
+
+    The E2E output is a low-dim vector (K hypotheses x 6 waypoints x 2 +
+    confidences + controls), not a raster, so the refiner is an MLP rather
+    than a U-Net. It sees the predicted plan, the current speed v0, and a
+    pooled summary of the fused BEV (scene context), and predicts a residual
+    correction on the waypoints. Zero-init last layer => identity at start,
+    so the base planner's ADE is preserved and can only improve."""
+
+    def __init__(self, ego_dim, k=EGO_K, ctx_ch=96, hidden=256):
+        super().__init__()
+        self.k = k
+        self.mlp = nn.Sequential(
+            nn.Linear(ego_dim + 1 + ctx_ch, hidden), nn.ReLU(inplace=True),
+            nn.Linear(hidden, hidden), nn.ReLU(inplace=True),
+            nn.Linear(hidden, 12 * k))
+        nn.init.zeros_(self.mlp[-1].weight)
+        nn.init.zeros_(self.mlp[-1].bias)
+
+    def forward(self, ego, v0, fused_bev):
+        ctx = F.adaptive_avg_pool2d(fused_bev, 1).flatten(1).to(ego.dtype)
+        v = v0.view(-1, 1).to(ego.dtype)
+        res = self.mlp(torch.cat([ego, v, ctx], 1))
+        out = ego.clone()
+        out[:, :12 * self.k] = ego[:, :12 * self.k] + res
+        return out
+
+
+class MultiTaskRefiner(nn.Module):
+    """Post-hoc residual refiners for the three priority heads, sharing the
+    single frozen-model forward. Each enabled head is an independent zero-init
+    residual module (BEV seg U-Net, 3D-box U-Net, E2E MLP), so none shares
+    weights with another or with the frozen base -- every task is preserved by
+    construction and only added to. Heads can be enabled independently and
+    deployed separately."""
+
+    def __init__(self, do_seg=True, do_box=True, do_e2e=True,
+                 n_cls=N_CLASSES, seg_width=48, box_width=32, seg_ctx=0,
+                 ego_dim=None, ego_k=EGO_K):
+        super().__init__()
+        self.seg = BEVSegRefiner(n_cls, ctx_ch=seg_ctx,
+                                 width=seg_width) if do_seg else None
+        self.box = BEVBoxRefiner(width=box_width) if do_box else None
+        self.e2e = (E2ERefiner(ego_dim, k=ego_k)
+                    if (do_e2e and ego_dim) else None)
+
+    def forward(self, seg=None, hm=None, reg=None, ego=None, v0=None,
+                fused=None, seg_ctx=None):
+        """Refine whichever frozen outputs are provided; returns a dict. Called
+        through DDP so every enabled head's params are tracked each step."""
+        out = {}
+        if self.seg is not None and seg is not None:
+            out["seg"] = self.seg(seg, seg_ctx)
+        if self.box is not None and hm is not None:
+            out["hm"], out["reg"] = self.box(hm, reg)
+        if self.e2e is not None and ego is not None:
+            out["ego"] = self.e2e(ego, v0, fused)
+        return out
+
+
 MODELS = {"v1": IPMSegNet, "v2": IPMSegNetV2, "v3s": IPMSegNetV3,
           "lss": LSSDepthNet, "v8": DepthGatedIPMNet, "v13": DepthSegIPMNet,
           "v13d": DepthSegIPMNetS4, "v14d": DepthSegIPMNetV14,

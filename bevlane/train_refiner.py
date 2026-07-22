@@ -1,20 +1,23 @@
 #!/usr/bin/env python3
-"""Train the post-hoc BEV-seg refiner (roadmap 3f, r33).
+"""Train post-hoc residual refiners for the three priority heads (roadmap 3f).
 
-A small U-Net (bevlane.model.BEVSegRefiner) that sharpens / completes the
-FROZEN main model's BEV-seg logits, targeting the >50 m dropout. The
-backbone is loaded from an r32/r33 checkpoint and never updated, so this is
-zero-risk to the running training and to near-range accuracy (the refiner is
-residual + zero-init -> identity at start).
+A MultiTaskRefiner (bevlane.model) refines the FROZEN main model's outputs:
+  * BEV seg    -- U-Net residual on the 9-class logits (far-range completion,
+                  black trained as a real class so road does not bleed)
+  * BEV 3D box -- U-Net residual on the [hm+reg] det grid (peak sharpening,
+                  box size/heading correction)
+  * E2E plan   -- MLP residual on the waypoint vector, conditioned on v0 and a
+                  pooled BEV summary (second-stage planner)
 
-Single GPU:
-    python bevlane/train_refiner.py --ckpt out/bevlane_ckpt_r32/last.pt \
-        --model v38 --epochs 4 --batch 8 --out out/refiner_r33
+The base model is loaded from a round checkpoint and never updated (eval,
+requires_grad=False, forward under no_grad), and every head is zero-init
+residual, so all three tasks are preserved by construction and only added to.
+Heads can be enabled independently (--do-seg / --do-box / --do-e2e).
 
 8-GPU DDP:
     torchrun --nproc_per_node=8 bevlane/train_refiner.py \
-        --ckpt out/bevlane_ckpt_r33/last.pt --model v39 --batch 6 \
-        --out out/refiner_r33
+        --ckpt out/bevlane_ckpt_r34/last.pt --model v39 --batch 4 \
+        --do-box --do-e2e --out out/refiner_r34
 """
 import argparse
 import os
@@ -28,68 +31,130 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader, DistributedSampler
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from bevlane.dataset import BevLaneDataset          # noqa: E402
-from bevlane.model import MODELS, BEVSegRefiner, N_CLASSES  # noqa: E402
+from bevlane.dataset import BevLaneDataset                    # noqa: E402
+from bevlane.model import (MODELS, MultiTaskRefiner,          # noqa: E402
+                           N_CLASSES, EGO_K)
 from bevlane.train import (CLASS_NAMES, CLASS_W, lovasz_softmax,  # noqa: E402
                            split_scenes)
 
-# forward-distance bands (rows): x = 80 - r*0.2
+EGO_DIM = 12 * EGO_K + EGO_K + 3
 BANDS = [("40-80m", 0, 200), ("20-40m", 200, 300), ("0-20m", 300, 400)]
 
 
+def _unpack(batch, device, do_box, do_e2e):
+    """Batch layout with only with_boxdet/with_ego enabled: index 4.. runs a
+    counter identical to train.py."""
+    imgs, K, Tc, gt = (batch[i].to(device, non_blocking=True) for i in range(4))
+    bi = 4
+    det_boxes = det_n = ego_gt = None
+    if do_box:
+        det_boxes = batch[bi].to(device, non_blocking=True)
+        det_n = batch[bi + 1].to(device, non_blocking=True)
+        bi += 2
+    if do_e2e:
+        ego_gt = batch[bi].to(device, non_blocking=True)
+        bi += 1
+    return imgs, K, Tc, gt, det_boxes, det_n, ego_gt
+
+
 @torch.no_grad()
-def band_iou(frozen, refiner, loader, device, ctx_ch, max_b=40):
-    frozen.eval(); refiner.eval()
+def evaluate(frozen, ref0, loader, device, args, max_b=40):
+    frozen.eval(); ref0.eval()
     iR = np.zeros((len(BANDS), N_CLASSES)); uR = iR.copy()
     iF = iR.copy(); uF = iR.copy()
+    ade_r = ade_f = nseen = 0.0
+    hm_r = hm_f = 0.0
     for bi, batch in enumerate(loader):
         if bi >= max_b:
             break
-        imgs, K, Tc, gt = (t.to(device, non_blocking=True) for t in batch[:4])
+        imgs, K, Tc, gt, det_boxes, det_n, ego_gt = _unpack(
+            batch, device, args.do_box, args.do_e2e)
+        v0 = ego_gt[:, 12] if args.do_e2e else None
         with torch.autocast("cuda", torch.float16):
-            out = frozen(imgs, K, Tc)
-            logits = (out[0] if isinstance(out, tuple) else out).float()
-            ctx = frozen.lane_input().float() if ctx_ch else None
-            ref = refiner(logits, ctx)
-        pr, pf = logits.argmax(1), ref.argmax(1)
-        m = gt > 0
-        for bidx, (_, r0, r1) in enumerate(BANDS):
-            gb, mb = gt[:, r0:r1], m[:, r0:r1]
-            for c in range(1, N_CLASSES):
-                gi = gb == c
-                pi = (pr[:, r0:r1] == c) & mb
-                iR[bidx, c] += (pi & gi).sum().item()
-                uR[bidx, c] += (pi | gi).sum().item()
-                pi = (pf[:, r0:r1] == c) & mb
-                iF[bidx, c] += (pi & gi).sum().item()
-                uF[bidx, c] += (pi | gi).sum().item()
-    refiner.train()
-    return iR, uR, iF, uF
+            out = frozen(imgs, K, Tc, v0)
+            seg = out[0].float()
+            ctx = frozen.lane_input().float() if args.ctx else None
+            fused = frozen._fused_bev.float() if args.do_e2e else None
+            r = ref0(seg=seg if args.do_seg else None,
+                     hm=out[3].float() if args.do_box else None,
+                     reg=out[4].float() if args.do_box else None,
+                     ego=out[7].float() if args.do_e2e else None,
+                     v0=v0, fused=fused, seg_ctx=ctx)
+        if args.do_seg:
+            pr, pf = seg.argmax(1), r["seg"].argmax(1)
+            m = gt > 0
+            for bidx, (_, r0, r1) in enumerate(BANDS):
+                gb, mb = gt[:, r0:r1], m[:, r0:r1]
+                for c in range(1, N_CLASSES):
+                    gi = gb == c
+                    pi = (pr[:, r0:r1] == c) & mb
+                    iR[bidx, c] += (pi & gi).sum().item()
+                    uR[bidx, c] += (pi | gi).sum().item()
+                    pi = (pf[:, r0:r1] == c) & mb
+                    iF[bidx, c] += (pi & gi).sum().item()
+                    uF[bidx, c] += (pi | gi).sum().item()
+        if args.do_e2e:
+            valid = ego_gt[:, 16] > 0.5
+            if valid.any():
+                gtw = ego_gt[:, :12].view(-1, 6, 2)
+                for tag, ev in (("r", out[7].float()), ("f", r["ego"].float())):
+                    wp = ev[:, :12 * EGO_K].view(-1, EGO_K, 6, 2)
+                    d = (wp - gtw[:, None]).pow(2).sum(-1).sqrt().mean(2)  # [B,K]
+                    ade = d.min(1).values[valid].mean().item()
+                    if tag == "r":
+                        ade_r += ade
+                    else:
+                        ade_f += ade
+                nseen += 1
+    res = {"seg": (iR, uR, iF, uF)}
+    if args.do_e2e and nseen:
+        res["ade"] = (ade_r / nseen, ade_f / nseen)
+    ref0.train()
+    return res
+
+
+def _report(res, ep, step, tag=""):
+    if "seg" in res:
+        iR, uR, iF, uF = res["seg"]
+        if uR.sum():
+            print(f"[refBand ep{ep} step{step}] {tag} seg raw->refined IoU",
+                  flush=True)
+            for c in [1, 3, 4, 5, 6]:
+                row = "  " + CLASS_NAMES[c].ljust(10)
+                for bidx, (nm, _, _) in enumerate(BANDS):
+                    r = iR[bidx, c] / uR[bidx, c] if uR[bidx, c] else float("nan")
+                    f_ = iF[bidx, c] / uF[bidx, c] if uF[bidx, c] else float("nan")
+                    row += f"  {nm} {r:.3f}->{f_:.3f}"
+                print(row, flush=True)
+    if "ade" in res:
+        print(f"[refE2E ep{ep} step{step}] {tag} ADE raw->refined "
+              f"{res['ade'][0]:.3f}->{res['ade'][1]:.3f}", flush=True)
 
 
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--root", default="out/bevlane")
     ap.add_argument("--ckpt", required=True, help="frozen main-model ckpt")
-    ap.add_argument("--model", default="v38")
+    ap.add_argument("--model", default="v39")
     ap.add_argument("--gt-key", default="gt_cons")
     ap.add_argument("--n-seg2d", type=int, default=21)
-    ap.add_argument("--epochs", type=int, default=4)
-    ap.add_argument("--batch", type=int, default=8)
+    ap.add_argument("--epochs", type=int, default=3)
+    ap.add_argument("--batch", type=int, default=4)
     ap.add_argument("--lr", type=float, default=0.0)
     ap.add_argument("--width", type=int, default=48)
-    ap.add_argument("--ctx", type=int, default=0,
-                    help="raw-BEV context channels into refiner (0=off, 96=on)")
-    ap.add_argument("--far-w", type=float, default=3.0,
-                    help="extra CE weight ramp toward the far rows")
-    ap.add_argument("--bg-w", type=float, default=0.5,
-                    help="class-0 (black/background) loss weight; >0 trains "
-                         "black as a real class so road does not bleed into "
-                         "the unobserved background (0 = don't-care)")
+    ap.add_argument("--ctx", type=int, default=0)
+    ap.add_argument("--far-w", type=float, default=3.0)
+    ap.add_argument("--bg-w", type=float, default=0.5)
     ap.add_argument("--lovasz-w", type=float, default=0.3)
+    ap.add_argument("--do-seg", action="store_true", default=True)
+    ap.add_argument("--no-seg", dest="do_seg", action="store_false")
+    ap.add_argument("--do-box", action="store_true", default=False)
+    ap.add_argument("--do-e2e", action="store_true", default=False)
+    ap.add_argument("--box-w", type=float, default=1.0)
+    ap.add_argument("--e2e-w", type=float, default=1.0)
     ap.add_argument("--workers", type=int, default=4)
     ap.add_argument("--limit-train", type=int, default=0)
-    ap.add_argument("--out", default="out/refiner_r33")
+    ap.add_argument("--out", default="out/refiner_r34")
     args = ap.parse_args()
 
     ddp = "RANK" in os.environ
@@ -108,30 +173,34 @@ def main():
 
     train_s, val_s = split_scenes(args.root)
 
-    # frozen backbone
-    mkw = {"n_seg": args.n_seg2d}
-    frozen = MODELS[args.model](**mkw).to(device)
+    # frozen backbone (eval, no grad)
+    frozen = MODELS[args.model](n_seg=args.n_seg2d).to(device)
     sd = torch.load(args.ckpt, map_location="cpu")
     sd = sd.get("model", sd)
     miss, unexp = frozen.load_state_dict(sd, strict=False)
-    if is_main:
-        print(f"[frozen] {args.ckpt} missing={len(miss)} unexpected={len(unexp)}",
-              flush=True)
     frozen.eval()
     for p in frozen.parameters():
         p.requires_grad_(False)
 
-    refiner = BEVSegRefiner(N_CLASSES, ctx_ch=args.ctx, width=args.width).to(device)
-    n_par = sum(p.numel() for p in refiner.parameters()) / 1e6
+    ref = MultiTaskRefiner(do_seg=args.do_seg, do_box=args.do_box,
+                           do_e2e=args.do_e2e, n_cls=N_CLASSES,
+                           seg_width=args.width, seg_ctx=args.ctx,
+                           ego_dim=EGO_DIM).to(device)
     if is_main:
-        print(f"[refiner] width={args.width} ctx={args.ctx} "
-              f"params={n_par:.2f}M (residual, zero-init=identity)", flush=True)
-    refiner = DDP(refiner, device_ids=[local]) if ddp else refiner
-    net0 = refiner.module if ddp else refiner
+        n_par = sum(p.numel() for p in ref.parameters()) / 1e6
+        print(f"[frozen] {args.ckpt} missing={len(miss)} unexpected={len(unexp)}",
+              flush=True)
+        print(f"[refiner] heads: seg={args.do_seg} box={args.do_box} "
+              f"e2e={args.do_e2e} | params={n_par:.2f}M (zero-init residual)",
+              flush=True)
+    ref = DDP(ref, device_ids=[local]) if ddp else ref
+    ref0 = ref.module if ddp else ref
 
-    tr = BevLaneDataset(args.root, train_s, gt_key=args.gt_key, with_depth=False)
+    tr = BevLaneDataset(args.root, train_s, gt_key=args.gt_key, with_depth=False,
+                        with_boxdet=args.do_box, with_ego=args.do_e2e)
     va = BevLaneDataset(args.root, val_s, max_per_scene=4, gt_key=args.gt_key,
-                        with_depth=False)
+                        with_depth=False, with_boxdet=args.do_box,
+                        with_ego=args.do_e2e)
     sampler = DistributedSampler(tr) if ddp else None
     dl = DataLoader(tr, batch_size=args.batch, shuffle=sampler is None,
                     sampler=sampler, num_workers=args.workers, pin_memory=True,
@@ -143,14 +212,9 @@ def main():
               f"val {len(va)} / {len(val_s)} scenes; world={world} lr={lr:.1e}",
               flush=True)
 
-    # class 0 (black / unlabeled) is trained as a REAL class here, not
-    # don't-care: give it a moderate weight so the refiner learns to predict
-    # background off-road instead of bleeding road into the unobserved area.
-    # gt_cons labels road out to ~80 m (drive-accumulated), so far-range road
-    # completion is preserved while the off-road region is pushed to black.
     cw = CLASS_W.clone().to(device)
     cw[0] = args.bg_w
-    opt = torch.optim.AdamW(net0.parameters(), lr=lr, weight_decay=1e-4)
+    opt = torch.optim.AdamW(ref0.parameters(), lr=lr, weight_decay=1e-4)
     steps = args.epochs * (args.limit_train or len(dl))
     sched = torch.optim.lr_scheduler.OneCycleLR(
         opt, max_lr=lr, total_steps=steps, pct_start=0.1)
@@ -160,30 +224,41 @@ def main():
     for ep in range(args.epochs):
         if ddp:
             sampler.set_epoch(ep)
-        for bi, batch in enumerate(dl):
-            if args.limit_train and bi >= args.limit_train:
+        for bidx, batch in enumerate(dl):
+            if args.limit_train and bidx >= args.limit_train:
                 break
-            imgs, K, Tc, gt = (t.to(device, non_blocking=True)
-                               for t in batch[:4])
+            imgs, K, Tc, gt, det_boxes, det_n, ego_gt = _unpack(
+                batch, device, args.do_box, args.do_e2e)
+            v0 = ego_gt[:, 12] if args.do_e2e else None
             with torch.no_grad(), torch.autocast("cuda", torch.float16):
-                out = frozen(imgs, K, Tc)
-                logits = (out[0] if isinstance(out, tuple) else out).float()
+                out = frozen(imgs, K, Tc, v0)
+                seg = out[0].float()
+                hm = out[3].float() if args.do_box else None
+                reg = out[4].float() if args.do_box else None
+                ego = out[7].float() if args.do_e2e else None
                 ctx = frozen.lane_input().float() if args.ctx else None
+                fused = frozen._fused_bev.float() if args.do_e2e else None
             with torch.autocast("cuda", torch.float16):
-                ref = refiner(logits, ctx)
-                # black (class 0) trained as a real class (ignore nothing):
-                # weighted by cw[0]=args.bg_w so the refiner is penalised for
-                # predicting road in the unobserved background -> no road bleed.
-                ce = F.cross_entropy(ref.float(), gt, weight=cw,
-                                     ignore_index=-100, reduction="none")
-                H2 = ce.shape[-2]
-                rows = torch.arange(H2, device=device, dtype=ce.dtype)
-                # ramp toward the top rows (far forward = row 0)
-                wrow = 1 + args.far_w * (1 - rows / (H2 - 1)).clamp(min=0)
-                loss = (ce * wrow.view(1, -1, 1)).mean()
-                if args.lovasz_w > 0:
-                    loss = loss + args.lovasz_w * lovasz_softmax(
-                        ref.float(), gt, ignore=0)
+                r = ref(seg=seg if args.do_seg else None, hm=hm, reg=reg,
+                        ego=ego, v0=v0, fused=fused, seg_ctx=ctx)
+                loss = seg.new_zeros(())
+                if args.do_seg:
+                    rs = r["seg"].float()
+                    ce = F.cross_entropy(rs, gt, weight=cw,
+                                         ignore_index=-100, reduction="none")
+                    H2 = ce.shape[-2]
+                    rows = torch.arange(H2, device=device, dtype=ce.dtype)
+                    wrow = 1 + args.far_w * (1 - rows / (H2 - 1)).clamp(min=0)
+                    loss = loss + (ce * wrow.view(1, -1, 1)).mean()
+                    if args.lovasz_w > 0:
+                        loss = loss + args.lovasz_w * lovasz_softmax(
+                            rs, gt, ignore=0)
+                if args.do_box:
+                    loss = loss + args.box_w * ref0_boxloss(
+                        frozen, r["hm"], r["reg"], det_boxes, det_n)
+                if args.do_e2e:
+                    loss = loss + args.e2e_w * frozen.ego_loss(
+                        r["ego"].float(), ego_gt)
             opt.zero_grad(set_to_none=True)
             scaler.scale(loss).backward()
             scaler.step(opt); scaler.update(); sched.step()
@@ -192,30 +267,24 @@ def main():
                 print(f"ep{ep} step{step}/{steps} loss={loss.item():.4f} "
                       f"lr={sched.get_last_lr()[0]:.2e}", flush=True)
             if is_main and step % 1000 == 0:
-                iR, uR, iF, uF = band_iou(frozen, net0, dv, device, args.ctx)
-                _report(iR, uR, iF, uF, ep, step)
+                _report(evaluate(frozen, ref0, dv, device, args), ep, step)
         if is_main:
-            torch.save({"refiner": net0.state_dict(), "epoch": ep,
+            torch.save({"refiner": ref0.state_dict(), "epoch": ep,
                         "args": vars(args)},
                        os.path.join(args.out, "last.pt"))
             print(f"[ckpt] saved epoch {ep}", flush=True)
     if is_main:
-        iR, uR, iF, uF = band_iou(frozen, net0, dv, device, args.ctx, max_b=120)
-        _report(iR, uR, iF, uF, args.epochs, step, tag="FINAL")
+        _report(evaluate(frozen, ref0, dv, device, args, max_b=120),
+                args.epochs, step, tag="FINAL")
         print("REFINER DONE", flush=True)
     if ddp:
         dist.destroy_process_group()
 
 
-def _report(iR, uR, iF, uF, ep, step, tag=""):
-    print(f"[refBand ep{ep} step{step}] {tag} raw->refined IoU", flush=True)
-    for c in [1, 3, 4, 5, 6]:
-        row = "  " + CLASS_NAMES[c].ljust(10)
-        for bidx, (nm, _, _) in enumerate(BANDS):
-            r = iR[bidx, c] / uR[bidx, c] if uR[bidx, c] else float("nan")
-            f_ = iF[bidx, c] / uF[bidx, c] if uF[bidx, c] else float("nan")
-            row += f"  {nm} {r:.3f}->{f_:.3f}"
-        print(row, flush=True)
+def ref0_boxloss(frozen, hm, reg, boxes, nbox):
+    """Frozen model owns build_det_targets + the focal/L1 box loss; reuse it
+    on the refined maps."""
+    return frozen.boxdet_loss(hm.float(), reg.float(), boxes, nbox)
 
 
 if __name__ == "__main__":
