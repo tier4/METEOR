@@ -2610,9 +2610,15 @@ class E2ERefiner(nn.Module):
     correction on the waypoints. Zero-init last layer => identity at start,
     so the base planner's ADE is preserved and can only improve."""
 
-    def __init__(self, ego_dim, k=EGO_K, ctx_ch=96, hidden=256):
+    def __init__(self, ego_dim, k=EGO_K, ctx_ch=96, hidden=256, max_res=3.0):
         super().__init__()
         self.k = k
+        self.max_res = max_res           # bound the waypoint correction (m)
+        # LayerNorm the concatenated input: the pooled BEV context can have a
+        # large / uncalibrated magnitude, which under fp16 + a high LR blows
+        # the MLP up to inf -> NaN. Normalising + a tanh-bounded residual keeps
+        # the second-stage planner numerically stable.
+        self.norm = nn.LayerNorm(ego_dim + 1 + ctx_ch)
         self.mlp = nn.Sequential(
             nn.Linear(ego_dim + 1 + ctx_ch, hidden), nn.ReLU(inplace=True),
             nn.Linear(hidden, hidden), nn.ReLU(inplace=True),
@@ -2621,11 +2627,13 @@ class E2ERefiner(nn.Module):
         nn.init.zeros_(self.mlp[-1].bias)
 
     def forward(self, ego, v0, fused_bev):
-        ctx = F.adaptive_avg_pool2d(fused_bev, 1).flatten(1).to(ego.dtype)
-        v = v0.view(-1, 1).to(ego.dtype)
-        res = self.mlp(torch.cat([ego, v, ctx], 1))
-        out = ego.clone()
-        out[:, :12 * self.k] = ego[:, :12 * self.k] + res
+        ctx = F.adaptive_avg_pool2d(fused_bev, 1).flatten(1)
+        v = v0.view(-1, 1)
+        # do the MLP in fp32 for stability (ego_loss has small denominators)
+        x = self.norm(torch.cat([ego.float(), v.float(), ctx.float()], 1))
+        res = torch.tanh(self.mlp(x)) * self.max_res   # zero-init => 0 at start
+        out = ego.clone().float()
+        out[:, :12 * self.k] = ego[:, :12 * self.k].float() + res
         return out
 
 

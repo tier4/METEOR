@@ -260,7 +260,14 @@ def main():
                     loss = loss + args.e2e_w * frozen.ego_loss(
                         r["ego"].float(), ego_gt)
             opt.zero_grad(set_to_none=True)
+            if not torch.isfinite(loss):        # skip a bad batch, don't poison
+                sched.step(); step += 1
+                if is_main:
+                    print(f"ep{ep} step{step} SKIP non-finite loss", flush=True)
+                continue
             scaler.scale(loss).backward()
+            scaler.unscale_(opt)                 # clip in true grad scale
+            torch.nn.utils.clip_grad_norm_(ref0.parameters(), 1.0)
             scaler.step(opt); scaler.update(); sched.step()
             step += 1
             if is_main and step % 100 == 0:
