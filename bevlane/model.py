@@ -2669,6 +2669,40 @@ class MultiTaskRefiner(nn.Module):
         return out
 
 
+class DepthSegIPMNetV40(DepthSegIPMNetV39):
+    """v40 (method A): the multi-task refiner GRAFTED onto the model as
+    trainable post-heads. The seg/box/e2e refiners that were trained as a
+    frozen post-processor (train_refiner.py) become part of the network and
+    are fine-tuned end-to-end in r35, initialised from r34 (48 M base) + the
+    trained refiner (5 M heads). The refiner's learned weights carry forward,
+    the whole 53 M model trains together, and deployment needs no separate
+    refiner engine. Each refiner head is a residual (zero-init when fresh), so
+    at the graft point the combined model reproduces base+refiner behaviour and
+    fine-tuning only adapts it."""
+
+    def __init__(self, *a, **k):
+        super().__init__(*a, **k)
+        self.refiner = MultiTaskRefiner(
+            do_seg=True, do_box=True, do_e2e=True, n_cls=N_CLASSES,
+            ego_dim=12 * EGO_K + EGO_K + 3)
+
+    def forward(self, imgs, K, T_cam_ego, v0=None, prev_bev=None,
+                warp_theta=None, lidar=None, lidar_bev=None, kin=None,
+                intent=None):
+        out = list(super().forward(imgs, K, T_cam_ego, v0, prev_bev,
+                                   warp_theta, lidar=lidar,
+                                   lidar_bev=lidar_bev, kin=kin, intent=intent))
+        B = out[0].shape[0]
+        v0r = v0 if v0 is not None else out[0].new_zeros(B)
+        r = self.refiner(seg=out[0].float(), hm=out[3].float(),
+                         reg=out[4].float(), ego=out[7].float(),
+                         v0=v0r, fused=self._fused_bev.float(), seg_ctx=None)
+        out[0] = r["seg"]
+        out[3], out[4] = r["hm"], r["reg"]
+        out[7] = r["ego"]
+        return tuple(out)
+
+
 MODELS = {"v1": IPMSegNet, "v2": IPMSegNetV2, "v3s": IPMSegNetV3,
           "lss": LSSDepthNet, "v8": DepthGatedIPMNet, "v13": DepthSegIPMNet,
           "v13d": DepthSegIPMNetS4, "v14d": DepthSegIPMNetV14,
@@ -2677,4 +2711,4 @@ MODELS = {"v1": IPMSegNet, "v2": IPMSegNetV2, "v3s": IPMSegNetV3,
           "v19": DepthSegIPMNetV19, "v20": DepthSegIPMNetV20,
           "v21": DepthSegIPMNetV21, "v22": DepthSegIPMNetV22,
           "v23": DepthSegIPMNetV23, "v24": DepthSegIPMNetV24,
-          "v25": DepthSegIPMNetV25, "v26": DepthSegIPMNetV26, "v27": DepthSegIPMNetV27, "v28": DepthSegIPMNetV28, "v29": DepthSegIPMNetV29, "v30": DepthSegIPMNetV30, "v31": DepthSegIPMNetV31, "v32": DepthSegIPMNetV32, "v33": DepthSegIPMNetV33, "v34": DepthSegIPMNetV34, "v35": DepthSegIPMNetV35, "v36": DepthSegIPMNetV36, "v37": DepthSegIPMNetV37, "v38": DepthSegIPMNetV38, "v39": DepthSegIPMNetV39}
+          "v25": DepthSegIPMNetV25, "v26": DepthSegIPMNetV26, "v27": DepthSegIPMNetV27, "v28": DepthSegIPMNetV28, "v29": DepthSegIPMNetV29, "v30": DepthSegIPMNetV30, "v31": DepthSegIPMNetV31, "v32": DepthSegIPMNetV32, "v33": DepthSegIPMNetV33, "v34": DepthSegIPMNetV34, "v35": DepthSegIPMNetV35, "v36": DepthSegIPMNetV36, "v37": DepthSegIPMNetV37, "v38": DepthSegIPMNetV38, "v39": DepthSegIPMNetV39, "v40": DepthSegIPMNetV40}
