@@ -161,18 +161,17 @@ def main():
                 ctx = frozen.lane_input().float() if args.ctx else None
             with torch.autocast("cuda", torch.float16):
                 ref = refiner(logits, ctx)
-                # class 0 (black / unlabeled) is strict don't-care: ignored by
-                # CE and normalized out of the denominator so the far-row ramp
-                # is not diluted by the large unobserved area at long range.
+                # class 0 (black / unlabeled) is skipped by CE (ignore_index)
+                # but kept in the mean() denominator: normalizing it OUT made
+                # the refiner over-predict road into the mostly-black far field
+                # (road bled into the background), so we revert to plain mean.
                 ce = F.cross_entropy(ref.float(), gt, weight=cw,
                                      ignore_index=0, reduction="none")
                 H2 = ce.shape[-2]
                 rows = torch.arange(H2, device=device, dtype=ce.dtype)
                 # ramp toward the top rows (far forward = row 0)
                 wrow = 1 + args.far_w * (1 - rows / (H2 - 1)).clamp(min=0)
-                valid = (gt > 0).float()
-                loss = ((ce * wrow.view(1, -1, 1)).sum()
-                        / valid.sum().clamp(min=1))
+                loss = (ce * wrow.view(1, -1, 1)).mean()
                 if args.lovasz_w > 0:
                     loss = loss + args.lovasz_w * lovasz_softmax(
                         ref.float(), gt, ignore=0)

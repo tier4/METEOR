@@ -414,10 +414,14 @@ def main():
                              T[None].cuda()))
             seg, dlog = out[0], out[1]        # v13 returns (seg, depth, seg2d)
             if refiner is not None:           # far-range completion refiner
-                with torch.autocast("cuda", torch.float16):
+                # MUST be no_grad + detach: this runs outside the model's
+                # no_grad block, so without it the refiner graph (and the
+                # seg-fuse accumulator that derives from it) chains across
+                # every frame and leaks memory until OOM.
+                with torch.no_grad(), torch.autocast("cuda", torch.float16):
                     ctx = m.lane_input().float() if getattr(
                         refiner, "_ctx", 0) else None
-                    seg = refiner(seg.float(), ctx)
+                    seg = refiner(seg.float(), ctx).detach()
             pred = seg.argmax(1)[0].cpu().numpy().astype(np.uint8)
             if args.seg_fuse:
                 # temporal log-odds fusion in the ego frame (static classes):
@@ -440,7 +444,8 @@ def main():
                                                align_corners=False)
                             lp = lp + 0.7 * F.grid_sample(
                                 _SEGACC["acc"], gr, align_corners=False)
-                    _SEGACC.update(scene=s_pre, fi=f_pre["frame"], acc=lp)
+                    _SEGACC.update(scene=s_pre, fi=f_pre["frame"],
+                                   acc=lp.detach())
                     fpred = lp.argmax(1)[0].cpu().numpy().astype(np.uint8)
                     raw = pred.copy()
                     pred[175:] = fpred[175:]              # fuse near field
