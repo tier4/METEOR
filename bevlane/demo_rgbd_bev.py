@@ -287,15 +287,28 @@ def main():
     m.load_state_dict(torch.load(args.ckpt, map_location="cpu")["model"])
     refiner = None
     if args.refiner_ckpt:
-        from bevlane.model import BEVSegRefiner, N_CLASSES
+        from bevlane.model import (BEVSegRefiner, MultiTaskRefiner,  # noqa
+                                   N_CLASSES, EGO_K)
         ck = torch.load(args.refiner_ckpt, map_location="cpu")
         ra = ck.get("args", {})
-        refiner = BEVSegRefiner(N_CLASSES, ctx_ch=ra.get("ctx", 0),
-                                width=ra.get("width", 48)).cuda().eval()
-        refiner.load_state_dict(ck["refiner"])
+        sd = ck["refiner"]
+        heads = set(k.split(".")[0] for k in sd)
+        if heads & {"seg", "box", "e2e"}:        # multi-task ckpt
+            refiner = MultiTaskRefiner(
+                do_seg="seg" in heads, do_box="box" in heads,
+                do_e2e="e2e" in heads, n_cls=N_CLASSES,
+                seg_width=ra.get("width", 48), seg_ctx=ra.get("ctx", 0),
+                ego_dim=12 * EGO_K + EGO_K + 3).cuda().eval()
+            refiner.load_state_dict(sd)
+            refiner._multi = True
+        else:                                    # legacy single seg head
+            refiner = BEVSegRefiner(N_CLASSES, ctx_ch=ra.get("ctx", 0),
+                                    width=ra.get("width", 48)).cuda().eval()
+            refiner.load_state_dict(sd)
+            refiner._multi = False
         refiner._ctx = ra.get("ctx", 0)
-        print(f"[refiner] loaded {args.refiner_ckpt} "
-              f"(ctx={ra.get('ctx', 0)}, epoch={ck.get('epoch')})", flush=True)
+        print(f"[refiner] loaded {args.refiner_ckpt} multi={refiner._multi} "
+              f"heads={sorted(heads)} epoch={ck.get('epoch')}", flush=True)
     dbins = torch.arange(m.D) * m.D_STEP + m.D_MIN
     infer_hw = args.infer_hw or ("none" if args.model in ("v13", "v13d", "v14d", "v15", "v16", "v17", "v18", "v19", "v20", "v21", "v22", "v23", "v25", "v26", "v27", "v28", "v29", "v30", "v31", "v32", "v33", "v34", "v35", "v36", "v37", "v38", "v39") else "288x512")
     ih, iw = (None, None) if infer_hw == "none" else \
@@ -412,16 +425,35 @@ def main():
                            if v0_t is not None else
                            m(imgs_m[None].cuda(), K[None].cuda(),
                              T[None].cuda()))
-            seg, dlog = out[0], out[1]        # v13 returns (seg, depth, seg2d)
-            if refiner is not None:           # far-range completion refiner
-                # MUST be no_grad + detach: this runs outside the model's
-                # no_grad block, so without it the refiner graph (and the
-                # seg-fuse accumulator that derives from it) chains across
-                # every frame and leaks memory until OOM.
+            out = list(out)
+            if refiner is not None:
+                # Apply the refiner(s) to the frozen outputs. MUST be
+                # no_grad + detach: this runs outside the model's no_grad
+                # block, else the refiner graph (and the seg-fuse accumulator
+                # derived from it) chains across frames and leaks to OOM.
                 with torch.no_grad(), torch.autocast("cuda", torch.float16):
-                    ctx = m.lane_input().float() if getattr(
-                        refiner, "_ctx", 0) else None
-                    seg = refiner(seg.float(), ctx).detach()
+                    ctx = m.lane_input().float() if refiner._ctx else None
+                    if getattr(refiner, "_multi", False):
+                        rb = refiner.box is not None
+                        re = refiner.e2e is not None
+                        v0r = (v0_t.cuda() if v0_t is not None
+                               else torch.zeros(1, device="cuda")) if re else None
+                        fused = m._fused_bev.float() if re else None
+                        r = refiner(
+                            seg=out[0].float() if refiner.seg is not None else None,
+                            hm=out[3].float() if rb else None,
+                            reg=out[4].float() if rb else None,
+                            ego=out[7].float() if re else None,
+                            v0=v0r, fused=fused, seg_ctx=ctx)
+                        if "seg" in r:
+                            out[0] = r["seg"].detach()
+                        if "hm" in r:
+                            out[3] = r["hm"].detach(); out[4] = r["reg"].detach()
+                        if "ego" in r:
+                            out[7] = r["ego"].detach()
+                    else:
+                        out[0] = refiner(out[0].float(), ctx).detach()
+            seg, dlog = out[0], out[1]        # v13 returns (seg, depth, seg2d)
             pred = seg.argmax(1)[0].cpu().numpy().astype(np.uint8)
             if args.seg_fuse:
                 # temporal log-odds fusion in the ego frame (static classes):
@@ -447,10 +479,10 @@ def main():
                     _SEGACC.update(scene=s_pre, fi=f_pre["frame"],
                                    acc=lp.detach())
                     fpred = lp.argmax(1)[0].cpu().numpy().astype(np.uint8)
-                    raw = pred.copy()
+                    raw_pred = pred.copy()   # NOT `raw` (that's the mp4 path)
                     pred[175:] = fpred[175:]              # fuse near field
-                    thin = np.isin(raw, (3, 4, 5, 6))     # protect raw lines
-                    pred[thin] = raw[thin]
+                    thin = np.isin(raw_pred, (3, 4, 5, 6))  # protect raw lines
+                    pred[thin] = raw_pred[thin]
                 except Exception:
                     pass
             if not args.no_thin:
@@ -482,8 +514,8 @@ def main():
                         [_e[j * 12:(j + 1) * 12] for j in range(3)], _pr, _rm)
                 ego_modes = [(_e[j * 12:(j + 1) * 12], float(_pr[j]), j == _k)
                              for j in range(3)]
-                out = out[:7] + (torch.from_numpy(np.concatenate(
-                    [_e[_k * 12:(_k + 1) * 12], _e[39:42]]))[None],) + out[8:]
+                out = out[:7] + [torch.from_numpy(np.concatenate(
+                    [_e[_k * 12:(_k + 1) * 12], _e[39:42]]))[None]] + out[8:]
             ego_pred = out[7][0].float().cpu().numpy() \
                 if args.model in ("v18", "v19", "v20", "v21", "v22", "v23", "v25", "v26", "v27", "v28", "v29", "v30", "v31", "v32", "v33", "v34", "v35", "v36", "v37", "v38", "v39") and len(out) >= 8 else None
             traj_map = out[9][0].float().cpu() \
