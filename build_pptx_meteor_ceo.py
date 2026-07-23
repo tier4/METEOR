@@ -312,6 +312,40 @@ bullets(s, [
     (0, "→ 人的リソースに律速されない、圧倒的な開発スループット。", C_GREEN),
 ])
 
+# ---------------------------------------------------------------- 10.5 dev history
+s = slide("開発の歩み ── 約3週間で多タスク統合まで", "全コードAI記述による開発スピード")
+# native horizontal timeline (editable shapes)
+tl_y = 3.7
+line = s.shapes.add_shape(MSO_SHAPE.RECTANGLE, Inches(1.2), Inches(tl_y),
+                          Inches(10.9), Pt(4))
+_fill(line, C_BLUE)
+mile = [
+    (1.7, "7/10", "開発スタート", "BEV Segmentation・\n3D BBox 推論", C_BLUE, True),
+    (6.3, "7/17", "機能追加", "E2E（経路計画）\n機能を追加", C_TEAL, False),
+    (11.3, "現在", "統合・自己改善", "多タスク統合・Refiner\n・エッジ配備まで", C_GREEN, True),
+]
+for x, date, head, desc, col, above in mile:
+    dot = s.shapes.add_shape(MSO_SHAPE.OVAL, Inches(x - 0.16), Inches(tl_y - 0.13),
+                             Inches(0.34), Inches(0.34))
+    _fill(dot, col)
+    # date label on the line
+    db = s.shapes.add_textbox(Inches(x - 0.7), Inches(tl_y + 0.25), Inches(1.4),
+                              Inches(0.4))
+    dp = db.text_frame.paragraphs[0]; dp.text = date; dp.alignment = PP_ALIGN.CENTER
+    dp.font.size = Pt(16); dp.font.bold = True; dp.font.color.rgb = col
+    # description card above or below
+    cy = tl_y - 1.85 if above else tl_y + 0.75
+    card = s.shapes.add_shape(MSO_SHAPE.ROUNDED_RECTANGLE, Inches(x - 1.5),
+                              Inches(cy), Inches(3.0), Inches(1.5))
+    _fill(card, RGBColor(0xF2, 0xF4, 0xF6))
+    tf = card.text_frame; tf.word_wrap = True; tf.vertical_anchor = MSO_ANCHOR.MIDDLE
+    hp = tf.paragraphs[0]; hp.text = head; hp.alignment = PP_ALIGN.CENTER
+    hp.font.size = Pt(14); hp.font.bold = True; hp.font.color.rgb = col
+    dp2 = tf.add_paragraph(); dp2.text = desc; dp2.alignment = PP_ALIGN.CENTER
+    dp2.font.size = Pt(11); dp2.font.color.rgb = C_NAVY
+caption(s, "人手を待たずに24時間開発を継続 ── わずか約3週間で認識から計画まで1モデルに統合",
+        y=6.4, col=C_GREEN, size=14)
+
 # ---------------------------------------------------------------- 11 no map
 s = slide("③ No Map ── HDマップ不要", "地図の無い場所でも、その場で認識",
           band=C_GREEN)
