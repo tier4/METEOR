@@ -41,20 +41,27 @@ EGO_DIM = 12 * EGO_K + EGO_K + 3
 BANDS = [("40-80m", 0, 200), ("20-40m", 200, 300), ("0-20m", 300, 400)]
 
 
-def _unpack(batch, device, do_box, do_e2e):
-    """Batch layout with only with_boxdet/with_ego enabled: index 4.. runs a
-    counter identical to train.py."""
-    imgs, K, Tc, gt = (batch[i].to(device, non_blocking=True) for i in range(4))
+def _unpack(batch, device, a):
+    """Batch layout (counter identical to train.py). with_agenttraj provides
+    boxes+traj (+4); else with_boxdet gives boxes (+2); then ego (+1), risk
+    (+1)."""
+    def g(i):
+        return batch[i].to(device, non_blocking=True)
+    imgs, K, Tc, gt = g(0), g(1), g(2), g(3)
     bi = 4
-    det_boxes = det_n = ego_gt = None
-    if do_box:
-        det_boxes = batch[bi].to(device, non_blocking=True)
-        det_n = batch[bi + 1].to(device, non_blocking=True)
+    det_boxes = det_n = traj_gt = tvalid = ego_gt = risk_gt = None
+    if a.do_traj:                         # boxes + traj (+4)
+        det_boxes, det_n = g(bi), g(bi + 1)
+        traj_gt, tvalid = g(bi + 2), g(bi + 3)
+        bi += 4
+    elif a.do_box:                        # boxes only (+2)
+        det_boxes, det_n = g(bi), g(bi + 1)
         bi += 2
-    if do_e2e:
-        ego_gt = batch[bi].to(device, non_blocking=True)
-        bi += 1
-    return imgs, K, Tc, gt, det_boxes, det_n, ego_gt
+    if a.do_e2e:
+        ego_gt = g(bi); bi += 1
+    if a.do_risk:
+        risk_gt = g(bi); bi += 1
+    return imgs, K, Tc, gt, det_boxes, det_n, traj_gt, tvalid, ego_gt, risk_gt
 
 
 @torch.no_grad()
@@ -67,8 +74,8 @@ def evaluate(frozen, ref0, loader, device, args, max_b=40):
     for bi, batch in enumerate(loader):
         if bi >= max_b:
             break
-        imgs, K, Tc, gt, det_boxes, det_n, ego_gt = _unpack(
-            batch, device, args.do_box, args.do_e2e)
+        (imgs, K, Tc, gt, det_boxes, det_n, traj_gt, tvalid,
+         ego_gt, risk_gt) = _unpack(batch, device, args)
         v0 = ego_gt[:, 12] if args.do_e2e else None
         with torch.autocast("cuda", torch.float16):
             out = frozen(imgs, K, Tc, v0)
@@ -79,7 +86,9 @@ def evaluate(frozen, ref0, loader, device, args, max_b=40):
                      hm=out[3].float() if args.do_box else None,
                      reg=out[4].float() if args.do_box else None,
                      ego=out[7].float() if args.do_e2e else None,
-                     v0=v0, fused=fused, seg_ctx=ctx)
+                     v0=v0, fused=fused, seg_ctx=ctx,
+                     traj=out[9].float() if args.do_traj else None,
+                     risk=out[12].float() if args.do_risk else None)
         if args.do_seg:
             pr, pf = seg.argmax(1), r["seg"].argmax(1)
             m = gt > 0
@@ -150,8 +159,14 @@ def main():
     ap.add_argument("--no-seg", dest="do_seg", action="store_false")
     ap.add_argument("--do-box", action="store_true", default=False)
     ap.add_argument("--do-e2e", action="store_true", default=False)
+    ap.add_argument("--do-traj", action="store_true", default=False,
+                    help="refine the other-agent trajectory field (out[9])")
+    ap.add_argument("--do-risk", action="store_true", default=False,
+                    help="refine the risk field (out[12])")
     ap.add_argument("--box-w", type=float, default=1.0)
     ap.add_argument("--e2e-w", type=float, default=1.0)
+    ap.add_argument("--traj-w", type=float, default=0.5)
+    ap.add_argument("--risk-w", type=float, default=0.3)
     ap.add_argument("--workers", type=int, default=4)
     ap.add_argument("--limit-train", type=int, default=0)
     ap.add_argument("--out", default="out/refiner_r34")
@@ -183,7 +198,8 @@ def main():
         p.requires_grad_(False)
 
     ref = MultiTaskRefiner(do_seg=args.do_seg, do_box=args.do_box,
-                           do_e2e=args.do_e2e, n_cls=N_CLASSES,
+                           do_e2e=args.do_e2e, do_traj=args.do_traj,
+                           do_risk=args.do_risk, n_cls=N_CLASSES,
                            seg_width=args.width, seg_ctx=args.ctx,
                            ego_dim=EGO_DIM).to(device)
     if is_main:
@@ -191,16 +207,18 @@ def main():
         print(f"[frozen] {args.ckpt} missing={len(miss)} unexpected={len(unexp)}",
               flush=True)
         print(f"[refiner] heads: seg={args.do_seg} box={args.do_box} "
-              f"e2e={args.do_e2e} | params={n_par:.2f}M (zero-init residual)",
-              flush=True)
+              f"e2e={args.do_e2e} traj={args.do_traj} risk={args.do_risk} | "
+              f"params={n_par:.2f}M (zero-init residual)", flush=True)
     ref = DDP(ref, device_ids=[local]) if ddp else ref
     ref0 = ref.module if ddp else ref
 
-    tr = BevLaneDataset(args.root, train_s, gt_key=args.gt_key, with_depth=False,
-                        with_boxdet=args.do_box, with_ego=args.do_e2e)
+    # with_agenttraj provides boxes+traj; else with_boxdet gives boxes.
+    dkw = dict(with_depth=False, with_agenttraj=args.do_traj,
+               with_boxdet=args.do_box and not args.do_traj,
+               with_ego=args.do_e2e, with_risk=args.do_risk)
+    tr = BevLaneDataset(args.root, train_s, gt_key=args.gt_key, **dkw)
     va = BevLaneDataset(args.root, val_s, max_per_scene=4, gt_key=args.gt_key,
-                        with_depth=False, with_boxdet=args.do_box,
-                        with_ego=args.do_e2e)
+                        **dkw)
     sampler = DistributedSampler(tr) if ddp else None
     dl = DataLoader(tr, batch_size=args.batch, shuffle=sampler is None,
                     sampler=sampler, num_workers=args.workers, pin_memory=True,
@@ -227,20 +245,24 @@ def main():
         for bidx, batch in enumerate(dl):
             if args.limit_train and bidx >= args.limit_train:
                 break
-            imgs, K, Tc, gt, det_boxes, det_n, ego_gt = _unpack(
-                batch, device, args.do_box, args.do_e2e)
+            (imgs, K, Tc, gt, det_boxes, det_n, traj_gt, tvalid,
+             ego_gt, risk_gt) = _unpack(batch, device, args)
             v0 = ego_gt[:, 12] if args.do_e2e else None
+            has_box = args.do_box or args.do_traj      # det_boxes available
             with torch.no_grad(), torch.autocast("cuda", torch.float16):
                 out = frozen(imgs, K, Tc, v0)
                 seg = out[0].float()
                 hm = out[3].float() if args.do_box else None
                 reg = out[4].float() if args.do_box else None
                 ego = out[7].float() if args.do_e2e else None
+                traj = out[9].float() if args.do_traj else None
+                risk = out[12].float() if args.do_risk else None
                 ctx = frozen.lane_input().float() if args.ctx else None
                 fused = frozen._fused_bev.float() if args.do_e2e else None
             with torch.autocast("cuda", torch.float16):
                 r = ref(seg=seg if args.do_seg else None, hm=hm, reg=reg,
-                        ego=ego, v0=v0, fused=fused, seg_ctx=ctx)
+                        ego=ego, v0=v0, fused=fused, seg_ctx=ctx,
+                        traj=traj, risk=risk)
                 loss = seg.new_zeros(())
                 if args.do_seg:
                     rs = r["seg"].float()
@@ -259,6 +281,12 @@ def main():
                 if args.do_e2e:
                     loss = loss + args.e2e_w * frozen.ego_loss(
                         r["ego"].float(), ego_gt)
+                if args.do_traj:
+                    loss = loss + args.traj_w * frozen.traj_loss(
+                        r["traj"].float(), det_boxes, det_n, traj_gt, tvalid)
+                if args.do_risk:
+                    loss = loss + args.risk_w * frozen.risk_loss(
+                        r["risk"].float(), risk_gt)
             opt.zero_grad(set_to_none=True)
             # DDP-safe non-finite guard: ALL ranks must agree, else a rank that
             # skips backward() deadlocks the others on the grad all-reduce.

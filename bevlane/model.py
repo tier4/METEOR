@@ -2637,6 +2637,70 @@ class E2ERefiner(nn.Module):
         return out
 
 
+class BEVDenseRefiner(nn.Module):
+    """Generic residual U-Net for any dense BEV map on the det grid
+    (400x250). Used for the agent-trajectory field (other-agent behaviour,
+    39 ch) and the risk field (1 ch). Same recipe as the box refiner: a range
+    channel, encoder to s8, decoder with skips, zero-init last conv so it is
+    identity at start and can only add a correction to the frozen map."""
+
+    def __init__(self, cin, width=32):
+        super().__init__()
+        self.cin = cin
+
+        def enc(ci, co):
+            return nn.Sequential(
+                nn.Conv2d(ci, co, 3, stride=2, padding=1, bias=False),
+                nn.BatchNorm2d(co), nn.ReLU(inplace=True), ConvBlock(co, co))
+
+        self.stem = nn.Sequential(
+            nn.Conv2d(cin + 1, width, 3, padding=1, bias=False),
+            nn.BatchNorm2d(width), nn.ReLU(inplace=True))
+        self.d1 = enc(width, width * 2)
+        self.d2 = enc(width * 2, width * 3)
+        self.d3 = enc(width * 3, width * 4)
+        self.u3 = nn.Conv2d(width * 4, width * 3, 1)
+        self.m2 = ConvBlock(width * 3, width * 3)
+        self.u2 = nn.Conv2d(width * 3, width * 2, 1)
+        self.m1 = ConvBlock(width * 2, width * 2)
+        self.u1 = nn.Conv2d(width * 2, width, 1)
+        self.out = nn.Sequential(
+            nn.Conv2d(width, width, 3, padding=1, bias=False),
+            nn.BatchNorm2d(width), nn.ReLU(inplace=True),
+            nn.Conv2d(width, cin, 1))
+        nn.init.zeros_(self.out[-1].weight)
+        nn.init.zeros_(self.out[-1].bias)
+        self._rng = {}
+
+    def _range(self, h, w, device, dtype):
+        c = self._rng.get((h, w, device, dtype))
+        if c is None:
+            x = (BEV_XH - (torch.arange(h, device=device, dtype=dtype) + 0.5)
+                 * (2 * BEV_XH / h)) / BEV_XH
+            c = x.view(1, 1, h, 1).expand(1, 1, h, w).contiguous()
+            self._rng[(h, w, device, dtype)] = c
+        return c
+
+    def forward(self, x):
+        B, _, H, W = x.shape
+        rng = self._range(H, W, x.device, x.dtype).expand(B, 1, H, W)
+        s0 = self.stem(torch.cat([x, rng], 1))
+        s1 = self.d1(s0)
+        s2 = self.d2(s1)
+        s3 = self.d3(s2)
+
+        def up(u, skip):
+            return F.interpolate(u, size=skip.shape[-2:], mode="bilinear",
+                                 align_corners=False)
+        y2 = self.m2(s2 + up(self.u3(s3), s2))
+        y1 = self.m1(s1 + up(self.u2(y2), s1))
+        y0 = s0 + up(self.u1(y1), s0)
+        return x + self.out(y0)
+
+
+TRAJ_CH = TRAJ_H * 2 * EGO_K + EGO_K      # 39: dense agent-forecast channels
+
+
 class MultiTaskRefiner(nn.Module):
     """Post-hoc residual refiners for the three priority heads, sharing the
     single frozen-model forward. Each enabled head is an independent zero-init
@@ -2646,6 +2710,7 @@ class MultiTaskRefiner(nn.Module):
     deployed separately."""
 
     def __init__(self, do_seg=True, do_box=True, do_e2e=True,
+                 do_traj=False, do_risk=False,
                  n_cls=N_CLASSES, seg_width=48, box_width=32, seg_ctx=0,
                  ego_dim=None, ego_k=EGO_K):
         super().__init__()
@@ -2654,9 +2719,12 @@ class MultiTaskRefiner(nn.Module):
         self.box = BEVBoxRefiner(width=box_width) if do_box else None
         self.e2e = (E2ERefiner(ego_dim, k=ego_k)
                     if (do_e2e and ego_dim) else None)
+        # new heads: other-agent trajectory field + risk field
+        self.traj = BEVDenseRefiner(TRAJ_CH, width=32) if do_traj else None
+        self.risk = BEVDenseRefiner(1, width=24) if do_risk else None
 
     def forward(self, seg=None, hm=None, reg=None, ego=None, v0=None,
-                fused=None, seg_ctx=None):
+                fused=None, seg_ctx=None, traj=None, risk=None):
         """Refine whichever frozen outputs are provided; returns a dict. Called
         through DDP so every enabled head's params are tracked each step."""
         out = {}
@@ -2666,6 +2734,10 @@ class MultiTaskRefiner(nn.Module):
             out["hm"], out["reg"] = self.box(hm, reg)
         if self.e2e is not None and ego is not None:
             out["ego"] = self.e2e(ego, v0, fused)
+        if self.traj is not None and traj is not None:
+            out["traj"] = self.traj(traj)
+        if self.risk is not None and risk is not None:
+            out["risk"] = self.risk(risk)
         return out
 
 
