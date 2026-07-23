@@ -272,6 +272,10 @@ bullets(s, [
         C_NAVY),
 ], y=6.55, size=13)
 
+# 4.6 METEOR demo video (placeholder) — shown early as the hook
+demo_slide("METEOR デモ ── 実走行での認識・計画",
+           "カメラのみ・地図なしで、BEV・3D物体・信号・経路計画をリアルタイム出力")
+
 # 5 differentiators overview
 s = slide("METEORの4+2の強み（＝競争優位）", "この組み合わせが他に無い")
 bullets(s, [
@@ -354,10 +358,6 @@ bullets(s, [
     (0, "加えて：深度・占有・車線グラフ・未知障害物・他者挙動予測・リスク地図"),
     (1, "後段のRefinerが、遠方や細部を自動で補正しさらに高精度化。"),
 ], size=16)
-
-# 13.5 METEOR demo video (placeholder)
-demo_slide("METEOR デモ ── 実走行での認識・計画",
-           "カメラのみ・地図なしで、BEV・3D物体・信号・経路計画をリアルタイム出力")
 
 # 14 business value
 s = slide("事業価値", "コスト構造を根本から変える", band=C_AMBER)
