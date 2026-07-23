@@ -409,8 +409,11 @@ bullets(s, [
     ("Roadmap:", 0, ACC),
     (1, "NVIDIA Cosmos-generated data for robustness."),
     (1, "Feature-focused optimisation -> NVIDIA Orin SoC & Renesas R-Car Gen5."),
-    (1, "Release as a Reference AI (open source)."),
+    (1, "Release as a Reference AI (open source) + White Paper."),
 ], size=16)
+note(s, "Repository: github.com/tier4/METEOR   |   "
+        "White Paper: github.com/tier4/METEOR/blob/main/paper/main.pdf",
+     y=6.7, size=12)
 
 os.makedirs("out", exist_ok=True)
 prs.save("out/METEOR_model_architecture.pptx")

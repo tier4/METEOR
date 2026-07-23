@@ -379,11 +379,13 @@ bullets(s, [
     (0, "エッジ最適化・車載SoC実装", C_AMBER),
     (1, "必要な機能に絞り込んだ上で最適化を実施。"),
     (1, "NVIDIA SoC「Orin」および Renesas「R-Car Gen5」への実装を進める。"),
-    (0, "リファレンスAIとしてOSS公開", C_AMBER),
+    (0, "リファレンスAI化とWhite Paper公開", C_AMBER),
     (1, "Reference AI（オープンソース）として公開し、業界標準・エコシステム形成を狙う。"),
+    (1, "技術詳細をWhite Paperとして公開："
+        "github.com/tier4/METEOR/blob/main/paper/main.pdf"),
     (0, "並行して：遠方・未知障害物の精度向上、車種・地域の横展開、自己学習ループの"
         "完全自律化。", C_NAVY),
-], size=16)
+], size=15)
 
 # 15.5 Cosmos robustification demo video (placeholder)
 demo_slide("Cosmos生成データによるロバスト化 ── デモ",
@@ -397,7 +399,12 @@ lines = [("人手ゼロで、自動運転の認識を作り続ける。", 30, C_
          ("ラベル無し・地図無し・コード無し。カメラだけで、どこでも走る。",
           18, RGBColor(0xB9, 0xCF, 0xE8), False),
          ("", 10, C_WHITE, False),
-         ("METEOR ── スケールする自律認識エンジン", 22, C_TEAL, True)]
+         ("METEOR ── スケールする自律認識エンジン", 22, C_TEAL, True),
+         ("", 12, C_WHITE, False),
+         ("Repository:  github.com/tier4/METEOR", 15,
+          RGBColor(0xB9, 0xCF, 0xE8), False),
+         ("White Paper:  github.com/tier4/METEOR/blob/main/paper/main.pdf", 14,
+          RGBColor(0x9F, 0xB8, 0xD4), False)]
 for i, (t, sz, c, b) in enumerate(lines):
     p = tb.text_frame.paragraphs[0] if i == 0 else tb.text_frame.add_paragraph()
     p.text = t; p.font.size = Pt(sz); p.font.color.rgb = c
