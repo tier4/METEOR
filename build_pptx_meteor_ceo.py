@@ -125,7 +125,7 @@ abox(140, 26, 26, 24, "Refiner\n(自己改善)", "出力を自動補正\n+ 自�
 aarr(21, 38, 26, 38); aarr(48, 38, 53, 50); aarr(48, 38, 53, 32)
 aarr(77, 50, 82, 40); aarr(77, 32, 82, 36); aarr(104, 38, 110, 38)
 aarr(134, 38, 140, 38)
-ax.text(84, 3, "入力：CoMET基盤で自動ラベルしたCo-MLOpsの走行データ  →  "
+ax.text(84, 3, "入力：Co-MLOpsプロジェクトでCoMET基盤により自動ラベリング済みのデータを再利用  →  "
         "1つのモデルが多タスクを同時出力  →  Refinerが補正・ガードレールが安全担保",
         ha="center", fontsize=10.5, style="italic", color="#B9770E")
 fig.savefig("docs/media/ceo_arch.png", bbox_inches="tight", facecolor="white")
@@ -268,8 +268,8 @@ s = slide("モデルアーキテクチャ", "8台のカメラ映像を1つのモ
 s.shapes.add_picture("docs/media/ceo_arch.png", Inches(0.55), Inches(1.4),
                      width=Inches(12.2))
 bullets(s, [
-    (0, "データはCoMET（自動ラベル基盤）で教師付けしたCo-MLOpsの走行データを使用。",
-        C_NAVY),
+    (0, "データはCo-MLOpsプロジェクトでCoMET（自動ラベル基盤）により"
+        "自動ラベリング済みのものを再利用。", C_NAVY),
 ], y=6.55, size=13)
 
 # 4.6 METEOR demo video (placeholder) — shown early as the hook
@@ -295,7 +295,8 @@ s.shapes.add_picture("docs/media/ceo_vs.png", Inches(1.0), Inches(1.35),
 # 7 zero annotation
 s = slide("① Zero Human Annotation ── 人手ラベルゼロ", "最大のコスト要因を消す", band=C_GREEN)
 bullets(s, [
-    (0, "データ基盤：Co-MLOpsの走行データを、自動ラベル基盤CoMETで教師付け。", C_NAVY),
+    (0, "Co-MLOpsプロジェクトで自動ラベル基盤CoMETにより既にラベル付け済みの"
+        "データを再利用（新規の人手ラベルは一切不要）。", C_NAVY),
     (0, "LiDARの点群を走行全体で蓄積し、幾何的に整合させて教師データを自動生成。"),
     (1, "2通りの生成の「一致」だけを採用するコンセンサス方式でラベルノイズを除去。"),
     (0, "人手ラベル0枚のまま、現在7,147シーン・約104万フレームを学習に使用。"),

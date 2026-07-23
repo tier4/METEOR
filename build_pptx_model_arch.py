@@ -402,7 +402,7 @@ bullets(s, [
 # ---------- 15 data source ----------
 s = slide("Data & auto-label foundation")
 bullets(s, [
-    ("Data: Co-MLOps driving data.", 0, ACC),
+    ("Data: reused from the Co-MLOps project (already auto-labeled).", 0, ACC),
     ("Auto-label platform: CoMET.", 0, ACC),
     (1, "LiDAR-accumulated, geometry-consistent, consensus ground truth."),
     (1, "Zero human annotation — 7,147 scenes / ~1.05M frames / ~60 h so far."),
