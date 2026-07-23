@@ -255,12 +255,14 @@ bullets(s, [
 # 4 what is meteor + engine diagram
 s = slide("METEORとは ── 自律的に成長する認識エンジン")
 bullets(s, [
-    (0, "走行データを入れるだけで、ラベル生成→学習→自己改善→配備までを自動で回す"
+    (0, "METEORは、Co-MLOpsの自動ラベリング基盤CoMETが生み出すデータから"
+        "作られた、自動運転の認識・計画AIです。", C_GREEN),
+    (0, "そのデータを使い、学習→自己改善→配備までを人手を介さず自動で回す"
         "「認識・計画の自己生成エンジン」。", C_NAVY),
     (0, "出力は1つのモデルで多タスク：BEVセグメンテーション・3D物体・信号・"
         "経路計画(E2E)・深度・占有・車線グラフ・未知障害物。", C_NAVY),
-], y=1.5, size=16)
-s.shapes.add_picture("docs/media/ceo_engine.png", Inches(0.6), Inches(3.4),
+], y=1.5, size=15)
+s.shapes.add_picture("docs/media/ceo_engine.png", Inches(0.6), Inches(3.6),
                      width=Inches(12.1))
 
 # 4.5 model architecture (early)
