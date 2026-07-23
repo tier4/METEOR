@@ -86,7 +86,50 @@ for i, (k, a, b) in enumerate(rows):
     ax.text(110, y, b, ha="center", va="center", fontsize=9.8, color="#1B5c2b",
             fontweight="bold")
 fig.savefig("docs/media/ceo_vs.png", bbox_inches="tight", facecolor="white")
-print("saved 2 diagrams")
+
+# ---------------------------------------------------------------- diagram 3: model architecture
+fig, ax = plt.subplots(figsize=(15.5, 6.4), dpi=120)
+ax.set_xlim(0, 168); ax.set_ylim(0, 64); ax.axis("off")
+
+
+def abox(x, y, w, h, t, s="", fc="#CFE2F3", fs=11.5, sfs=8.6):
+    ax.add_patch(FancyBboxPatch((x, y), w, h, boxstyle="round,pad=0.5",
+                                fc=fc, ec="#4a5560", lw=1.2))
+    ax.text(x + w / 2, y + (h * 0.62 if s else h / 2), t, ha="center",
+            va="center", fontsize=fs, fontweight="bold", color="#152238")
+    if s:
+        ax.text(x + w / 2, y + h * 0.26, s, ha="center", va="center",
+                fontsize=sfs, color="#444")
+
+
+def aarr(x1, y1, x2, y2, col="#152238", w=2.0):
+    ax.add_patch(FancyArrowPatch((x1, y1), (x2, y2), arrowstyle="-|>",
+                                 mutation_scale=15, lw=w, color=col))
+
+
+ax.text(84, 61, "モデルアーキテクチャ（カメラのみ・地図なし）", ha="center",
+        fontsize=16, fontweight="bold", color="#152238")
+abox(1, 30, 20, 16, "8台の\nサラウンド\nカメラ", fc="#EEEEEE")
+abox(26, 30, 22, 16, "共有バックボーン", "画像特徴抽出", fc="#CFE2F3")
+abox(53, 44, 24, 12, "深度推定", "ピクセル毎(AI)", fc="#FDE7B5")
+abox(53, 26, 24, 12, "深度ゲート付き\nIPM投影", "幾何的に正確", fc="#FDE7B5")
+abox(82, 30, 22, 16, "共有BEV\n(俯瞰空間)", "+ 時系列メモリ", fc="#D9EAD3")
+# task heads fanned out
+heads = ["BEVセグ", "3D物体", "経路計画E2E", "深度・占有", "信号・車線", "未知障害物"]
+for i, hd in enumerate(heads):
+    y = 51 - i * 7.0
+    abox(110, y - 2.6, 24, 5.6, hd, fc="#CFE2F3", fs=10)
+    aarr(104, 38, 110, y)
+abox(140, 26, 26, 24, "Refiner\n(自己改善)", "出力を自動補正\n+ 自己ガードレール\n(決定論的な安全層)",
+     fc="#E8D5F2", fs=12)
+aarr(21, 38, 26, 38); aarr(48, 38, 53, 50); aarr(48, 38, 53, 32)
+aarr(77, 50, 82, 40); aarr(77, 32, 82, 36); aarr(104, 38, 110, 38)
+aarr(134, 38, 140, 38)
+ax.text(84, 3, "入力：CoMET基盤で自動ラベルしたCo-MLOpsの走行データ  →  "
+        "1つのモデルが多タスクを同時出力  →  Refinerが補正・ガードレールが安全担保",
+        ha="center", fontsize=10.5, style="italic", color="#B9770E")
+fig.savefig("docs/media/ceo_arch.png", bbox_inches="tight", facecolor="white")
+print("saved 3 diagrams")
 
 # ---------------------------------------------------------------- deck
 SW, SH = Inches(13.333), Inches(7.5)
@@ -204,6 +247,15 @@ bullets(s, [
 s.shapes.add_picture("docs/media/ceo_engine.png", Inches(0.6), Inches(3.4),
                      width=Inches(12.1))
 
+# 4.5 model architecture (early)
+s = slide("モデルアーキテクチャ", "8台のカメラ映像を1つのモデルが俯瞰(BEV)へ変換し、多タスクを同時出力")
+s.shapes.add_picture("docs/media/ceo_arch.png", Inches(0.55), Inches(1.4),
+                     width=Inches(12.2))
+bullets(s, [
+    (0, "データはCoMET（自動ラベル基盤）で教師付けしたCo-MLOpsの走行データを使用。",
+        C_NAVY),
+], y=6.55, size=13)
+
 # 5 differentiators overview
 s = slide("METEORの4+2の強み（＝競争優位）", "この組み合わせが他に無い")
 bullets(s, [
@@ -223,12 +275,13 @@ s.shapes.add_picture("docs/media/ceo_vs.png", Inches(1.0), Inches(1.35),
 # 7 zero annotation
 s = slide("① Zero Human Annotation ── 人手ラベルゼロ", "最大のコスト要因を消す", band=C_GREEN)
 bullets(s, [
+    (0, "データ基盤：Co-MLOpsの走行データを、自動ラベル基盤CoMETで教師付け。", C_NAVY),
     (0, "LiDARの点群を走行全体で蓄積し、幾何的に整合させて教師データを自動生成。"),
     (1, "2通りの生成の「一致」だけを採用するコンセンサス方式でラベルノイズを除去。"),
     (0, "人手ラベル0枚のまま、現在7,147シーン・約104万フレームを学習に使用。"),
     (1, "新しい地域・車種のデータが来ても、人手を介さず数時間で学習データに追加。"),
     (0, "→ アノテーション費用が実質ゼロ。スケールが人件費に縛られない。", C_GREEN),
-])
+], size=16)
 
 # 8 zero code
 s = slide("② Zero Human Code ── 全コードをAIが記述", "開発速度そのものが競争力", band=C_GREEN)
@@ -298,15 +351,19 @@ bullets(s, [
 ])
 
 # 15 roadmap
-s = slide("ロードマップ")
+s = slide("今後の予定（ロードマップ）", band=C_AMBER)
 bullets(s, [
-    (0, "短期：遠方・細部の精度向上（Refiner拡張）、未知障害物検出の抜本改善"
-        "（LiDAR蓄積GT）。"),
-    (0, "中期：データ規模拡大（自動で数百時間へ）、車種・地域の横展開、"
-        "INT8化でさらなる軽量エッジ配備。"),
-    (0, "長期：自己学習ループの完全自律化（新環境を自分で取り込み改善）、"
-        "量産車搭載。"),
-])
+    (0, "データのロバスト化", C_AMBER),
+    (1, "NVIDIA Cosmosで生成した多様・希少シーンのデータで学習し、実環境への"
+        "堅牢性を高める。"),
+    (0, "エッジ最適化・車載SoC実装", C_AMBER),
+    (1, "必要な機能に絞り込んだ上で最適化を実施。"),
+    (1, "NVIDIA SoC「Orin」および Renesas「R-Car Gen5」への実装を進める。"),
+    (0, "リファレンスAIとしてOSS公開", C_AMBER),
+    (1, "Reference AI（オープンソース）として公開し、業界標準・エコシステム形成を狙う。"),
+    (0, "並行して：遠方・未知障害物の精度向上、車種・地域の横展開、自己学習ループの"
+        "完全自律化。", C_NAVY),
+], size=16)
 
 # 16 closing
 s = prs.slides.add_slide(BLANK)

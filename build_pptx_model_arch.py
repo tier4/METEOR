@@ -3,6 +3,7 @@
 
 Structure-focused: every module, tensor shape, and design decision of the
 deployed network, with measured parameter budgets."""
+import os
 from pptx import Presentation
 from pptx.dml.color import RGBColor
 from pptx.enum.shapes import MSO_SHAPE
@@ -159,10 +160,10 @@ def note(s, txt, y=6.85, col=GRAY, size=12):
 s = slide()
 big(s, [
     ("METEOR", 60, True, ACC),
-    ("Model Architecture (v26)", 32, True, DARK),
+    ("Model Architecture (v40)", 32, True, DARK),
     ("Multi-task Estimation of Traffic Elements, Objects & Roads", 18, False, GRAY),
-    ("One network - 8 cameras - 7 tasks - 43.5M params - TensorRT-safe ops only",
-     16, False, DARK),
+    ("One network - 8 cameras - 10+ tasks - 53M params (base 48M + grafted "
+     "Refiner 5M) - TensorRT-safe ops only", 15, False, DARK),
 ], y=2.0)
 note(s, "All architecture, code and labels produced autonomously by Claude Fable 5 "
         "on the CoMET / Co-MLOps autolabeling foundation", y=6.6)
@@ -323,7 +324,7 @@ bullets(s, [
 ], size=16)
 
 # ---------- 11 parameter budget ----------
-s = slide("Parameter budget (measured, v26 total 43.50M)")
+s = slide("Parameter budget (base 48M; v40 with grafted Refiner = 53M)")
 table(s, [
     ["Component", "Params", "Input", "Notes"],
     ["Image encoder (ResNet-34 + FPN)", "21.67M", "8 x 768x432", "shared by all tasks"],
@@ -373,11 +374,44 @@ table(s, [
     ["v22", "streaming temporal BEV (warp + residual tfuse)", "+0.19M"],
     ["v23", "LaneDecED lane decoder, s4 det tower, tfuse zero-init", "+4.9M"],
     ["v24/25", "task routing: geometry on RAW BEV, motion on FUSED BEV", "+0.4M"],
-    ["v26", "explicit stationary-flag head + near-range-first det supervision", "+129"],
-], 1.6, 1.5, 10.1, [1.2, 7.2, 1.7], fs=13)
+    ["v26/27", "stationary-flag head; traffic-light head", "+0.3M"],
+    ["v28-30", "risk field; 3-slot temporal queue; motion-residual forecast", "+1.5M"],
+    ["v32-34", "optional LiDAR pillar branch; unknown-obstacle head", "+1.0M"],
+    ["v36-39", "E2E: intent, in-training risk selection, decoupled head", "+2M"],
+    ["v40", "multi-task Refiner grafted on as trainable post-heads", "+5M"],
+], 1.6, 1.5, 10.1, [1.1, 7.4, 1.6], fs=12)
 note(s, "Every version validated against the previous on the same held-out scenes before adoption")
 
-import os
+# ---------- 14 refiner (v40, method A) ----------
+s = slide("Post-hoc Refiner (v40) — residual heads on the outputs",
+          "seg / 3D box / E2E / agent-traj / risk-map; each zero-init residual")
+if os.path.exists("docs/media/refiner_arch.png"):
+    s.shapes.add_picture("docs/media/refiner_arch.png", Inches(0.7),
+                         Inches(1.5), width=Inches(8.0))
+bullets(s, [
+    ("residual + zero-init", 0, GREEN),
+    (1, "= identity at start; can only improve the base, never degrade it."),
+    ("5 heads, +5M params", 0, ACC),
+    (1, "seg U-Net (far-range fill), box U-Net (peak/size), E2E MLP, and NEW"),
+    (1, "agent-traj U-Net + risk-map U-Net."),
+    ("Method A graft", 0, ACC),
+    (1, "grafted into v40 (53M) and fine-tuned end-to-end from base + refiner"),
+    (1, "weights; deployment needs no separate engine."),
+], x=9.0, y=1.6, w=3.9, size=13)
+
+# ---------- 15 data source ----------
+s = slide("Data & auto-label foundation")
+bullets(s, [
+    ("Data: Co-MLOps driving data.", 0, ACC),
+    ("Auto-label platform: CoMET.", 0, ACC),
+    (1, "LiDAR-accumulated, geometry-consistent, consensus ground truth."),
+    (1, "Zero human annotation — 7,147 scenes / ~1.05M frames / ~60 h so far."),
+    ("Roadmap:", 0, ACC),
+    (1, "NVIDIA Cosmos-generated data for robustness."),
+    (1, "Feature-focused optimisation -> NVIDIA Orin SoC & Renesas R-Car Gen5."),
+    (1, "Release as a Reference AI (open source)."),
+], size=16)
+
 os.makedirs("out", exist_ok=True)
 prs.save("out/METEOR_model_architecture.pptx")
 print("saved out/METEOR_model_architecture.pptx,", len(prs.slides.__iter__.__self__._sldIdLst), "slides")
