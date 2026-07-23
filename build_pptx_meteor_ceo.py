@@ -180,6 +180,22 @@ def bullets(s, items, x=0.7, y=1.6, w=11.9, h=5.5, size=17):
         p.space_after = Pt(7)
 
 
+def demo_slide(title, sub=None, band=C_BLUE):
+    """Title-only placeholder page for a demo video (frame + '▶' hint)."""
+    s = slide(title, sub, band=band)
+    frame = s.shapes.add_shape(MSO_SHAPE.ROUNDED_RECTANGLE, Inches(2.3),
+                               Inches(1.9), Inches(8.7), Inches(4.9))
+    frame.fill.solid(); frame.fill.fore_color.rgb = RGBColor(0x0E, 0x14, 0x22)
+    frame.line.color.rgb = C_BLUE; frame.line.width = Pt(2)
+    tf = frame.text_frame; tf.vertical_anchor = MSO_ANCHOR.MIDDLE
+    p = tf.paragraphs[0]; p.text = "▶"; p.alignment = PP_ALIGN.CENTER
+    p.font.size = Pt(60); p.font.color.rgb = C_WHITE
+    p2 = tf.add_paragraph(); p2.text = "（デモ動画をここに挿入）"
+    p2.alignment = PP_ALIGN.CENTER; p2.font.size = Pt(18)
+    p2.font.color.rgb = RGBColor(0xB9, 0xCF, 0xE8)
+    return s
+
+
 def bignum(s, items, y=2.2):
     n = len(items)
     w = 12.0 / n
@@ -339,6 +355,10 @@ bullets(s, [
     (1, "後段のRefinerが、遠方や細部を自動で補正しさらに高精度化。"),
 ], size=16)
 
+# 13.5 METEOR demo video (placeholder)
+demo_slide("METEOR デモ ── 実走行での認識・計画",
+           "カメラのみ・地図なしで、BEV・3D物体・信号・経路計画をリアルタイム出力")
+
 # 14 business value
 s = slide("事業価値", "コスト構造を根本から変える", band=C_AMBER)
 bullets(s, [
@@ -364,6 +384,10 @@ bullets(s, [
     (0, "並行して：遠方・未知障害物の精度向上、車種・地域の横展開、自己学習ループの"
         "完全自律化。", C_NAVY),
 ], size=16)
+
+# 15.5 Cosmos robustification demo video (placeholder)
+demo_slide("Cosmos生成データによるロバスト化 ── デモ",
+           "NVIDIA Cosmosで生成した多様・希少シーンでの認識・計画の頑健性", band=C_AMBER)
 
 # 16 closing
 s = prs.slides.add_slide(BLANK)
