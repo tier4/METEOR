@@ -845,9 +845,25 @@ class DepthSegIPMNetV16(DepthSegIPMNetV14):
             cw = torch.tensor([2.0, 5.0], device=hm.device).view(2, 1, 1)
             # far positives are unresolvable at 768x432 (a 60 m pedestrian is
             # ~10 px); full-weight unlearnable positives push the focal loss
-            # to suppress confidence everywhere -> damp them instead
-            damp = torch.stack([torch.where(r > 50.0, 0.3, 1.0),
-                                torch.where(r > 40.0, 0.2, 1.0)])
+            # to suppress confidence everywhere -> damp them instead.
+            # v41 (BOX_FAR_W): VEHICLES are resolvable at range by the narrow
+            # cameras (~4.7 px/cell at 60 m), so BOOST far veh positives to
+            # lift recall; keep VRU far-damping (far pedestrians truly ~10 px).
+            far_w = getattr(self, "BOX_FAR_W", None)
+            if getattr(self, "VRU_FAR_BAND", False):
+                # v42: the narrow cams resolve a 40 m pedestrian (~60 px),
+                # so the old >40 m x0.2 damp was discarding learnable GT.
+                # Boost the 25-45 m band x2, damp only past 50 m.
+                d_vru = ((1.0 + ((r > 25.0) & (r < 45.0)).float())
+                         * torch.where(r > 50.0, 0.3, 1.0))
+                damp = torch.stack([torch.where(r > 40.0, float(far_w or 2.0),
+                                                1.0), d_vru])
+            elif far_w:
+                damp = torch.stack([torch.where(r > 40.0, float(far_w), 1.0),
+                                    torch.where(r > 40.0, 0.2, 1.0)])
+            else:
+                damp = torch.stack([torch.where(r > 50.0, 0.3, 1.0),
+                                    torch.where(r > 40.0, 0.2, 1.0)])
             # laterally distant objects are out of scope -> nearly ignore
             damp = damp * torch.where(ye.abs() > 15.0, 0.2, 1.0)
             self._det_posw = (near * cw * damp).unsqueeze(0)
@@ -2421,7 +2437,14 @@ class DepthSegIPMNetV39(DepthSegIPMNetV38):
         g = F.adaptive_avg_pool2d(self._fused_bev, 1).flatten(1).float()
         d = self.dec_head(g).view(B, 3, 12)
         phi = d[:, :, :6]
-        v = F.softplus(d[:, :, 6:])
+        # fp16-safe softplus: log(1+exp(x)) overflows fp16 at x>~11 (a
+        # 15 m/s speed logit), which made the TRT fp16 engine emit NaN
+        # waypoints at ~55 km/h. exp(-|x|)<=1 never overflows; identical
+        # values. Speeds capped at 25 m/s (90 km/h): physically sane and
+        # exact identity below the cap.
+        xv = d[:, :, 6:]
+        v = (xv.clamp(min=0)
+             + torch.log1p(torch.exp(-xv.abs()))).clamp(max=25.0)
         step = 0.5 * v
         dx = step * torch.cos(phi)
         dy = step * torch.sin(phi)
@@ -2775,6 +2798,110 @@ class DepthSegIPMNetV40(DepthSegIPMNetV39):
         return tuple(out)
 
 
+class _DenseObstacleHead(nn.Module):
+    """Dense small-static-obstacle occupancy head (v41). Compact U-Net on the
+    temporal feature -> a per-cell logit on the 400x250 det grid, trained on
+    the LiDAR-accumulated dense GT (unknown_v2) with dense focal loss. Dense
+    supervision avoids the sparse-positive collapse of the old peak head."""
+
+    def __init__(self, cin, width=48):
+        super().__init__()
+
+        def enc(ci, co):
+            return nn.Sequential(
+                nn.Conv2d(ci, co, 3, stride=2, padding=1, bias=False),
+                nn.BatchNorm2d(co), nn.ReLU(inplace=True), ConvBlock(co, co))
+
+        self.stem = nn.Sequential(
+            nn.Conv2d(cin, width, 3, padding=1, bias=False),
+            nn.BatchNorm2d(width), nn.ReLU(inplace=True), ConvBlock(width, width))
+        self.d1 = enc(width, width * 2)
+        self.d2 = enc(width * 2, width * 3)
+        self.u2 = nn.Conv2d(width * 3, width * 2, 1)
+        self.m1 = ConvBlock(width * 2, width * 2)
+        self.u1 = nn.Conv2d(width * 2, width, 1)
+        self.out = nn.Sequential(
+            nn.Conv2d(width, width, 3, padding=1, bias=False),
+            nn.BatchNorm2d(width), nn.ReLU(inplace=True),
+            nn.Conv2d(width, 1, 1))
+        nn.init.constant_(self.out[-1].bias, -2.0)   # rare-positive prior
+
+    def forward(self, x):
+        s0 = self.stem(x)
+        s1 = self.d1(s0)
+        s2 = self.d2(s1)
+
+        def up(u, skip):
+            return F.interpolate(u, size=skip.shape[-2:], mode="bilinear",
+                                 align_corners=False)
+        y1 = self.m1(s1 + up(self.u2(s2), s1))
+        y0 = s0 + up(self.u1(y1), s0)
+        return self.out(y0)
+
+
+class DepthSegIPMNetV41(DepthSegIPMNetV40):
+    """v41 (next-stage perception): two fundamental fixes on the r35 base.
+
+    (1) Unknown detector redesign: the sparse-peak head (recall ~0.11) is
+        replaced by a DENSE small-static-obstacle occupancy head trained on
+        the LiDAR-accumulated dense GT (unknown_v2) with dense focal loss.
+    (2) Far-range vehicle 3D-box recall: box_loss gains a range weight that
+        up-weights far positives (BOX_FAR_W), so distant vehicles -- small in
+        BEV and camera-sparse -- are pushed harder (recall was the weak point).
+    """
+    BOX_FAR_W = 2.0                       # extra weight on far-range box GT
+
+    def __init__(self, *a, **k):
+        super().__init__(*a, **k)
+        # the sparse-peak unknown head (unk_stem/unk_head2) is superseded by
+        # the dense head; drop its params (param-free Identity) so DDP does
+        # not flag them as unused -> avoids find_unused_parameters overhead.
+        self.unk_stem = nn.Identity()
+        self.unk_head2 = nn.Identity()
+        self.unk_dense = _DenseObstacleHead(256)
+
+    def forward(self, imgs, K, T_cam_ego, v0=None, prev_bev=None,
+                warp_theta=None, lidar=None, lidar_bev=None, kin=None,
+                intent=None):
+        out = list(super().forward(imgs, K, T_cam_ego, v0, prev_bev,
+                                   warp_theta, lidar=lidar,
+                                   lidar_bev=lidar_bev, kin=kin, intent=intent))
+        out[17] = self.unk_dense(self._tf[:, :256].float())
+        return tuple(out)
+
+    def unk_dense_loss(self, pred, mask):
+        """pred logits [B,1,H,W]; mask [B,H,W] float (1 = small obstacle,
+        0 = free, -1 = no GT for this frame -> ignored).
+        alpha-balanced focal on the dense mask, averaged over valid pixels."""
+        p = pred[:, 0].float()
+        g = mask.float()
+        valid = (g >= 0).float()          # -1 sentinel frames contribute 0
+        denom = valid.sum().clamp(min=1)
+        g = g.clamp(min=0)
+        # pos_weight lifts the focal equilibrium: with 0.3% positives and
+        # alpha .75 alone, the calibrated positive prob plateaued at ~0.25
+        # (never crossing any usable threshold, r36 valUnkD stuck at 0)
+        pw = torch.tensor(8.0, device=p.device)
+        bce = F.binary_cross_entropy_with_logits(p, g, reduction="none",
+                                                 pos_weight=pw)
+        pt = torch.exp(-bce.clamp(max=20))
+        alpha = torch.where(g > 0.5, 0.75, 0.25)
+        return (alpha * (1 - pt) ** 2 * bce * valid).sum() / denom * 100.0
+
+
+class DepthSegIPMNetV42(DepthSegIPMNetV41):
+    """v42 (r37): TRT-safety + far-VRU round.
+
+    1. fp16-safe E2E decoder (stable softplus + 25 m/s cap in the v39 dec
+       path -- fix lives in V39.forward, shared by all descendants): no
+       overflow on ANY TensorRT precision.
+    2. VRU_FAR_BAND: 25-45 m pedestrians boosted x2 in the box loss (was
+       damped x0.2 past 40 m); recall at range was the weak point.
+    Zero new parameters: r36/r37_init checkpoints load with missing=0.
+    """
+    VRU_FAR_BAND = True
+
+
 MODELS = {"v1": IPMSegNet, "v2": IPMSegNetV2, "v3s": IPMSegNetV3,
           "lss": LSSDepthNet, "v8": DepthGatedIPMNet, "v13": DepthSegIPMNet,
           "v13d": DepthSegIPMNetS4, "v14d": DepthSegIPMNetV14,
@@ -2783,4 +2910,4 @@ MODELS = {"v1": IPMSegNet, "v2": IPMSegNetV2, "v3s": IPMSegNetV3,
           "v19": DepthSegIPMNetV19, "v20": DepthSegIPMNetV20,
           "v21": DepthSegIPMNetV21, "v22": DepthSegIPMNetV22,
           "v23": DepthSegIPMNetV23, "v24": DepthSegIPMNetV24,
-          "v25": DepthSegIPMNetV25, "v26": DepthSegIPMNetV26, "v27": DepthSegIPMNetV27, "v28": DepthSegIPMNetV28, "v29": DepthSegIPMNetV29, "v30": DepthSegIPMNetV30, "v31": DepthSegIPMNetV31, "v32": DepthSegIPMNetV32, "v33": DepthSegIPMNetV33, "v34": DepthSegIPMNetV34, "v35": DepthSegIPMNetV35, "v36": DepthSegIPMNetV36, "v37": DepthSegIPMNetV37, "v38": DepthSegIPMNetV38, "v39": DepthSegIPMNetV39, "v40": DepthSegIPMNetV40}
+          "v25": DepthSegIPMNetV25, "v26": DepthSegIPMNetV26, "v27": DepthSegIPMNetV27, "v28": DepthSegIPMNetV28, "v29": DepthSegIPMNetV29, "v30": DepthSegIPMNetV30, "v31": DepthSegIPMNetV31, "v32": DepthSegIPMNetV32, "v33": DepthSegIPMNetV33, "v34": DepthSegIPMNetV34, "v35": DepthSegIPMNetV35, "v36": DepthSegIPMNetV36, "v37": DepthSegIPMNetV37, "v38": DepthSegIPMNetV38, "v39": DepthSegIPMNetV39, "v40": DepthSegIPMNetV40, "v41": DepthSegIPMNetV41, "v42": DepthSegIPMNetV42}

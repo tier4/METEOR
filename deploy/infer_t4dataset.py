@@ -116,6 +116,44 @@ def build_engine_from_onnx(onnx_path, compat=False):
     config = builder.create_builder_config()
     config.set_memory_pool_limit(trt.MemoryPoolType.WORKSPACE, 8 << 30)
     config.set_flag(trt.BuilderFlag.FP16)
+    # E2E (ego) head overflows in fp16 at highway speed (waypoints -> NaN
+    # while everything else stays finite; PyTorch autocast kept these ops
+    # fp32). TRT 8.6 CANNOT pin layers inside Myelin-fused regions
+    # (ForeignNode build failure), so the pin path is opt-in for a future
+    # TRT; the runtime instead holds the last finite ego output on NaN.
+    if not os.environ.get("METEOR_TRT_EGO_FP32"):
+        blob = builder.build_serialized_network(network, config)
+        if blob is None:
+            sys.exit("TensorRT build failed")
+        with open(eng, "wb") as f:
+            f.write(blob)
+        print(f"[engine] saved {eng}", flush=True)
+        return eng
+    config.set_flag(trt.BuilderFlag.PREFER_PRECISION_CONSTRAINTS)
+    E2E_FP32 = ("ego_stem", "ego_attn", "ego_mlp", "ego_q", "ego_delta",
+                "dec_head", "dec_gate", "kin_delta", "intent_delta",
+                "refiner.e2e", "refiner/e2e")
+    n32 = 0
+    skip_t = (trt.LayerType.SHAPE, trt.LayerType.CONSTANT)
+    for i in range(network.num_layers):
+        lay = network.get_layer(i)
+        if not any(t in lay.name for t in E2E_FP32):
+            continue
+        # only float compute layers: INT32 constants / shape / index layers
+        # must keep their types or network validation fails
+        if lay.type in skip_t:
+            continue
+        if any(lay.get_output(oi).dtype not in (trt.float32, trt.float16)
+               for oi in range(lay.num_outputs)):
+            continue
+        try:
+            # precision only -- forcing output types too creates subgraph
+            # boundaries the optimizer cannot implement (ForeignNode error)
+            lay.precision = trt.float32
+            n32 += 1
+        except Exception:
+            pass
+    print(f"[engine] pinned {n32} E2E-head layers to fp32", flush=True)
     if compat:
         config.set_flag(trt.BuilderFlag.VERSION_COMPATIBLE)
         config.hardware_compatibility_level = \
@@ -229,16 +267,14 @@ def run_scene(args, root, rt=None, vw=None):
         cams = by_sample.get(s["token"], {})
         if any(c not in cams for c in CAMS):
             continue
-        imgs = []
-        ok = True
-        for c in CAMS:
-            p = os.path.join(root, cams[c]["filename"])
-            im = cv2.imread(p)
-            if im is None:
-                ok = False
-                break
-            imgs.append(cv2.resize(im, (IMG_W, IMG_H)))
-        if not ok:
+        def _load(c):
+            im = cv2.imread(os.path.join(root, cams[c]["filename"]))
+            return cv2.resize(im, (IMG_W, IMG_H)) if im is not None else None
+        from concurrent.futures import ThreadPoolExecutor
+        if not hasattr(run_scene, "_pool"):
+            run_scene._pool = ThreadPoolExecutor(max_workers=8)
+        imgs = list(run_scene._pool.map(_load, CAMS))
+        if any(im is None for im in imgs):
             continue
         # ego pose + speed from the pose deltas (no CAN in t4dataset)
         ep = egop.get(cams["CAM_FRONT_WIDE"]["ego_pose_token"])
@@ -259,6 +295,12 @@ def run_scene(args, root, rt=None, vw=None):
             v0 = 0.0
 
         out = rt.infer(preprocess_images(imgs), K_t, T_t, v0, pose=pose)
+        # fp16 TRT (8.6): the ego head can transiently overflow to NaN at
+        # ~55 km/h; hold the last finite plan instead (deployment-style)
+        if np.isfinite(out["ego"]).all():
+            run_scene._ego_hold = out["ego"].copy()
+        elif getattr(run_scene, "_ego_hold", None) is not None:
+            out["ego"] = run_scene._ego_hold
 
         boxes = decode_boxes(out["hm"], out["reg"], out.get("stationary"),
                              thresh=args.thresh)

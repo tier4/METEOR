@@ -96,12 +96,27 @@ class MeteorRT:
             self.dev[nm] = cuda.mem_alloc(self.host[nm].nbytes)
             self.ctx.set_tensor_address(nm, int(self.dev[nm]))
         self.stream = cuda.Stream()
-        self._hist = {}                 # frame index -> (raw_bev, pose)
+        # DEVICE-RESIDENT temporal ring: raw_bev is 153 MB/frame and the
+        # 3-slot hist_bev is 460 MB -- staging them through the host cost
+        # >1 GB of copies per frame (~350 ms). Keep the last max(HIST_OFFS)
+        # raw_bev tensors on the GPU and splice hist_bev with D2D copies.
+        self._ring_n = max(HIST_OFFS)
+        self._slot_bytes = None
+        self._ring = None
+        self._ring_pose = [None] * self._ring_n
+        self._ring_t = [-1] * self._ring_n
+        if "raw_bev" in self.shapes and "hist_bev" in self.shapes:
+            self._slot_bytes = self.host["raw_bev"].nbytes
+            self._ring = [cuda.mem_alloc(self._slot_bytes)
+                          for _ in range(self._ring_n)]
+        self._hist = {}                 # legacy host path (no raw_bev I/O)
         self._t = 0
 
     def reset(self):
         """call at scene boundaries: drops the temporal state."""
         self._hist.clear()
+        self._ring_pose = [None] * self._ring_n
+        self._ring_t = [-1] * self._ring_n
         self._t = 0
 
     def infer(self, imgs, K, T_cam_ego, v0, pose=None):
@@ -113,15 +128,7 @@ class MeteorRT:
         slots (t-0.4 / -1.2 / -2.8 s) are fed back on the next call. Slots
         with no history yet are zero-filled with an identity warp, exactly
         as training does for scene starts."""
-        hb = np.zeros(self.shapes["hist_bev"], np.float32)
         ht = np.zeros(self.shapes["hist_theta"], np.float32)
-        for i, off in enumerate(HIST_OFFS):
-            h = self._hist.get(self._t - off)
-            if h is None or pose is None or h[1] is None:
-                ht[0, i] = _identity_theta()[0]
-                continue
-            hb[0, i] = h[0]
-            ht[0, i] = make_warp_theta(h[1], pose)[0]
         if not self._zeroed:
             for nm_ in list(self.host):
                 self.host[nm_][:] = 0
@@ -129,24 +136,46 @@ class MeteorRT:
                                        self.stream)
             self.stream.synchronize()
             self._zeroed = True
+        # splice hist_bev on-device: D2D from the raw_bev ring (~1 ms)
+        # instead of a 460 MB host round-trip (~350 ms)
+        hb_base = int(self.dev["hist_bev"])
+        for i, off in enumerate(HIST_OFFS):
+            ti = self._t - off
+            slot = ti % self._ring_n if ti >= 0 else -1
+            valid = (self._ring is not None and ti >= 0
+                     and self._ring_t[slot] == ti and pose is not None
+                     and self._ring_pose[slot] is not None)
+            dst = hb_base + i * self._slot_bytes
+            if valid:
+                cuda.memcpy_dtod_async(dst, int(self._ring[slot]),
+                                       self._slot_bytes, self.stream)
+                ht[0, i] = make_warp_theta(self._ring_pose[slot], pose)[0]
+            else:
+                cuda.memset_d8_async(dst, 0, self._slot_bytes, self.stream)
+                ht[0, i] = _identity_theta()[0]
         feed = {"imgs": imgs, "K": K, "T_cam_ego": T_cam_ego,
-                "v0": np.array([v0], np.float32),
-                "hist_bev": hb, "hist_theta": ht}
+                "v0": np.array([v0], np.float32), "hist_theta": ht}
         for nm, v in feed.items():
             np.copyto(self.host[nm],
                       np.ascontiguousarray(v, np.float32).ravel())
             cuda.memcpy_htod_async(self.dev[nm], self.host[nm], self.stream)
         self.ctx.execute_async_v3(self.stream.handle)
+        # store this frame's raw_bev in the device ring (D2D, no host copy)
+        if self._ring is not None:
+            slot = self._t % self._ring_n
+            cuda.memcpy_dtod_async(int(self._ring[slot]),
+                                   int(self.dev["raw_bev"]),
+                                   self._slot_bytes, self.stream)
+            self._ring_pose[slot] = pose
+            self._ring_t[slot] = self._t
         out = {}
-        outs = [nm for nm in OUTPUTS if nm in self.shapes]
+        outs = [nm for nm in OUTPUTS if nm in self.shapes
+                and nm != "raw_bev"]
         for nm in outs:
             cuda.memcpy_dtoh_async(self.host[nm], self.dev[nm], self.stream)
         self.stream.synchronize()
         for nm in outs:
             out[nm] = self.host[nm].reshape(self.shapes[nm]).copy()
-        self._hist[self._t] = (out["raw_bev"][0], pose)
-        for k in [k for k in self._hist if k < self._t - max(HIST_OFFS)]:
-            del self._hist[k]
         self._t += 1
         return out
 

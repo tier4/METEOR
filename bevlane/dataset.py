@@ -25,7 +25,8 @@ class BevLaneDataset(Dataset):
                  with_bbox2d=False, with_ego=False, with_occ=False,
                  with_agenttraj=False, with_temporal=False, with_tl=False,
                  with_risk=False, with_lanegraph=False, temporal_hist=0,
-                 with_unknown=False, with_lidarbev=False):
+                 with_unknown=False, with_lidarbev=False,
+                 with_unknown_v2=False):
         self.root = root
         self.with_lidarbev = with_lidarbev
         self.gt_key = gt_key
@@ -46,6 +47,7 @@ class BevLaneDataset(Dataset):
         self.with_risk = with_risk
         self.with_lanegraph = with_lanegraph
         self.with_unknown = with_unknown
+        self.with_unknown_v2 = with_unknown_v2
         self._unk_cache = {}
         self.temporal_hist = temporal_hist   # v29: N history slots
         self._tl_cache = {}
@@ -300,6 +302,18 @@ class BevLaneDataset(Dataset):
                 un = nv + (ni << 8)
             out.append(torch.from_numpy(uc))
             out.append(torch.tensor(un, dtype=torch.int64))
+        if self.with_unknown_v2:
+            # dense small-obstacle occupancy mask [400,250] (LiDAR-accumulated
+            # unknown - known-box residual); -1 sentinel = no GT for this frame
+            um = np.full((400, 250), -1.0, np.float32)
+            p_ = f.get("unknown_v2")
+            if p_:
+                try:
+                    um = np.load(os.path.join(self.root, s, p_)
+                                 )["mask"].astype(np.float32)
+                except Exception:
+                    pass
+            out.append(torch.from_numpy(um))
         if self.with_lidarbev:
             lb = np.zeros((4, 400, 250), np.float32)
             p_ = f.get("lidar_bev")
