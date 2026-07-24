@@ -237,6 +237,55 @@ for a, b in ((b1, b2), (b2, b3), (b3, b4), (b4, b5)):
 caption(s, "収集 → ラベル → 学習 → 改善 → 配備 の全工程を自動化"
         "（人手のラベリングもコード記述も不要）", y=5.8)
 
+# ---------------------------------------------------------------- 4.5 dev method
+s = slide("開発のやり方 ── 人間は「指示」、AIが「開発」",
+          "コンセプト・機能は人間が指示。残りの全工程はAIが主導（Zero Human Code）")
+hb = nbox(s, 0.6, 2.7, 2.4, 2.2, "人間",
+          "コンセプト・機能を\n指示するだけ", fc=F_AMBER, fs=16, sfs=11.5)
+band = s.shapes.add_shape(MSO_SHAPE.ROUNDED_RECTANGLE, Inches(3.9),
+                          Inches(1.75), Inches(8.9), Inches(3.9))
+band.fill.solid(); band.fill.fore_color.rgb = RGBColor(0xF2, 0xF6, 0xFB)
+band.line.color.rgb = C_BLUE; band.line.width = Pt(1.5)
+band.shadow.inherit = False
+bp = band.text_frame.paragraphs[0]
+bp.text = "AIが主導（Claude Fable 5）"; bp.alignment = PP_ALIGN.CENTER
+bp.font.size = Pt(15); bp.font.bold = True; bp.font.color.rgb = C_BLUE
+band.text_frame.vertical_anchor = MSO_ANCHOR.TOP
+steps = [("モデル開発", "設計・学習・評価"),
+         ("データセット\n読み込み", "新データ自動取込"),
+         ("データ変換", "学習形式へ自動変換"),
+         ("データ\nクレンジング", "ノイズ自動除去"),
+         ("モデル管理", "配備・自動復旧")]
+sb = []
+for i, (t, sub) in enumerate(steps):
+    sb.append(nbox(s, 4.1 + i * 1.75, 2.75, 1.6, 1.5, t, sub,
+                   fc=F_BLUE, fs=11.5, sfs=8.5))
+for a, b in zip(sb, sb[1:]):
+    link(s, a, b)
+# human -> AI (instruction) and AI -> human (report) arrows with labels
+c1 = s.shapes.add_connector(MSO_CONNECTOR.STRAIGHT, hb.left + hb.width,
+                            Inches(3.15), band.left, Inches(3.15))
+_arrow(c1, C_AMBER)
+c2 = s.shapes.add_connector(MSO_CONNECTOR.STRAIGHT, band.left, Inches(4.45),
+                            hb.left + hb.width, Inches(4.45))
+_arrow(c2, C_TEAL)
+for lx, ly, txt, col in ((2.92, 2.72, "指示", C_AMBER),
+                         (2.92, 4.55, "報告・提案", C_TEAL)):
+    lb = s.shapes.add_textbox(Inches(lx), Inches(ly), Inches(1.05), Inches(0.35))
+    p = lb.text_frame.paragraphs[0]; p.text = txt; p.alignment = PP_ALIGN.CENTER
+    p.font.size = Pt(10.5); p.font.bold = True; p.font.color.rgb = col
+# self-improvement loop-back inside the AI band
+lp = s.shapes.add_connector(MSO_CONNECTOR.STRAIGHT, Inches(11.7), Inches(4.85),
+                            Inches(5.1), Inches(4.85))
+_arrow(lp, C_TEAL)
+lt = s.shapes.add_textbox(Inches(6.2), Inches(4.95), Inches(4.5), Inches(0.4))
+p = lt.text_frame.paragraphs[0]
+p.text = "24時間 自己改善ループ（クラッシュ復旧・再学習も自動）"
+p.alignment = PP_ALIGN.CENTER; p.font.size = Pt(11); p.font.color.rgb = C_TEAL
+caption(s, "人間は「何を作るか」を決めるだけ ── "
+        "モデル開発からデータ処理・運用まで、作り方はすべてAIが自律実行",
+        y=6.15, col=C_GREEN, size=13)
+
 # ---------------------------------------------------------------- 5 model architecture
 s = slide("モデルアーキテクチャ",
           "8台のカメラ映像を1つのモデルが俯瞰(BEV)へ変換し、多タスクを同時出力")
@@ -256,9 +305,12 @@ link(s, a1, a2); link(s, a2, a3); link(s, a2, a3b)
 link(s, a3, a4); link(s, a3b, a4); link(s, a4, a5)
 link(s, a5, a6, side="v", col=C_TEAL)
 bullets(s, [
+    (0, "現行の車載SoC（NVIDIA Orin）で動作可能な、CNNベースの効率重視"
+        "アーキテクチャを採用（LLM・世界モデル(WM)ベースにも拡張可能だが、"
+        "現行ハードでは実行が難しいため現時点では未着手）。", C_NAVY),
     (0, "データはCo-MLOpsプロジェクトでCoMET（自動ラベル基盤）により"
         "自動ラベリング済みのものを再利用。", C_NAVY),
-], y=6.7, size=13)
+], y=6.35, size=11.5)
 
 # ---------------------------------------------------------------- 6 METEOR demo (early hook)
 demo_slide("METEOR デモ ── 実走行での認識・計画",
@@ -368,6 +420,9 @@ bullets(s, [
 # ---------------------------------------------------------------- 13 edge
 s = slide("⑤ 軽量・エッジ実装", "データセンター不要、車載で動く", band=C_TEAL)
 bullets(s, [
+    (0, "現行SoC（NVIDIA Orin）で動作可能な、CNNベースの効率重視アーキテクチャ。"),
+    (1, "LLM・世界モデル（WM）ベースにもできるが、現行ハードウェアでの実行が"
+        "難しいため現時点では未着手（将来の拡張余地）。"),
     (0, "TensorRTエンジン + C++ランタイムに変換済み。車載GPUで単体動作。"),
     (0, "カメラのみで完結（LiDAR等はオプション）。追加センサー無しで配備可能。"),
     (0, "→ 量産車への搭載を見据えた、現実的なコストとフットプリント。", C_TEAL),
