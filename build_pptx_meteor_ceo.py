@@ -240,51 +240,142 @@ caption(s, "収集 → ラベル → 学習 → 改善 → 配備 の全工程�
 # ---------------------------------------------------------------- 4.5 dev method
 s = slide("開発のやり方 ── 人間は「指示」、AIが「開発」",
           "コンセプト・機能は人間が指示。残りの全工程はAIが主導（Zero Human Code）")
-hb = nbox(s, 0.6, 2.7, 2.4, 2.2, "人間",
-          "コンセプト・機能を\n指示するだけ", fc=F_AMBER, fs=16, sfs=11.5)
+
+
+def person_icon(sl, cx, cy, h, col):
+    """simple editable person pictogram (head + shoulders)"""
+    hd = h * 0.36
+    head = sl.shapes.add_shape(MSO_SHAPE.OVAL, Inches(cx - hd / 2), Inches(cy),
+                               Inches(hd), Inches(hd))
+    _fill(head, col)
+    bw, bh = h * 0.62, h * 0.5
+    body = sl.shapes.add_shape(MSO_SHAPE.ROUNDED_RECTANGLE,
+                               Inches(cx - bw / 2), Inches(cy + hd + 0.04),
+                               Inches(bw), Inches(bh))
+    _fill(body, col)
+
+
+def robot_icon(sl, cx, cy, h, col):
+    """simple editable robot pictogram (antenna + head + eyes + mouth)"""
+    tip = sl.shapes.add_shape(MSO_SHAPE.OVAL, Inches(cx - h * 0.07),
+                              Inches(cy - h * 0.02), Inches(h * 0.14),
+                              Inches(h * 0.14))
+    _fill(tip, col)
+    ant = sl.shapes.add_shape(MSO_SHAPE.RECTANGLE, Inches(cx - 0.015),
+                              Inches(cy + h * 0.1), Inches(0.03),
+                              Inches(h * 0.18))
+    _fill(ant, col)
+    hw = h * 0.92
+    head = sl.shapes.add_shape(MSO_SHAPE.ROUNDED_RECTANGLE,
+                               Inches(cx - hw / 2), Inches(cy + h * 0.26),
+                               Inches(hw), Inches(h * 0.72))
+    _fill(head, col)
+    for dx in (-hw * 0.22, hw * 0.22):
+        eye = sl.shapes.add_shape(MSO_SHAPE.OVAL,
+                                  Inches(cx + dx - h * 0.075),
+                                  Inches(cy + h * 0.44), Inches(h * 0.15),
+                                  Inches(h * 0.15))
+        _fill(eye, C_WHITE)
+    mo = sl.shapes.add_shape(MSO_SHAPE.ROUNDED_RECTANGLE,
+                             Inches(cx - hw * 0.26), Inches(cy + h * 0.76),
+                             Inches(hw * 0.52), Inches(h * 0.09))
+    _fill(mo, C_WHITE)
+
+
+# --- human zone (left, amber) ---
+hb = s.shapes.add_shape(MSO_SHAPE.ROUNDED_RECTANGLE, Inches(0.45),
+                        Inches(1.8), Inches(2.5), Inches(3.55))
+hb.fill.solid(); hb.fill.fore_color.rgb = F_AMBER
+hb.line.color.rgb = C_AMBER; hb.line.width = Pt(1.75); hb.shadow.inherit = False
+person_icon(s, 1.7, 2.0, 1.0, C_AMBER)
+ht = s.shapes.add_textbox(Inches(0.5), Inches(3.6), Inches(2.4), Inches(0.95))
+p = ht.text_frame.paragraphs[0]; p.text = "人間"; p.alignment = PP_ALIGN.CENTER
+p.font.size = Pt(19); p.font.bold = True; p.font.color.rgb = C_NAVY
+p2 = ht.text_frame.add_paragraph()
+p2.text = "コンセプト・機能を\n指示するだけ"; p2.alignment = PP_ALIGN.CENTER
+p2.font.size = Pt(11.5); p2.font.color.rgb = C_NAVY
+qb = s.shapes.add_shape(MSO_SHAPE.ROUNDED_RECTANGLE, Inches(0.62),
+                        Inches(4.55), Inches(2.16), Inches(0.62))
+qb.fill.solid(); qb.fill.fore_color.rgb = C_WHITE
+qb.line.color.rgb = C_AMBER; qb.line.width = Pt(1); qb.shadow.inherit = False
+p = qb.text_frame.paragraphs[0]; p.text = "「◯◯できる機能が欲しい」"
+p.alignment = PP_ALIGN.CENTER; p.font.size = Pt(9.5); p.font.italic = True
+p.font.color.rgb = C_NAVY
+
+# --- AI zone (right band, blue) ---
 band = s.shapes.add_shape(MSO_SHAPE.ROUNDED_RECTANGLE, Inches(3.9),
-                          Inches(1.75), Inches(8.9), Inches(3.9))
+                          Inches(1.8), Inches(8.9), Inches(3.55))
 band.fill.solid(); band.fill.fore_color.rgb = RGBColor(0xF2, 0xF6, 0xFB)
-band.line.color.rgb = C_BLUE; band.line.width = Pt(1.5)
+band.line.color.rgb = C_BLUE; band.line.width = Pt(1.75)
 band.shadow.inherit = False
-bp = band.text_frame.paragraphs[0]
-bp.text = "AIが主導（Claude Fable 5）"; bp.alignment = PP_ALIGN.CENTER
-bp.font.size = Pt(15); bp.font.bold = True; bp.font.color.rgb = C_BLUE
-band.text_frame.vertical_anchor = MSO_ANCHOR.TOP
-steps = [("モデル開発", "設計・学習・評価"),
-         ("データセット\n読み込み", "新データ自動取込"),
-         ("データ変換", "学習形式へ自動変換"),
-         ("データ\nクレンジング", "ノイズ自動除去"),
-         ("モデル管理", "配備・自動復旧")]
+robot_icon(s, 7.05, 1.95, 0.62, C_BLUE)
+bh_ = s.shapes.add_textbox(Inches(7.45), Inches(2.05), Inches(3.6),
+                           Inches(0.45))
+p = bh_.text_frame.paragraphs[0]; p.text = "AIが主導（Claude Fable 5）"
+p.font.size = Pt(15); p.font.bold = True; p.font.color.rgb = C_BLUE
+# 5 steps, each with its own editable icon shape above the box
+steps = [(MSO_SHAPE.GEAR_6, "モデル開発", "設計・学習・評価"),
+         (MSO_SHAPE.CAN, "データセット\n読み込み", "新データ自動取込"),
+         (MSO_SHAPE.LEFT_RIGHT_ARROW, "データ変換", "学習形式へ自動変換"),
+         (MSO_SHAPE.FUNNEL, "データ\nクレンジング", "ノイズ自動除去"),
+         (MSO_SHAPE.CUBE, "モデル管理", "配備・自動復旧")]
 sb = []
-for i, (t, sub) in enumerate(steps):
-    sb.append(nbox(s, 4.1 + i * 1.75, 2.75, 1.6, 1.5, t, sub,
-                   fc=F_BLUE, fs=11.5, sfs=8.5))
+for i, (icon, t, sub) in enumerate(steps):
+    bx = 4.1 + i * 1.75
+    if icon == MSO_SHAPE.LEFT_RIGHT_ARROW:      # wide so it reads as an arrow
+        ic = s.shapes.add_shape(icon, Inches(bx + 0.44), Inches(2.8),
+                                Inches(0.68), Inches(0.32))
+    else:
+        ic = s.shapes.add_shape(icon, Inches(bx + 0.55), Inches(2.72),
+                                Inches(0.45), Inches(0.45))
+    _fill(ic, C_BLUE)
+    sb.append(nbox(s, bx, 3.3, 1.55, 1.3, t, sub, fc=F_BLUE,
+                   fs=11, sfs=8.5))
 for a, b in zip(sb, sb[1:]):
     link(s, a, b)
-# human -> AI (instruction) and AI -> human (report) arrows with labels
-c1 = s.shapes.add_connector(MSO_CONNECTOR.STRAIGHT, hb.left + hb.width,
-                            Inches(3.15), band.left, Inches(3.15))
-_arrow(c1, C_AMBER)
-c2 = s.shapes.add_connector(MSO_CONNECTOR.STRAIGHT, band.left, Inches(4.45),
-                            hb.left + hb.width, Inches(4.45))
-_arrow(c2, C_TEAL)
-for lx, ly, txt, col in ((2.92, 2.72, "指示", C_AMBER),
-                         (2.92, 4.55, "報告・提案", C_TEAL)):
-    lb = s.shapes.add_textbox(Inches(lx), Inches(ly), Inches(1.05), Inches(0.35))
-    p = lb.text_frame.paragraphs[0]; p.text = txt; p.alignment = PP_ALIGN.CENTER
-    p.font.size = Pt(10.5); p.font.bold = True; p.font.color.rgb = col
-# self-improvement loop-back inside the AI band
-lp = s.shapes.add_connector(MSO_CONNECTOR.STRAIGHT, Inches(11.7), Inches(4.85),
-                            Inches(5.1), Inches(4.85))
-_arrow(lp, C_TEAL)
-lt = s.shapes.add_textbox(Inches(6.2), Inches(4.95), Inches(4.5), Inches(0.4))
+# 24h self-improvement loop inside the AI band
+lo = s.shapes.add_shape(MSO_SHAPE.DONUT, Inches(5.45), Inches(4.72),
+                        Inches(0.5), Inches(0.5))
+_fill(lo, C_TEAL)
+lt = s.shapes.add_textbox(Inches(6.1), Inches(4.78), Inches(6.0), Inches(0.4))
 p = lt.text_frame.paragraphs[0]
 p.text = "24時間 自己改善ループ（クラッシュ復旧・再学習も自動）"
-p.alignment = PP_ALIGN.CENTER; p.font.size = Pt(11); p.font.color.rgb = C_TEAL
+p.font.size = Pt(11.5); p.font.bold = True; p.font.color.rgb = C_TEAL
+
+# --- human <-> AI arrows ---
+c1 = s.shapes.add_connector(MSO_CONNECTOR.STRAIGHT, hb.left + hb.width,
+                            Inches(2.9), band.left, Inches(2.9))
+_arrow(c1, C_AMBER)
+c2 = s.shapes.add_connector(MSO_CONNECTOR.STRAIGHT, band.left, Inches(4.35),
+                            hb.left + hb.width, Inches(4.35))
+_arrow(c2, C_TEAL)
+for lx, ly, txt, col in ((2.87, 2.5, "指示", C_AMBER),
+                         (2.87, 4.45, "報告・提案", C_TEAL)):
+    lb = s.shapes.add_textbox(Inches(lx), Inches(ly), Inches(1.1), Inches(0.35))
+    p = lb.text_frame.paragraphs[0]; p.text = txt; p.alignment = PP_ALIGN.CENTER
+    p.font.size = Pt(10.5); p.font.bold = True; p.font.color.rgb = col
+
+# --- workload ratio bar (who does the work) ---
+rt = s.shapes.add_textbox(Inches(0.45), Inches(5.62), Inches(2.0), Inches(0.35))
+p = rt.text_frame.paragraphs[0]; p.text = "作業量の割合:"
+p.font.size = Pt(12); p.font.bold = True; p.font.color.rgb = C_NAVY
+seg_h = s.shapes.add_shape(MSO_SHAPE.RECTANGLE, Inches(1.95), Inches(5.95),
+                           Inches(0.55), Inches(0.45))
+_fill(seg_h, C_AMBER)
+seg_a = s.shapes.add_shape(MSO_SHAPE.RECTANGLE, Inches(2.5), Inches(5.95),
+                           Inches(10.35), Inches(0.45))
+_fill(seg_a, C_BLUE)
+p = seg_a.text_frame.paragraphs[0]
+p.text = "AI ～95%（モデル開発・データ処理・運用のすべて）"
+p.alignment = PP_ALIGN.CENTER; p.font.size = Pt(12); p.font.bold = True
+p.font.color.rgb = C_WHITE
+hl = s.shapes.add_textbox(Inches(1.35), Inches(6.45), Inches(1.9),
+                          Inches(0.35))
+p = hl.text_frame.paragraphs[0]; p.text = "人間 ～5%（指示）"
+p.font.size = Pt(10.5); p.font.bold = True; p.font.color.rgb = C_AMBER
 caption(s, "人間は「何を作るか」を決めるだけ ── "
         "モデル開発からデータ処理・運用まで、作り方はすべてAIが自律実行",
-        y=6.15, col=C_GREEN, size=13)
+        y=6.95, col=C_GREEN, size=13)
 
 # ---------------------------------------------------------------- 5 model architecture
 s = slide("モデルアーキテクチャ",
