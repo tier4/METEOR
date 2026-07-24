@@ -431,6 +431,53 @@ table(s, [
     ["配備", "重く高価な計算機", "軽量・エッジ実装"],
 ], 0.9, 1.5, 11.5, [2.6, 4.6, 4.3], fs=14)
 
+# ---------------------------------------------------------------- 8.5 vs VAD
+s = slide("METEOR vs VAD ── 最先端E2E研究との違い",
+          "VAD: 学界の代表的なカメラE2E手法（ベクトル化シーン表現）")
+# two pipeline rows as native shapes
+vy, vh = 1.5, 0.8
+lb = s.shapes.add_textbox(Inches(0.5), Inches(vy + 0.2), Inches(1.35),
+                          Inches(0.45))
+p = lb.text_frame.paragraphs[0]; p.text = "VAD"; p.font.size = Pt(17)
+p.font.bold = True; p.font.color.rgb = C_RED
+v1 = nbox(s, 1.9, vy, 1.9, vh, "カメラ映像", fc=F_GRAY, fs=11.5)
+v2 = nbox(s, 4.15, vy, 2.15, vh, "Transformer BEV", "重い注意機構", fc=F_GRAY,
+          fs=11.5, sfs=8.5)
+v3 = nbox(s, 6.65, vy, 2.3, vh, "ベクトル化シーン", "地図・他車", fc=F_GRAY,
+          fs=11.5, sfs=8.5)
+v4 = nbox(s, 9.3, vy, 1.75, vh, "経路計画", fc=F_GRAY, fs=11.5)
+for a, b in ((v1, v2), (v2, v3), (v3, v4)):
+    link(s, a, b, col=C_RED)
+vt = nbox(s, 11.4, vy, 1.5, vh, "人手ラベル\nで学習", fc=RGBColor(0xF6, 0xD0, 0xCC),
+          fs=10, sfs=8)
+my, mh = 2.55, 0.8
+lb = s.shapes.add_textbox(Inches(0.5), Inches(my + 0.2), Inches(1.4),
+                          Inches(0.45))
+p = lb.text_frame.paragraphs[0]; p.text = "METEOR"; p.font.size = Pt(15)
+p.font.bold = True; p.font.color.rgb = C_GREEN
+m1 = nbox(s, 1.9, my, 1.9, mh, "8カメラ 360°", fc=F_BLUE, fs=11.5)
+m2 = nbox(s, 4.15, my, 2.15, mh, "深度ベースBEV", "CNN・軽量", fc=F_BLUE,
+          fs=11.5, sfs=8.5)
+m3 = nbox(s, 6.65, my, 2.3, mh, "多タスク認識+計画", "セグ/3D/信号/占有…",
+          fc=F_BLUE, fs=10.5, sfs=8)
+m4 = nbox(s, 9.3, my, 1.75, mh, "ガードレール", "決定論安全層", fc=F_PURP,
+          fs=10.5, sfs=8)
+for a, b in ((m1, m2), (m2, m3), (m3, m4)):
+    link(s, a, b, col=C_GREEN)
+mt = nbox(s, 11.4, my, 1.5, mh, "自動ラベル\nで学習(人手0)", fc=F_GREEN,
+          fs=10, sfs=8)
+# can / cannot table
+table(s, [
+    ["観点", "VAD（E2E研究の代表）", "METEOR"],
+    ["E2E経路計画・3D検出・車線", "○", "○（同じ土俵）"],
+    ["信号・深度・占有・未知障害物", "−（対象外）", "○（1モデルで出力）"],
+    ["学習ラベル", "人手アノテーションが必要", "人手ゼロ（CoMET自動ラベル）"],
+    ["開発", "研究者が実装", "AIが全コード記述"],
+    ["安全担保", "NN出力に依存", "決定論ガードレールで二重化"],
+    ["計算・実装", "Transformer・研究実装", "CNN・車載SoC（Orin）動作可"],
+    ["公開ベンチ実績", "○（nuScenes）", "今後（White Paperで公開予定）"],
+], 0.9, 3.65, 11.5, [3.3, 4.1, 4.1], fs=12.5)
+
 # ---------------------------------------------------------------- 9 zero annotation
 s = slide("① Zero Human Annotation ── 人手ラベルゼロ", "最大のコスト要因を消す",
           band=C_GREEN)
