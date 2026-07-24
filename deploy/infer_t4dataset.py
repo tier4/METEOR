@@ -250,6 +250,8 @@ def run_scene(args, root, rt=None, vw=None):
             xy = np.array(ep["translation"][:2], np.float64)
             t_s = cams["CAM_FRONT_WIDE"]["timestamp"] * 1e-6
             pose = (float(xy[0]), float(xy[1]), yaw)
+            if not all(np.isfinite(p) for p in pose):
+                pose = None              # bad odometry row: skip temporal warp
             if prev_xy is not None and t_s > prev_t:
                 v0 = float(np.linalg.norm(xy - prev_xy) / (t_s - prev_t))
             prev_xy, prev_t = xy, t_s
