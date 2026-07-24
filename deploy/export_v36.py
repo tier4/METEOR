@@ -36,6 +36,10 @@ def _manual_adaptive_pool(x, out):
     then fixed-kernel avg_pool. Sub-percent numeric difference on the
     attention-pool branches; parity is reported by --check."""
     th, tw = out if isinstance(out, (tuple, list)) else (out, out)
+    if th == 1 and tw == 1:
+        # global average -> ReduceMean: exact, and TensorRT rejects an
+        # avg_pool kernel of 400x250 (> MAX_KERNEL_DIMS_PRODUCT)
+        return x.mean((-2, -1), keepdim=True)
     H, W = int(x.shape[-2]), int(x.shape[-1])
     kh, kw = H // th, W // tw
     ch, cw_ = kh * th, kw * tw

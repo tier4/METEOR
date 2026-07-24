@@ -158,7 +158,10 @@ def main():
                     help="live visualisation window while inferring "
                     "(q quits, space pauses)")
     ap.add_argument("--stride", type=int, default=2, help="keyframe stride")
-    ap.add_argument("--limit", type=int, default=0)
+    ap.add_argument("--limit", type=int, default=0,
+                    help="max keyframes per scene (0 = all)")
+    ap.add_argument("--max-scenes", type=int, default=0,
+                    help="max scenes when --t4d is a dataset root (0 = all)")
     ap.add_argument("--thresh", type=float, default=0.45)
     args = ap.parse_args()
     if not args.engine and not args.onnx:
@@ -169,16 +172,38 @@ def main():
         print("[warn] --display requested but no $DISPLAY; continuing "
               "without a window", flush=True)
         args.display = False
-    for root in scene_dirs(args.t4d):
-        run_scene(args, root)
+    roots = scene_dirs(args.t4d)
+    if args.max_scenes:
+        roots = roots[:args.max_scenes]
+    # ONE engine + ONE video across every scene (t4d root -> combined video)
+    rt = MeteorRT(args.engine)
+    vw = None
+    if args.video:
+        vw = cv2.VideoWriter(args.video.replace(".mp4", "_raw.mp4"),
+                             cv2.VideoWriter_fourcc(*"mp4v"), 10,
+                             (1920, 1080))
+    for si, root in enumerate(roots):
+        print(f"=== scene {si + 1}/{len(roots)} "
+              f"{os.path.basename(root)} ===", flush=True)
+        run_scene(args, root, rt, vw)
+    if vw is not None:
+        vw.release()
+        import subprocess
+        subprocess.run(["ffmpeg", "-y", "-i",
+                        args.video.replace(".mp4", "_raw.mp4"), "-c:v",
+                        "libx264", "-crf", "24", "-pix_fmt", "yuv420p",
+                        args.video], check=True, capture_output=True)
+        os.remove(args.video.replace(".mp4", "_raw.mp4"))
+        print(f"video -> {args.video}", flush=True)
 
 
-def run_scene(args, root):
+def run_scene(args, root, rt=None, vw=None):
     name = os.path.basename(root)
     ordered, by_sample, calib, egop = load_scene(root)
     missing = [c for c in CAMS if c not in calib]
     if missing:
-        sys.exit(f"scene lacks cameras: {missing}")
+        print(f"[skip] {name}: lacks cameras {missing}", flush=True)
+        return
 
     # calibration is per-scene constant: build K/T once
     Ks, Ts = [], []
@@ -189,14 +214,10 @@ def run_scene(args, root):
     K_t = np.stack(Ks)[None].astype(np.float32)
     T_t = np.stack(Ts)[None].astype(np.float32)
 
-    rt = MeteorRT(args.engine)
-    rt.reset()
+    if rt is None:                       # single-scene compatibility path
+        rt = MeteorRT(args.engine)
+    rt.reset()                           # clear temporal ring across scenes
     os.makedirs(os.path.join(args.out, name), exist_ok=True)
-    vw = None
-    if args.video:
-        vw = cv2.VideoWriter(args.video.replace(".mp4", "_raw.mp4"),
-                             cv2.VideoWriter_fourcc(*"mp4v"), 10,
-                             (1920, 1080))
 
     frames = ordered[::args.stride]
     if args.limit:
@@ -232,6 +253,8 @@ def run_scene(args, root):
             if prev_xy is not None and t_s > prev_t:
                 v0 = float(np.linalg.norm(xy - prev_xy) / (t_s - prev_t))
             prev_xy, prev_t = xy, t_s
+        if not np.isfinite(v0):          # bad odometry row -> safe default
+            v0 = 0.0
 
         out = rt.infer(preprocess_images(imgs), K_t, T_t, v0, pose=pose)
 
@@ -344,6 +367,8 @@ def run_scene(args, root):
                         cv2.LINE_AA)
             pass
         if vw is not None:
+            cv2.putText(g, name, (12, 1032), cv2.FONT_HERSHEY_SIMPLEX,
+                        0.55, (180, 255, 180), 1, cv2.LINE_AA)
             vw.write(g)
         if args.display:
             cv2.imshow("METEOR live", g)
@@ -355,16 +380,7 @@ def run_scene(args, root):
         n += 1
         if n % 20 == 0:
             print(f"{n}/{len(frames)} frames", flush=True)
-    if vw is not None:
-        vw.release()
-        import subprocess
-        subprocess.run(["ffmpeg", "-y", "-i",
-                        args.video.replace(".mp4", "_raw.mp4"), "-c:v",
-                        "libx264", "-crf", "24", "-pix_fmt", "yuv420p",
-                        args.video], check=True, capture_output=True)
-        os.remove(args.video.replace(".mp4", "_raw.mp4"))
-    print(f"done {n} frames -> {os.path.join(args.out, name)}"
-          + (f" + {args.video}" if args.video else ""), flush=True)
+    print(f"done {n} frames -> {os.path.join(args.out, name)}", flush=True)
 
 
 if __name__ == "__main__":

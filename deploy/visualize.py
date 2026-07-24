@@ -183,6 +183,8 @@ def compose_frame(imgs, K, T, out, v0, boxes, scene, fi, guard=None):
     for k in range(3):
         pts = [xy2px(0, 0)]
         for x_, y_ in paths[k]:
+            if not (np.isfinite(x_) and np.isfinite(y_)):
+                break                    # NaN output (bad odom frame): stop
             if abs(x_) > 60 or abs(y_) > 25:
                 break
             pts.append(xy2px(float(x_), float(y_)))
