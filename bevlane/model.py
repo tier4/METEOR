@@ -2906,6 +2906,59 @@ class DepthSegIPMNetV42(DepthSegIPMNetV41):
     VRU_FAR_BAND = True
 
 
+class DepthSegIPMNetV43(DepthSegIPMNetV42):
+    """v43 (r39): Driving-Command that actually steers.
+
+    r38 finding: the v37 intent_delta is an INPUT-INDEPENDENT 3->39 bias --
+    a 'left' command shifts the final waypoint by <=0.105 m whatever the
+    scene, so commands visibly do nothing. Two fixes:
+    1. Context-dependent conditioning: intent_mlp([pooled fused BEV, intent])
+       -> ego-output delta (zero-init last layer, tanh-bounded +-8 m,
+       fp16-safe): the shift can now depend on the junction geometry.
+    2. Train with --intent-w: a consistency hinge on the (soft) selected
+       mode's final lateral displacement vs the command direction
+       (train.py intent_loss).
+    """
+    def __init__(self, *a, **k):
+        super().__init__(*a, **k)
+        self.intent_mlp = nn.Sequential(
+            nn.Linear(96 + 3, 64), nn.ReLU(),
+            nn.Linear(64, 12 * EGO_K + EGO_K + 3))
+        nn.init.zeros_(self.intent_mlp[-1].weight)
+        nn.init.zeros_(self.intent_mlp[-1].bias)
+
+    def forward(self, imgs, K, T_cam_ego, v0=None, prev_bev=None,
+                warp_theta=None, lidar=None, lidar_bev=None, kin=None,
+                intent=None):
+        out = list(super().forward(imgs, K, T_cam_ego, v0, prev_bev,
+                                   warp_theta, lidar=lidar,
+                                   lidar_bev=lidar_bev, kin=kin,
+                                   intent=intent))
+        if intent is not None:
+            g = F.adaptive_avg_pool2d(self._fused_bev, 1).flatten(1).float()
+            d = self.intent_mlp(torch.cat([g, intent.float()], 1))
+            d = 8.0 * torch.tanh(d / 8.0)          # bounded, fp16-safe
+            gate = intent.float().amax(1, keepdim=True)   # 0-vec = no nav
+            out[7] = out[7] + (d * gate).to(out[7].dtype)
+        return tuple(out)
+
+    @staticmethod
+    def intent_loss(ego_pred, intent, margin=1.5):
+        """Command-consistency hinge: the (softmax-soft) selected mode's
+        final lateral displacement must agree with the commanded direction.
+        intent [B,3] one-hot (straight,left,right); rows dropped to zero by
+        the training dropout contribute nothing."""
+        B = ego_pred.shape[0]
+        e = ego_pred.float()
+        wp = e[:, :12 * EGO_K].view(B, EGO_K, 6, 2)
+        probs = e[:, 12 * EGO_K:12 * EGO_K + EGO_K].softmax(1)
+        lat = (probs * wp[:, :, -1, 1]).sum(1)          # soft-selected y
+        dire = intent[:, 1] - intent[:, 2]              # left=+1 right=-1
+        m = (dire.abs() > 0.5).float()
+        pen = F.relu(margin - dire * lat)
+        return (pen * m).sum() / m.sum().clamp(min=1)
+
+
 MODELS = {"v1": IPMSegNet, "v2": IPMSegNetV2, "v3s": IPMSegNetV3,
           "lss": LSSDepthNet, "v8": DepthGatedIPMNet, "v13": DepthSegIPMNet,
           "v13d": DepthSegIPMNetS4, "v14d": DepthSegIPMNetV14,
@@ -2914,4 +2967,4 @@ MODELS = {"v1": IPMSegNet, "v2": IPMSegNetV2, "v3s": IPMSegNetV3,
           "v19": DepthSegIPMNetV19, "v20": DepthSegIPMNetV20,
           "v21": DepthSegIPMNetV21, "v22": DepthSegIPMNetV22,
           "v23": DepthSegIPMNetV23, "v24": DepthSegIPMNetV24,
-          "v25": DepthSegIPMNetV25, "v26": DepthSegIPMNetV26, "v27": DepthSegIPMNetV27, "v28": DepthSegIPMNetV28, "v29": DepthSegIPMNetV29, "v30": DepthSegIPMNetV30, "v31": DepthSegIPMNetV31, "v32": DepthSegIPMNetV32, "v33": DepthSegIPMNetV33, "v34": DepthSegIPMNetV34, "v35": DepthSegIPMNetV35, "v36": DepthSegIPMNetV36, "v37": DepthSegIPMNetV37, "v38": DepthSegIPMNetV38, "v39": DepthSegIPMNetV39, "v40": DepthSegIPMNetV40, "v41": DepthSegIPMNetV41, "v42": DepthSegIPMNetV42}
+          "v25": DepthSegIPMNetV25, "v26": DepthSegIPMNetV26, "v27": DepthSegIPMNetV27, "v28": DepthSegIPMNetV28, "v29": DepthSegIPMNetV29, "v30": DepthSegIPMNetV30, "v31": DepthSegIPMNetV31, "v32": DepthSegIPMNetV32, "v33": DepthSegIPMNetV33, "v34": DepthSegIPMNetV34, "v35": DepthSegIPMNetV35, "v36": DepthSegIPMNetV36, "v37": DepthSegIPMNetV37, "v38": DepthSegIPMNetV38, "v39": DepthSegIPMNetV39, "v40": DepthSegIPMNetV40, "v41": DepthSegIPMNetV41, "v42": DepthSegIPMNetV42, "v43": DepthSegIPMNetV43}
