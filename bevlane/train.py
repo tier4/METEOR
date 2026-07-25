@@ -636,8 +636,9 @@ def evaluate_unknown_dense(model, loader, device, um_idx, max_batches=20,
         prob = out[17].float().sigmoid()[:, 0].detach().cpu().numpy()
         for b in range(prob.shape[0]):
             g = um[b].numpy()
-            if g.min() < 0:                      # -1 sentinel = no GT frame
+            if (g >= 0).sum() == 0:              # all -1 = no GT frame
                 continue
+            dc = g < -0.5                        # per-cell don't-care (v3)
             gl, gn = ndimage.label(g > 0.5)
             pl, pn = ndimage.label(prob[b] > thresh)
             # drop tiny predicted blobs (<3 cells) as noise
@@ -645,6 +646,10 @@ def evaluate_unknown_dense(model, loader, device, um_idx, max_batches=20,
             keep = [j + 1 for j in range(pn) if sz[j] >= 3]
             gt_c = ndimage.center_of_mass(g > 0.5, gl, range(1, gn + 1))
             pr_c = ndimage.center_of_mass(prob[b] > thresh, pl, keep)
+            # a prediction on a don't-care (occluded) cell is neither
+            # TP nor FP
+            pr_c = [(r_, c_) for (r_, c_) in pr_c
+                    if not dc[int(round(r_)), int(round(c_))]]
             used = [False] * len(gt_c)
             for (pr_, pc_) in pr_c:
                 xe = BEV_XH - pr_ * DET_RES
@@ -891,6 +896,9 @@ def main():
                     help="draw weight for turn frames (|lat@3s|>4m)")
     ap.add_argument("--unk-w", type=float, default=0.0)
     ap.add_argument("--unk-dense-w", type=float, default=0.0)
+    ap.add_argument("--unk-key", default="unknown_v2",
+                    help="dense unknown GT key: unknown_v2 or unknown_v3 "
+                         "(camera-visibility-filtered, occluded=don't-care)")
     ap.add_argument("--bev-rot-aug", type=float, default=0.0,
                     help="BEV-frame rotation augmentation: max |yaw| in "
                     "degrees rotated into the extrinsics + all BEV GT "
@@ -986,7 +994,7 @@ def main():
                         with_tl=use_tl, with_risk=use_risk,
                         with_lanegraph=use_lg, temporal_hist=hist_n,
                         with_unknown=use_unk, with_lidarbev=use_lidarbev,
-                        with_unknown_v2=use_unk_v2,
+                        with_unknown_v2=use_unk_v2, unk2_key=args.unk_key,
                         trim_start=3, trim_end=args.trim_end,
                         min_cov_core=args.min_cov_core,
                         min_cov_fwd=args.min_cov_fwd,
@@ -1005,6 +1013,7 @@ def main():
                             temporal_hist=hist_n, with_unknown=use_unk,
                             with_lidarbev=use_lidarbev,
                             with_unknown_v2=use_unk_v2,
+                            unk2_key=args.unk_key,
                             trim_start=3, trim_end=args.trim_end)
         seen = min(args.limit_train or len(tr), len(tr)) * args.epochs
         print(f"train {len(tr)} samples / {len(train_s)} scenes; "
