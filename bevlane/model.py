@@ -2733,7 +2733,7 @@ class MultiTaskRefiner(nn.Module):
     deployed separately."""
 
     def __init__(self, do_seg=True, do_box=True, do_e2e=True,
-                 do_traj=False, do_risk=False,
+                 do_traj=False, do_risk=False, do_unk=False,
                  n_cls=N_CLASSES, seg_width=48, box_width=32, seg_ctx=0,
                  ego_dim=None, ego_k=EGO_K):
         super().__init__()
@@ -2745,9 +2745,11 @@ class MultiTaskRefiner(nn.Module):
         # new heads: other-agent trajectory field + risk field
         self.traj = BEVDenseRefiner(TRAJ_CH, width=32) if do_traj else None
         self.risk = BEVDenseRefiner(1, width=24) if do_risk else None
+        # dense unknown-obstacle logit refiner (v41+ out[17], 1ch 400x250)
+        self.unk = BEVDenseRefiner(1, width=32) if do_unk else None
 
     def forward(self, seg=None, hm=None, reg=None, ego=None, v0=None,
-                fused=None, seg_ctx=None, traj=None, risk=None):
+                fused=None, seg_ctx=None, traj=None, risk=None, unk=None):
         """Refine whichever frozen outputs are provided; returns a dict. Called
         through DDP so every enabled head's params are tracked each step."""
         out = {}
@@ -2761,6 +2763,8 @@ class MultiTaskRefiner(nn.Module):
             out["traj"] = self.traj(traj)
         if self.risk is not None and risk is not None:
             out["risk"] = self.risk(risk)
+        if self.unk is not None and unk is not None:
+            out["unk"] = self.unk(unk)
         return out
 
 

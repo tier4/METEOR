@@ -61,7 +61,11 @@ def _unpack(batch, device, a):
         ego_gt = g(bi); bi += 1
     if a.do_risk:
         risk_gt = g(bi); bi += 1
-    return imgs, K, Tc, gt, det_boxes, det_n, traj_gt, tvalid, ego_gt, risk_gt
+    unk_gt = None
+    if a.do_unk:                          # dense unknown mask (+1)
+        unk_gt = g(bi); bi += 1
+    return (imgs, K, Tc, gt, det_boxes, det_n, traj_gt, tvalid, ego_gt,
+            risk_gt, unk_gt)
 
 
 @torch.no_grad()
@@ -71,11 +75,12 @@ def evaluate(frozen, ref0, loader, device, args, max_b=40):
     iF = iR.copy(); uF = iR.copy()
     ade_r = ade_f = nseen = 0.0
     hm_r = hm_f = 0.0
+    utp_r = ufp_r = ufn_r = utp_f = ufp_f = ufn_f = 0
     for bi, batch in enumerate(loader):
         if bi >= max_b:
             break
         (imgs, K, Tc, gt, det_boxes, det_n, traj_gt, tvalid,
-         ego_gt, risk_gt) = _unpack(batch, device, args)
+         ego_gt, risk_gt, unk_gt) = _unpack(batch, device, args)
         v0 = ego_gt[:, 12] if args.do_e2e else None
         with torch.autocast("cuda", torch.float16):
             out = frozen(imgs, K, Tc, v0)
@@ -88,7 +93,20 @@ def evaluate(frozen, ref0, loader, device, args, max_b=40):
                      ego=out[7].float() if args.do_e2e else None,
                      v0=v0, fused=fused, seg_ctx=ctx,
                      traj=out[9].float() if args.do_traj else None,
-                     risk=out[12].float() if args.do_risk else None)
+                     risk=out[12].float() if args.do_risk else None,
+                     unk=out[17].float() if args.do_unk else None)
+        if args.do_unk:
+            pos = unk_gt > 0.5
+            neg = (unk_gt > -0.5) & ~pos       # visible free cells only
+            for tag, logit in (("r", out[17]), ("f", r["unk"])):
+                p = logit.float().sigmoid()[:, 0] > 0.3
+                tp = (p & pos).sum().item()
+                fp = (p & neg).sum().item()
+                fn = (~p & pos).sum().item()
+                if tag == "r":
+                    utp_r += tp; ufp_r += fp; ufn_r += fn
+                else:
+                    utp_f += tp; ufp_f += fp; ufn_f += fn
         if args.do_seg:
             pr, pf = seg.argmax(1), r["seg"].argmax(1)
             m = gt > 0
@@ -118,6 +136,11 @@ def evaluate(frozen, ref0, loader, device, args, max_b=40):
     res = {"seg": (iR, uR, iF, uF)}
     if args.do_e2e and nseen:
         res["ade"] = (ade_r / nseen, ade_f / nseen)
+    if args.do_unk:
+        res["unk"] = ((utp_r / max(utp_r + ufp_r, 1),
+                       utp_r / max(utp_r + ufn_r, 1)),
+                      (utp_f / max(utp_f + ufp_f, 1),
+                       utp_f / max(utp_f + ufn_f, 1)))
     ref0.train()
     return res
 
@@ -138,6 +161,10 @@ def _report(res, ep, step, tag=""):
     if "ade" in res:
         print(f"[refE2E ep{ep} step{step}] {tag} ADE raw->refined "
               f"{res['ade'][0]:.3f}->{res['ade'][1]:.3f}", flush=True)
+    if "unk" in res:
+        (pr, rr_), (pf, rf) = res["unk"]
+        print(f"[refUnk ep{ep} step{step}] {tag} pix P/R raw "
+              f"{pr:.3f}/{rr_:.3f} -> refined {pf:.3f}/{rf:.3f}", flush=True)
 
 
 def main():
@@ -163,6 +190,10 @@ def main():
                     help="refine the other-agent trajectory field (out[9])")
     ap.add_argument("--do-risk", action="store_true", default=False,
                     help="refine the risk field (out[12])")
+    ap.add_argument("--do-unk", action="store_true", default=False,
+                    help="refine the dense unknown logit (out[17], v41+)")
+    ap.add_argument("--unk-w", type=float, default=2.0)
+    ap.add_argument("--unk-key", default="unknown_v3")
     ap.add_argument("--box-w", type=float, default=1.0)
     ap.add_argument("--e2e-w", type=float, default=1.0)
     ap.add_argument("--traj-w", type=float, default=0.5)
@@ -199,7 +230,8 @@ def main():
 
     ref = MultiTaskRefiner(do_seg=args.do_seg, do_box=args.do_box,
                            do_e2e=args.do_e2e, do_traj=args.do_traj,
-                           do_risk=args.do_risk, n_cls=N_CLASSES,
+                           do_risk=args.do_risk, do_unk=args.do_unk,
+                           n_cls=N_CLASSES,
                            seg_width=args.width, seg_ctx=args.ctx,
                            ego_dim=EGO_DIM).to(device)
     if is_main:
@@ -207,7 +239,8 @@ def main():
         print(f"[frozen] {args.ckpt} missing={len(miss)} unexpected={len(unexp)}",
               flush=True)
         print(f"[refiner] heads: seg={args.do_seg} box={args.do_box} "
-              f"e2e={args.do_e2e} traj={args.do_traj} risk={args.do_risk} | "
+              f"e2e={args.do_e2e} traj={args.do_traj} risk={args.do_risk} "
+              f"unk={args.do_unk}({args.unk_key}) | "
               f"params={n_par:.2f}M (zero-init residual)", flush=True)
     ref = DDP(ref, device_ids=[local]) if ddp else ref
     ref0 = ref.module if ddp else ref
@@ -215,7 +248,8 @@ def main():
     # with_agenttraj provides boxes+traj; else with_boxdet gives boxes.
     dkw = dict(with_depth=False, with_agenttraj=args.do_traj,
                with_boxdet=args.do_box and not args.do_traj,
-               with_ego=args.do_e2e, with_risk=args.do_risk)
+               with_ego=args.do_e2e, with_risk=args.do_risk,
+               with_unknown_v2=args.do_unk, unk2_key=args.unk_key)
     tr = BevLaneDataset(args.root, train_s, gt_key=args.gt_key, **dkw)
     va = BevLaneDataset(args.root, val_s, max_per_scene=4, gt_key=args.gt_key,
                         **dkw)
@@ -246,7 +280,7 @@ def main():
             if args.limit_train and bidx >= args.limit_train:
                 break
             (imgs, K, Tc, gt, det_boxes, det_n, traj_gt, tvalid,
-             ego_gt, risk_gt) = _unpack(batch, device, args)
+             ego_gt, risk_gt, unk_gt) = _unpack(batch, device, args)
             v0 = ego_gt[:, 12] if args.do_e2e else None
             has_box = args.do_box or args.do_traj      # det_boxes available
             with torch.no_grad(), torch.autocast("cuda", torch.float16):
@@ -257,12 +291,13 @@ def main():
                 ego = out[7].float() if args.do_e2e else None
                 traj = out[9].float() if args.do_traj else None
                 risk = out[12].float() if args.do_risk else None
+                unk = out[17].float() if args.do_unk else None
                 ctx = frozen.lane_input().float() if args.ctx else None
                 fused = frozen._fused_bev.float() if args.do_e2e else None
             with torch.autocast("cuda", torch.float16):
                 r = ref(seg=seg if args.do_seg else None, hm=hm, reg=reg,
                         ego=ego, v0=v0, fused=fused, seg_ctx=ctx,
-                        traj=traj, risk=risk)
+                        traj=traj, risk=risk, unk=unk)
                 loss = seg.new_zeros(())
                 if args.do_seg:
                     rs = r["seg"].float()
@@ -287,6 +322,10 @@ def main():
                 if args.do_risk:
                     loss = loss + args.risk_w * frozen.risk_loss(
                         r["risk"].float(), risk_gt)
+                if args.do_unk:
+                    # v41+ alpha-focal w/ pos_weight; -1 = don't-care
+                    loss = loss + args.unk_w * frozen.unk_dense_loss(
+                        r["unk"].float(), unk_gt)
             opt.zero_grad(set_to_none=True)
             # DDP-safe non-finite guard: ALL ranks must agree, else a rank that
             # skips backward() deadlocks the others on the grad all-reduce.
