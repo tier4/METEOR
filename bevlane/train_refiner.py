@@ -346,6 +346,24 @@ def main():
             if is_main and step % 100 == 0:
                 print(f"ep{ep} step{step}/{steps} loss={loss.item():.4f} "
                       f"lr={sched.get_last_lr()[0]:.2e}", flush=True)
+            if step % 200 == 0:
+                # BN running stats are updated in FORWARD: one inf batch
+                # poisons them permanently and the loss-skip guard cannot
+                # help. Detect and hard-exit -> the retry wrapper relaunches
+                # from a clean state instead of skip-looping forever.
+                bad = any(not torch.isfinite(t).all()
+                          for t in list(ref0.parameters())
+                          + list(ref0.buffers()))
+                flag = torch.tensor([float(bad)], device=device)
+                if ddp:
+                    dist.all_reduce(flag, op=dist.ReduceOp.MAX)
+                if flag.item() > 0:
+                    if is_main:
+                        print(f"ep{ep} step{step} POISONED PARAMS/BUFFERS "
+                              "-- exiting for clean relaunch", flush=True)
+                    if ddp:
+                        dist.destroy_process_group()
+                    sys.exit(3)
             if is_main and step % 1000 == 0:
                 _report(evaluate(frozen, ref0, dv, device, args), ep, step)
         if is_main:

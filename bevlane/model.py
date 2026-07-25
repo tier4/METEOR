@@ -2667,9 +2667,10 @@ class BEVDenseRefiner(nn.Module):
     channel, encoder to s8, decoder with skips, zero-init last conv so it is
     identity at start and can only add a correction to the frozen map."""
 
-    def __init__(self, cin, width=32):
+    def __init__(self, cin, width=32, bound=None):
         super().__init__()
         self.cin = cin
+        self.bound = bound          # tanh-bound on the residual (fp16 safety)
 
         def enc(ci, co):
             return nn.Sequential(
@@ -2718,7 +2719,13 @@ class BEVDenseRefiner(nn.Module):
         y2 = self.m2(s2 + up(self.u3(s3), s2))
         y1 = self.m1(s1 + up(self.u2(y2), s1))
         y0 = s0 + up(self.u1(y1), s0)
-        return x + self.out(y0)
+        res = self.out(y0)
+        if self.bound:
+            # one fp16-inf activation permanently poisons the BN running
+            # stats (r38 refiner died at step 19.5k); a bounded residual
+            # cannot amplify itself into overflow
+            res = self.bound * torch.tanh(res / self.bound)
+        return x + res
 
 
 TRAJ_CH = TRAJ_H * 2 * EGO_K + EGO_K      # 39: dense agent-forecast channels
@@ -2746,7 +2753,7 @@ class MultiTaskRefiner(nn.Module):
         self.traj = BEVDenseRefiner(TRAJ_CH, width=32) if do_traj else None
         self.risk = BEVDenseRefiner(1, width=24) if do_risk else None
         # dense unknown-obstacle logit refiner (v41+ out[17], 1ch 400x250)
-        self.unk = BEVDenseRefiner(1, width=32) if do_unk else None
+        self.unk = BEVDenseRefiner(1, width=32, bound=6.0) if do_unk else None
 
     def forward(self, seg=None, hm=None, reg=None, ego=None, v0=None,
                 fused=None, seg_ctx=None, traj=None, risk=None, unk=None):
@@ -2764,7 +2771,7 @@ class MultiTaskRefiner(nn.Module):
         if self.risk is not None and risk is not None:
             out["risk"] = self.risk(risk)
         if self.unk is not None and unk is not None:
-            out["unk"] = self.unk(unk)
+            out["unk"] = self.unk(unk.clamp(-12.0, 12.0))
         return out
 
 
