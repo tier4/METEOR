@@ -145,6 +145,32 @@ def draw_boxes_on_rgb(img, det_boxes, K, Tce, cw, ch, W0=768, H0=432):
                             cv2.FONT_HERSHEY_SIMPLEX, 0.45, col, 1, cv2.LINE_AA)
 
 
+def pseudo_intent(pose, fi, lo=5, hi=25, lat_th=3.0):
+    """Navigation-style pseudo Driving Command from the recorded route.
+
+    Lateral displacement of the ego pose 1-5 s ahead (rows at 5 Hz),
+    expressed in the CURRENT ego frame -> one-hot [straight,left,right].
+    Same convention as training (v37 intent: lat>+th=left, <-th=right)
+    but with a LONGER horizon, so the command fires before the turn --
+    exactly what a navigation system would provide."""
+    x0, y0, yaw0 = pose[fi]
+    c, s = np.cos(yaw0), np.sin(yaw0)
+    best = 0.0
+    for d in range(lo, min(hi, len(pose) - 1 - fi) + 1):
+        dx, dy = pose[fi + d][0] - x0, pose[fi + d][1] - y0
+        ey = -s * dx + c * dy               # lateral (left +) in ego frame
+        if abs(ey) > abs(best):
+            best = float(ey)
+    oh = np.zeros(3, np.float32)
+    if best > lat_th:
+        oh[1] = 1.0; lab = "LEFT"
+    elif best < -lat_th:
+        oh[2] = 1.0; lab = "RIGHT"
+    else:
+        oh[0] = 1.0; lab = "STRAIGHT"
+    return oh, lab
+
+
 _RIBBON_STATE = {"wps": None}
 
 
@@ -231,6 +257,11 @@ def main():
     ap.add_argument("--scenes", nargs="+", required=True)
     ap.add_argument("--out", default="out/demo_rgbd_bev.mp4")
     ap.add_argument("--fps", type=int, default=15)
+    ap.add_argument("--intent", default="none",
+                    choices=["none", "auto", "straight", "left", "right"],
+                    help="pseudo Driving Command into the v37+ intent input: "
+                         "auto = navigation-style, derived from the RECORDED "
+                         "route 1-5 s ahead (command fires BEFORE the turn)")
     ap.add_argument("--no-thin", action="store_true")
     ap.add_argument("--seg-fuse", action="store_true",
                     help="ego-warped log-odds fusion of BEV seg over time "
@@ -415,6 +446,22 @@ def main():
                     lid_kw = {"lidar": lt.cuda()}
                 except Exception:
                     pass
+            # pseudo Driving Command (v37+ intent input)
+            intent_lab = None
+            if args.intent != "none" and args.model in (
+                    "v37", "v38", "v39", "v40", "v41", "v42"):
+                if args.intent == "auto":
+                    try:
+                        pz = np.load(os.path.join("out/bevlane", s_pre,
+                                                  "ego_motion.npz"))["pose"]
+                        oh, intent_lab = pseudo_intent(pz, f_pre["frame"])
+                    except Exception:
+                        oh, intent_lab = np.zeros(3, np.float32), None
+                else:
+                    idx = {"straight": 0, "left": 1, "right": 2}[args.intent]
+                    oh = np.zeros(3, np.float32); oh[idx] = 1.0
+                    intent_lab = args.intent.upper()
+                lid_kw["intent"] = torch.from_numpy(oh)[None].cuda()
             with torch.no_grad(), torch.autocast("cuda", torch.float16):
                 if args.model in ("v22", "v23", "v25", "v26", "v27", "v28", "v29", "v30", "v31", "v32", "v33", "v34", "v35", "v36", "v37", "v38", "v39", "v40", "v41", "v42"):
                     out = m(imgs_m[None].cuda(), K[None].cuda(),
@@ -838,6 +885,12 @@ def main():
                         ("pred BEV+bbox +-25x+-60m" if args.model in ("v15", "v16", "v17")
                          else "pred BEV +-25x+-60m"), (6, 24),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 255), 2, cv2.LINE_AA)
+            if intent_lab:
+                arr = {"LEFT": "<<", "RIGHT": ">>", "STRAIGHT": "^"}.get(
+                    intent_lab, "")
+                cv2.putText(bev, f"NAV {arr} {intent_lab}", (6, 48),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.6, (80, 220, 255), 2,
+                            cv2.LINE_AA)
             bx = min(bx0, VW - BW2)                          # flush to right edge
             frame[40:40 + BH2, bx:bx + BW2] = bev
 
