@@ -394,6 +394,11 @@ def main():
                     sys.exit(3)
             if is_main and step % 1000 == 0:
                 _report(evaluate(frozen, ref0, dv, device, args), ep, step)
+                # periodic save: BN-poisoning incidents cost 20k steps when
+                # only epoch-end saves existed
+                torch.save({"refiner": ref0.state_dict(), "epoch": ep,
+                            "step": step, "args": vars(args)},
+                           os.path.join(args.out, "last.pt"))
         if is_main:
             torch.save({"refiner": ref0.state_dict(), "epoch": ep,
                         "args": vars(args)},
