@@ -439,31 +439,73 @@ caption(s, "人手を待たずに24時間開発を継続 ── わずか約3週
         y=6.4, col=C_GREEN, size=14)
 
 # ---------------------------------------------------------------- 5 model architecture
-s = slide("モデルアーキテクチャ",
-          "8台のカメラ映像を1つのモデルが俯瞰(BEV)へ変換し、多タスクを同時出力")
-ay = 2.15; ah = 1.7
-a1 = nbox(s, 0.55, ay, 1.9, ah, "8台の\nカメラ", fc=F_GRAY)
-a2 = nbox(s, 2.75, ay, 2.15, ah, "共有\nバックボーン", "画像特徴抽出", fc=F_BLUE)
-a3 = nbox(s, 5.2, ay - 0.95, 2.2, 1.5, "深度推定", "ピクセル毎(AI)", fc=F_AMBER)
-a3b = nbox(s, 5.2, ay + 1.05, 2.2, 1.5, "深度ゲート\nIPM投影", "幾何的に正確", fc=F_AMBER)
-a4 = nbox(s, 7.7, ay, 2.1, ah, "共有BEV\n(俯瞰空間)", "+時系列メモリ", fc=F_GREEN)
-a5 = nbox(s, 10.05, ay - 0.35, 2.7, 2.4,
-          "マルチタスクヘッド",
-          "BEVセグ / 3D物体 / 信号\n経路計画E2E / 深度・占有\n車線グラフ / 未知障害物",
-          fc=F_BLUE, fs=12, sfs=9.5)
-a6 = nbox(s, 5.6, ay + 3.05, 4.6, 1.35, "Refiner + 自己ガードレール",
-          "出力を自動補正し、決定論的な安全層で配備", fc=F_PURP, fs=13, sfs=10)
-link(s, a1, a2); link(s, a2, a3); link(s, a2, a3b)
-link(s, a3, a4); link(s, a3b, a4); link(s, a4, a5)
-link(s, a5, a6, side="v", col=C_TEAL)
-bullets(s, [
-    (0, "現行の車載SoC（NVIDIA Orin）で動作可能な、現実的な構成のCNNベース"
-        "効率重視アーキテクチャを採用（LLM・世界モデル(WM)ベースにも拡張可能"
-        "だが、現行ハードでは実行が難しいため現時点では未着手）。", C_NAVY),
-    (0, "学習データはDRSで収集した日本全国（九州〜北海道）の走行データで"
-        "バリエーションが高い。Co-MLOpsプロジェクトでCoMET（自動ラベル基盤）"
-        "により自動ラベリング済みのものを再利用。", C_NAVY),
-], y=6.3, size=11.5)
+s = slide("モデルアーキテクチャ（53Mパラメータ・CNN構成）",
+          "8カメラ → 深度付き俯瞰変換 → 時系列融合 → 10タスク同時出力 → 補正・安全層")
+# --- inputs column ---
+i1 = nbox(s, 0.3, 1.55, 1.75, 1.05, "8カメラ", "サラウンド6 +\n前後望遠2 (432×768)",
+          fc=F_GRAY, fs=11, sfs=8)
+i2 = nbox(s, 0.3, 2.8, 1.75, 0.8, "車速・運動履歴", "v0 + 直近2.8秒", fc=F_GRAY,
+          fs=9.5, sfs=8)
+i3 = nbox(s, 0.3, 3.8, 1.75, 0.8, "Driving Command", "直進/左折/右折(任意)",
+          fc=F_GRAY, fs=9, sfs=8)
+i4 = nbox(s, 0.3, 4.8, 1.75, 0.8, "LiDAR(任意)", "学習時のみ使用可",
+          fc=F_GRAY, fs=9.5, sfs=8)
+# --- image branch ---
+bb = nbox(s, 2.5, 1.55, 1.85, 1.5, "CNNバックボーン\n+FPN", "カメラ毎に共有重み",
+          fc=F_BLUE, fs=10.5, sfs=8)
+d2 = nbox(s, 2.5, 3.35, 1.85, 0.95, "2D出力", "21クラスセグ\n10クラス2D箱",
+          fc=F_BLUE, fs=10, sfs=8)
+dp = nbox(s, 4.75, 1.55, 1.85, 0.95, "深度分布推定", "ピクセル毎の距離確率",
+          fc=F_AMBER, fs=10.5, sfs=8)
+ipm = nbox(s, 4.75, 2.75, 1.85, 1.15, "深度ゲート\nIPM投影", "特徴×深度を俯瞰へ",
+           fc=F_AMBER, fs=10.5, sfs=8)
+# --- BEV branch ---
+bev = nbox(s, 7.0, 1.55, 1.9, 1.0, "BEVグリッド", "800×500・0.2m/セル\n前後±80m 左右±50m",
+           fc=F_GREEN, fs=10.5, sfs=8)
+tmp = nbox(s, 7.0, 2.8, 1.9, 1.1, "時系列メモリ融合", "0.4/1.2/2.8秒前のBEVを\n自車移動分ずらして重ねる",
+           fc=F_GREEN, fs=10, sfs=8)
+enc = nbox(s, 7.0, 4.15, 1.9, 0.9, "BEVエンコーダ", "256ch 共有特徴",
+           fc=F_GREEN, fs=10.5, sfs=8)
+# --- heads grid (2 cols x 5) ---
+heads = [("BEVセグ", "車線・停止線等 9クラス"), ("3D物体検出", "車両/歩行者+向き・速度"),
+         ("信号状態", "青/黄/赤 + 自車関連性"), ("E2E経路計画", "3候補・車速/Command入力"),
+         ("他者予測", "3秒先の軌跡場"), ("リスク地図", "衝突危険度の分布"),
+         ("3D占有(OCC)", "立体ボクセル"), ("未知障害物", "落下物等・密マップ"),
+         ("車線グラフ", "ベクトル接続関係"), ("占有フロー", "動き場")]
+hx0, hy0 = 9.35, 1.5
+hboxes = []
+for i, (t, d) in enumerate(heads):
+    r, c = divmod(i, 2)
+    hb2 = nbox(s, hx0 + c * 1.72, hy0 + r * 0.78, 1.62, 0.68, t, d,
+               fc=F_BLUE, fs=9, sfs=6.5)
+    hboxes.append(hb2)
+# --- refiner + guardrail ---
+rf = nbox(s, 9.35, hy0 + 5 * 0.78 + 0.15, 3.34, 0.62, "Refiner（タスク毎の残差補正）",
+          "凍結出力に補正のみ加算＝劣化しない構造", fc=F_PURP, fs=9.5, sfs=7)
+gd = nbox(s, 9.35, hy0 + 5 * 0.78 + 0.92, 3.34, 0.62, "自己ガードレール（決定論）",
+          "衝突・赤信号・逸脱チェック → 不合格なら安全停止", fc=F_PURP, fs=9.5, sfs=7)
+# --- wires ---
+link(s, i1, bb)
+link(s, bb, dp); link(s, bb, ipm)
+c_ = s.shapes.add_connector(MSO_CONNECTOR.STRAIGHT, bb.left + bb.width // 2,
+                            bb.top + bb.height, d2.left + d2.width // 2, d2.top)
+_arrow(c_, C_BLUE)
+link(s, dp, bev); link(s, ipm, tmp)
+link(s, bev, tmp, side="v", col=C_GREEN)
+link(s, tmp, enc, side="v", col=C_GREEN)
+link(s, enc, hboxes[8])
+c2_ = s.shapes.add_connector(MSO_CONNECTOR.STRAIGHT, enc.left + enc.width,
+                             enc.top + enc.height // 2, Inches(hx0),
+                             Inches(hy0 + 0.35))
+_arrow(c2_, C_BLUE)
+c3_ = s.shapes.add_connector(MSO_CONNECTOR.STRAIGHT,
+                             Inches(hx0 + 1.6), Inches(hy0 + 5 * 0.78),
+                             rf.left + rf.width // 2, rf.top)
+_arrow(c3_, RGBColor(0x8E, 0x44, 0xAD))
+link(s, rf, gd, side="v", col=C_TEAL)
+# aux inputs (v0/kin/Command/LiDAR) are annotated in-box to keep wires clean
+caption(s, "CNN構成＝現行SoC（Orin）で動作可能な現実的な設計（LLM/世界モデル化は現行車載HWでは困難なため未着手）"
+        "／ 学習データはCoMET自動ラベル（人手0）", y=6.95, col=C_GRAY, size=10.5)
 
 # ---------------------------------------------------------------- 6 screen guide (before the video)
 s = slide("デモ画面の見方", "1枚の画面に「見る・測る・理解する・決める」が全部出ます")
