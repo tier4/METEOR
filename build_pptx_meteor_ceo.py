@@ -198,11 +198,33 @@ bullets(s, [
         "自動運転の認識・計画AIを自律的に作り続けるエンジンです。", C_NAVY),
     (0, "カメラのみ（深度をAIが推定）で、地図に依存せず、軽量にエッジ配備。"
         "決定論的な自己ガードレールで安全に動きます。", C_NAVY),
-    (0, "現時点で人手ラベル0枚のまま約60時間分・7,147シーンを自動学習し、"
+    (0, "現時点で人手ラベル0枚のまま9,600シーン・約128万フレームを自動学習し、"
         "車両検出・車線・信号・経路計画までを1モデルで出力しています。", C_GREEN),
 ], size=18)
 bignum(s, [("0", "人手ラベル"), ("0", "人手コード行"), ("0", "HDマップ"),
-           ("60h+", "自動学習データ")], y=4.6)
+           ("9,600+", "自動学習シーン")], y=4.6)
+
+# ---------------------------------------------------------------- 2.5 glossary
+s = slide("はじめに ── この資料で使う3つの言葉", "これだけ分かれば全部読めます")
+gl = [("BEV（俯瞰図）", "クルマの真上から見た地図のような絵。"
+       "8台のカメラ映像をAIが1枚の俯瞰図に変換し、その上で道路や他車を理解します。", F_BLUE),
+      ("アノテーション", "AIに見せる「正解ラベル」を人が手作業で付ける仕事。"
+       "従来は数万枚規模で必要。METEORはこれがゼロ（自動生成）。", F_AMBER),
+      ("E2E（経路計画）", "カメラ映像から「次にどう走るか」の線まで一気通貫にAIが出すこと。"
+       "METEORは認識と計画を1つのモデルで同時に行います。", F_GREEN)]
+for i, (t, d, fc) in enumerate(gl):
+    card = s.shapes.add_shape(MSO_SHAPE.ROUNDED_RECTANGLE,
+                              Inches(0.7 + i * 4.2), Inches(2.1),
+                              Inches(3.9), Inches(3.6))
+    card.fill.solid(); card.fill.fore_color.rgb = fc
+    card.line.color.rgb = C_EDGE; card.line.width = Pt(1.2)
+    card.shadow.inherit = False
+    tf = card.text_frame; tf.word_wrap = True
+    tf.margin_left = tf.margin_right = Inches(0.15)
+    p = tf.paragraphs[0]; p.text = t; p.alignment = PP_ALIGN.CENTER
+    p.font.size = Pt(19); p.font.bold = True; p.font.color.rgb = C_NAVY
+    p2 = tf.add_paragraph(); p2.text = "\n" + d
+    p2.font.size = Pt(13); p2.font.color.rgb = C_NAVY
 
 # ---------------------------------------------------------------- 3 problem
 s = slide("なぜ自動運転の「認識」は高コストなのか", "従来アプローチの3つの重荷",
@@ -408,6 +430,64 @@ bullets(s, [
 demo_slide("METEOR デモ ── 実走行での認識・計画",
            "カメラのみ・地図なしで、BEV・3D物体・信号・経路計画をリアルタイム出力")
 
+# ---------------------------------------------------------------- 6.5 screen guide
+s = slide("デモ画面の見方", "1枚の画面に「見る・測る・理解する・決める」が全部出ます")
+img_w, img_h = 8.6, 4.84
+pic = s.shapes.add_picture("docs/media/ceo_demo_frame.png", Inches(0.45),
+                           Inches(1.7), Inches(img_w), Inches(img_h))
+guide = [
+    ("(1) 8カメラ+認識結果", "車両・歩行者・信号を映像上に表示",
+     C_BLUE, 2.0, 0.45 + img_w * 0.35, 1.75 + img_h * 0.12),
+    ("(2) 距離の予測(深度)", "色=距離。カメラだけで測距",
+     C_AMBER, 3.15, 0.45 + img_w * 0.35, 1.75 + img_h * 0.55),
+    ("(3) 立体空間の理解", "ボクセル=立体の占有マップ",
+     C_GREEN, 4.3, 0.45 + img_w * 0.12, 1.75 + img_h * 0.85),
+    ("(4) 俯瞰図(BEV)+走行計画", "緑線=AIの走行計画。GUARD OK=\n決定論の安全チェック合格",
+     C_TEAL, 5.45, 0.45 + img_w * 0.88, 1.75 + img_h * 0.5),
+]
+for t, d, col, ly, ax, ay in guide:
+    lb = s.shapes.add_shape(MSO_SHAPE.ROUNDED_RECTANGLE, Inches(9.35),
+                            Inches(ly), Inches(3.6), Inches(1.0))
+    lb.fill.solid(); lb.fill.fore_color.rgb = C_WHITE
+    lb.line.color.rgb = col; lb.line.width = Pt(2); lb.shadow.inherit = False
+    tf = lb.text_frame; tf.word_wrap = True
+    tf.margin_left = Inches(0.08); tf.margin_top = Inches(0.03)
+    p = tf.paragraphs[0]; p.text = t
+    p.font.size = Pt(13.5); p.font.bold = True; p.font.color.rgb = col
+    p2 = tf.add_paragraph(); p2.text = d
+    p2.font.size = Pt(10.5); p2.font.color.rgb = C_NAVY
+    c = s.shapes.add_connector(MSO_CONNECTOR.STRAIGHT, Inches(9.35),
+                               Inches(ly + 0.5), Inches(ax), Inches(ay))
+    _arrow(c, col)
+caption(s, "人が運転中に頭の中でやっていること（見る・距離感・立体把握・進路決め）を、"
+        "1つのAIが毎フレーム実行", y=6.85, col=C_GREEN, size=13)
+
+# ---------------------------------------------------------------- 6.7 self-improvement
+s = slide("自動で賢くなる ── 人手ゼロの改善ループ実績",
+          "ラウンド（自動学習の周回）毎に、人が何もしなくても精度が上がる")
+imp = [("BEVセグ精度 (mIoU)", "0.324", "0.334", "↑", C_GREEN),
+       ("車両検出の再現率", "47%", "51%", "↑", C_GREEN),
+       ("経路計画の誤差", "0.43m", "0.39m", "↓ (小さいほど良い)", C_BLUE)]
+for i, (t, a, b, ar, col) in enumerate(imp):
+    card = s.shapes.add_shape(MSO_SHAPE.ROUNDED_RECTANGLE,
+                              Inches(0.7 + i * 4.2), Inches(2.0),
+                              Inches(3.9), Inches(2.9))
+    _fill(card, RGBColor(0xF2, 0xF4, 0xF6))
+    tf = card.text_frame; tf.word_wrap = True
+    tf.vertical_anchor = MSO_ANCHOR.MIDDLE
+    p = tf.paragraphs[0]; p.text = t; p.alignment = PP_ALIGN.CENTER
+    p.font.size = Pt(16); p.font.bold = True; p.font.color.rgb = C_NAVY
+    p2 = tf.add_paragraph(); p2.text = f"{a} → {b}"
+    p2.alignment = PP_ALIGN.CENTER; p2.font.size = Pt(30); p2.font.bold = True
+    p2.font.color.rgb = col
+    p3 = tf.add_paragraph(); p3.text = ar
+    p3.alignment = PP_ALIGN.CENTER; p3.font.size = Pt(13); p3.font.color.rgb = C_GRAY
+bullets(s, [
+    (0, "改善のサイクル（データ追加 → 自動ラベル → 学習 → 評価 → 弱点の自動補正）を"
+        "24時間、AIが自律で回し続けた結果です。", C_NAVY),
+    (0, "→ 精度向上が人件費ではなく「計算時間」で買える構造。", C_AMBER),
+], y=5.3, size=15)
+
 # ---------------------------------------------------------------- 7 differentiators
 s = slide("METEORの4+2の強み（＝競争優位）", "この組み合わせが他に無い")
 bullets(s, [
@@ -515,7 +595,7 @@ _fill(line, C_BLUE)
 mile = [
     (1.7, "7/10", "開発スタート", "BEV Segmentation・\n3D BBox 推論", C_BLUE, True),
     (6.3, "7/17", "機能追加", "E2E（経路計画）\n機能を追加", C_TEAL, False),
-    (11.3, "現在", "統合・自己改善", "多タスク統合・Refiner\n・エッジ配備まで", C_GREEN, True),
+    (11.3, "現在", "統合・自己改善", "多タスク統合・TensorRT実装\n・自己改善ループ稼働", C_GREEN, True),
 ]
 for x, date, head, desc, col, above in mile:
     dot = s.shapes.add_shape(MSO_SHAPE.OVAL, Inches(x - 0.16), Inches(tl_y - 0.13),
@@ -566,6 +646,8 @@ bullets(s, [
     (1, "LLM・世界モデル（WM）ベースにもできるが、現行ハードウェアでの実行が"
         "難しいため現時点では未着手（将来の拡張余地）。"),
     (0, "TensorRTエンジン + C++ランタイムに変換済み。車載GPUで単体動作。"),
+    (1, "実測: 1フレーム108ms（fp16, NVIDIA L40S）。モジュール別の実測プロファイル"
+        "とINT8化・機能絞り込みの最適化計画を整備済み。"),
     (0, "カメラのみで完結（LiDAR等はオプション）。追加センサー無しで配備可能。"),
     (0, "→ 量産車への搭載を見据えた、現実的なコストとフットプリント。", C_TEAL),
 ])
@@ -583,12 +665,14 @@ bullets(s, [
 # ---------------------------------------------------------------- 15 capabilities
 s = slide("何ができるか ── 1モデルで多タスク", "カメラのみ・地図なしの実測値（検証データ）")
 bullets(s, [
-    (0, "BEVセグメンテーション（車線・停止線・横断歩道・走行領域）"),
-    (0, "3D物体検出：車両 適合率 83%"),
-    (0, "信号認識：全体 74%（青信号 94%）"),
-    (0, "経路計画(E2E)：平均誤差 約0.4〜0.9m"),
+    (0, "BEVセグメンテーション（車線・停止線・横断歩道・走行領域）: mIoU 0.334"),
+    (0, "3D物体検出：車両 適合率 ~80%・再現率 51%（遠方40m超も強化中）"),
+    (0, "信号認識：全体 74%（青信号 90%+）"),
+    (0, "経路計画(E2E)：カーブ誤差 0.39m（直線含む平均 0.87m）"),
     (0, "加えて：深度・占有・車線グラフ・未知障害物・他者挙動予測・リスク地図"),
     (1, "後段のRefinerが、遠方や細部を自動で補正しさらに高精度化。"),
+    (0, "未学習の米国道路でも車両・信号・経路の基本認識が動作（ゼロショット汎化）。",
+     C_GREEN),
 ], size=16)
 
 # ---------------------------------------------------------------- 16 business value
