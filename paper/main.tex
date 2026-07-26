@@ -340,6 +340,24 @@ joins the 3D-box stream as a third class with a fixed
 $0.4{\times}0.4$\,m footprint. The factory thus \emph{invents} supervision
 for a class no annotator ever drew.
 
+Two revisions were required before this supervision became learnable.
+First, per-frame blobs are too sparse: the GT was rebuilt by accumulating
+LiDAR small-obstacle candidates over the \emph{whole drive} in a global
+grid (confirmed after $\ge$3 hits), subtracting known-box footprints, and
+projecting the confirmed obstacles back into every frame as a dense
+occupancy mask. Second---and diagnostically decisive---a drive-accumulated
+mask marks obstacles the cameras \emph{cannot see in that frame}: on urban
+validation scenes a BEV ray-march over the per-frame LiDAR raster (camera
+height 1.75\,m against each cell's max-height profile) shows a median 59\%
+of accumulated positives are occluded at any given moment. Training against
+them punishes physically impossible predictions and pins object-level
+recall near zero; relabelling occluded cells as per-cell \emph{don't-care}
+makes both the loss and the metric refer only to the visible set. A
+complementary decode-time path lifts the per-camera 2D \emph{obstacle}
+detections through the predicted depth into BEV (ground-contact sampling,
+cross-camera de-duplication), providing instance-separated unknown markers
+without any BEV-head involvement.
+
 \subsection{Ego-relevant traffic-light state}
 CoMET's TLR subnet already writes per-image light boxes with colour states
 into the 2D autolabels; we reduce them to one whole-image label per frame
@@ -585,18 +603,27 @@ the scene list with newly converted recordings, warm-starts from the previous
 best checkpoint (shape-mismatched heads are dropped and re-initialised, so
 class-count changes retrain only the affected head), and applies whatever GT
 or loss fixes the previous round's metrics motivated. Nine rounds and four new
-task heads shipped in the project's first three days; the same loop is
+task heads shipped in the project's first three days; by week three the loop
+had produced $\sim$40 rounds, with BEV mIoU rising 0.302$\to$0.334 and curve
+ADE falling 0.72$\to$0.39\,m with no human intervention. Post-hoc residual
+refiners (zero-initialised U-Nets/MLPs on the frozen model's outputs, one per
+task) are trained between rounds and grafted back as trainable heads, so
+each round inherits the previous round's corrections. The same loop is
 designed to run for months as the factory converts the full corpus.
 
 \section{Experiments}
 \label{sec:exp}
 
 \subsection{Setup}
-Data: $\sim$2{,}000 scenes from two vehicle platforms (1{,}120 from an
-initial corpus; a second 5{,}282-scene corpus is converted progressively and
-folded in round by round). Validation is one held-out recording session (273
-scenes) never used for training. Training: 7$\times$ data-parallel, batch 2
-per GPU, AdamW~\citep{kingma2015adam,loshchilov2019adamw}, cosine schedule~\citep{loshchilov2017sgdr}, $10^{-4}$ peak LR, 46k samples per epoch.
+Data: 9{,}600+ scenes ($\approx$80 driving hours, 1.25M keyframes) recorded
+nationwide across Japan by the DRS fleet-recording platform and converted
+progressively by the factory; new corpora are folded in round by round.
+Validation is one held-out recording session (273 scenes, different day and
+route) never used for training; a further 16-scene hold-out from the newest
+corpus serves as an untouched test set. Training: 8$\times$ data-parallel,
+batch 2 per GPU, AdamW~\citep{kingma2015adam,loshchilov2019adamw}, cosine
+schedule~\citep{loshchilov2017sgdr}, $4{\times}10^{-5}$ peak LR on later
+rounds, 46k samples per epoch.
 All numbers below are single-model, single-pass; no test-time augmentation.
 
 \subsection{Main results}
@@ -608,17 +635,17 @@ All numbers below are single-model, single-pass; no test-time augmentation.
 \toprule
 Metric & Value\\
 \midrule
-BEV lane mIoU (8 classes + bg) & 0.302\\
-2D segmentation mIoU (21 classes) & 0.535\\
-3D det.\ vehicle precision / near-corridor recall & 0.85 / 0.72\\
-3D det.\ yaw axis error / direction flips & $5.8^\circ$ / 10\%\\
-3D det.\ VRU precision / near-corridor recall & 0.73 / 0.44\\
-E2E trajectory ADE / ADE$_\mathrm{curve}$ / FDE (3\,s) & 0.73\,m / 0.72\,m / 1.54\,m\\
-Steering MAE / brake accuracy & 0.018\,rad / 0.76\\
-Agent forecast ADE (3\,s) / stationary-flag acc. & 1.92\,m / 0.67\\
-Traffic-light state accuracy & 0.86\\
-Risk-field L1 (all / high-risk cells) & 0.083 / 0.221\\
-Occupancy-flow EPE moving / static & 1.40 / 0.22\,m/s\\
+BEV lane mIoU (8 classes + bg) & 0.334\\
+2D segmentation mIoU (21 classes) & 0.555\\
+3D det.\ vehicle precision / near-corridor recall & 0.78 / 0.71\\
+3D det.\ yaw axis error / direction flips & $3.7^\circ$ / 6\%\\
+3D det.\ VRU precision / near-corridor recall & 0.75 / 0.46\\
+E2E trajectory ADE / ADE$_\mathrm{curve}$ / FDE (3\,s) & 0.87\,m / 0.39\,m / 1.89\,m\\
+Steering MAE / brake accuracy & 0.032\,rad / 0.75\\
+Agent forecast ADE (3\,s) / stationary-flag acc. & 1.65\,m / 0.70\\
+Traffic-light state accuracy & 0.84\\
+Risk-field L1 (all / high-risk cells) & 0.092 / 0.122\\
+Occupancy-flow EPE moving / static & 1.40 / 0.24\,m/s\\
 \bottomrule
 \end{tabular}
 \end{table}
@@ -697,13 +724,27 @@ The entire network exports as one static ONNX graph (all task outputs plus
 the raw BEV for the streaming recurrence); \texttt{affine\_grid} is
 replaced at export by a constant base grid and a matrix product, after which
 every operator is TensorRT-native---no plugins. ONNX-Runtime outputs match
-PyTorch to $\sim$$10^{-5}$ on all heads. A stock fp16 build on TensorRT~8.6
-runs the full eight-camera, all-task graph at 14.4 inferences/s
-($\sim$70\,ms/frame) on a single L40S that was concurrently running a
-training job---a lower bound. The temporal memory is a device-side ring
-buffer maintained by the host runtime: history BEVs and warp matrices enter
-as inputs, the raw BEV returns as an output, and the graph itself remains
-feed-forward.
+PyTorch to $\sim$$10^{-4}$ on all heads. A stock fp16 build on TensorRT~8.6
+runs the current eight-camera, all-task graph (including the grafted
+refiners and the dense unknown head) at 9.3 inferences/s (108\,ms/frame,
+p99 117\,ms) on a single L40S. The temporal memory is a device-resident
+ring buffer maintained by the host runtime: history BEVs are spliced by
+device-to-device copies (the na\"ive host-staged variant moved 460\,MB per
+frame and cost 3.9$\times$ the latency), the raw BEV returns as an output,
+and the graph itself remains feed-forward.
+
+fp16 deployment exposed two overflow modes that PyTorch's autocast masks:
+$\log(1{+}e^{x})$ in the decoupled-planner speed decoder overflows at
+highway speed logits, and a global average pool over $10^{5}$ BEV cells
+overflows an fp16 accumulator once temporal fusion is active. TensorRT~8.6
+cannot pin per-layer precision inside Myelin-fused regions, so both were
+fixed \emph{by construction}: the numerically stable softplus
+$\max(x,0){+}\log1p(e^{-|x|})$ and a scale-before-sum pooling whose partial
+sums are bounded by $\max|x|$. A per-layer engine profile attributes 51\%
+of the latency to the BEV projection/encoder block and $\sim$1.5\% to all
+sparse task heads combined---removing tasks barely helps, while camera
+count, INT8 and an asymmetric BEV grid (80\,m ahead / 40\,m behind) are the
+effective levers for embedded targets.
 
 \section{Agent-Authored Development}
 \label{sec:agent}
