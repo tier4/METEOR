@@ -245,15 +245,17 @@ bullets(s, [
 # ---------------------------------------------------------------- 4 what is meteor
 s = slide("METEORとは ── 自律的に成長する認識エンジン")
 bullets(s, [
-    (0, "METEORは、Co-MLOpsの自動ラベリング基盤CoMETが生み出すデータから"
-        "作られた、自動運転の認識・計画AIです。", C_GREEN),
-    (0, "そのデータで学習→自己改善→配備までを人手を介さず自動で回す"
-        "「認識・計画の自己生成エンジン」。", C_NAVY),
-], y=1.45, size=15)
+    (0, "CoMET（コメット）＝ 走行データに「正解ラベル」を自動で付ける仕組み"
+        "（Co-MLOpsプロジェクトの自動ラベリング基盤）。いわばラベルの自動工場。",
+     C_AMBER),
+    (0, "METEOR（メテオ）＝ CoMETが作ったラベル付きデータで育つ、"
+        "自動運転の認識・計画AI。学習→自己改善→配備まで人手を介さず自動で回します。",
+     C_GREEN),
+], y=1.4, size=15)
 # native pipeline diagram
 py = 3.7; ph = 1.7
 b1 = nbox(s, 0.55, py, 2.2, ph, "走行データ", "DRS収集・日本全国\n8カメラ+LiDAR", fc=F_GRAY)
-b2 = nbox(s, 3.15, py, 2.35, ph, "自動ラベル(CoMET)", "Co-MLOpsの\n自動ラベル済みを再利用", fc=F_AMBER)
+b2 = nbox(s, 3.15, py, 2.35, ph, "CoMET＝ラベル自動工場", "正解ラベルを自動付与\n(Co-MLOps基盤・人手0)", fc=F_AMBER, fs=11)
 b3 = nbox(s, 5.9, py, 2.05, ph, "自己学習", "マルチタスク\nBEVモデル", fc=F_BLUE)
 b4 = nbox(s, 8.35, py, 2.0, ph, "自己改善", "Refinerが\n出力を自動補正", fc=F_PURP)
 b5 = nbox(s, 10.75, py, 2.0, ph, "エッジ配備", "TensorRT/C++\nカメラのみ", fc=F_GREEN)
@@ -402,6 +404,40 @@ caption(s, "人間は「何を作るか」を決めるだけ ── "
         "モデル開発からデータ処理・運用まで、作り方はすべてAIが自律実行",
         y=6.95, col=C_GREEN, size=13)
 
+# ---------------------------------------------------------------- 10.5 dev history
+s = slide("開発の歩み ── 約3週間で多タスク統合まで", "全コードAI記述による開発スピード")
+# native horizontal timeline (editable shapes)
+tl_y = 3.7
+line = s.shapes.add_shape(MSO_SHAPE.RECTANGLE, Inches(1.2), Inches(tl_y),
+                          Inches(10.9), Pt(4))
+_fill(line, C_BLUE)
+mile = [
+    (1.7, "7/10", "開発スタート", "BEV Segmentation・\n3D BBox 推論", C_BLUE, True),
+    (6.3, "7/17", "機能追加", "E2E（経路計画）\n機能を追加", C_TEAL, False),
+    (11.3, "現在", "統合・自己改善", "多タスク統合・TensorRT実装\n・自己改善ループ稼働", C_GREEN, True),
+]
+for x, date, head, desc, col, above in mile:
+    dot = s.shapes.add_shape(MSO_SHAPE.OVAL, Inches(x - 0.16), Inches(tl_y - 0.13),
+                             Inches(0.34), Inches(0.34))
+    _fill(dot, col)
+    # date label on the line
+    db = s.shapes.add_textbox(Inches(x - 0.7), Inches(tl_y + 0.25), Inches(1.4),
+                              Inches(0.4))
+    dp = db.text_frame.paragraphs[0]; dp.text = date; dp.alignment = PP_ALIGN.CENTER
+    dp.font.size = Pt(16); dp.font.bold = True; dp.font.color.rgb = col
+    # description card above or below
+    cy = tl_y - 1.85 if above else tl_y + 0.75
+    card = s.shapes.add_shape(MSO_SHAPE.ROUNDED_RECTANGLE, Inches(x - 1.5),
+                              Inches(cy), Inches(3.0), Inches(1.5))
+    _fill(card, RGBColor(0xF2, 0xF4, 0xF6))
+    tf = card.text_frame; tf.word_wrap = True; tf.vertical_anchor = MSO_ANCHOR.MIDDLE
+    hp = tf.paragraphs[0]; hp.text = head; hp.alignment = PP_ALIGN.CENTER
+    hp.font.size = Pt(14); hp.font.bold = True; hp.font.color.rgb = col
+    dp2 = tf.add_paragraph(); dp2.text = desc; dp2.alignment = PP_ALIGN.CENTER
+    dp2.font.size = Pt(11); dp2.font.color.rgb = C_NAVY
+caption(s, "人手を待たずに24時間開発を継続 ── わずか約3週間で認識から計画まで1モデルに統合",
+        y=6.4, col=C_GREEN, size=14)
+
 # ---------------------------------------------------------------- 5 model architecture
 s = slide("モデルアーキテクチャ",
           "8台のカメラ映像を1つのモデルが俯瞰(BEV)へ変換し、多タスクを同時出力")
@@ -429,11 +465,7 @@ bullets(s, [
         "により自動ラベリング済みのものを再利用。", C_NAVY),
 ], y=6.3, size=11.5)
 
-# ---------------------------------------------------------------- 6 METEOR demo (early hook)
-demo_slide("METEOR デモ ── 実走行での認識・計画",
-           "カメラのみ・地図なしで、BEV・3D物体・信号・経路計画をリアルタイム出力")
-
-# ---------------------------------------------------------------- 6.5 screen guide
+# ---------------------------------------------------------------- 6 screen guide (before the video)
 s = slide("デモ画面の見方", "1枚の画面に「見る・測る・理解する・決める」が全部出ます")
 img_w, img_h = 8.6, 4.84
 pic = s.shapes.add_picture("docs/media/ceo_demo_frame.png", Inches(0.45),
@@ -464,6 +496,10 @@ for t, d, col, ly, ax, ay in guide:
     _arrow(c, col)
 caption(s, "人が運転中に頭の中でやっていること（見る・距離感・立体把握・進路決め）を、"
         "1つのAIが毎フレーム実行", y=6.85, col=C_GREEN, size=13)
+
+# ---------------------------------------------------------------- 6.5 METEOR demo
+demo_slide("METEOR デモ ── 実走行での認識・計画",
+           "カメラのみ・地図なしで、BEV・3D物体・信号・経路計画をリアルタイム出力")
 
 # ---------------------------------------------------------------- 6.7 self-improvement
 s = slide("自動で賢くなる ── 人手ゼロの改善ループ実績",
@@ -587,40 +623,6 @@ bullets(s, [
     (1, "クラッシュの自動復旧、新データの自動取り込み、失敗事例の自動採掘まで自律運用。"),
     (0, "→ 人的リソースに律速されない、圧倒的な開発スループット。", C_GREEN),
 ])
-
-# ---------------------------------------------------------------- 10.5 dev history
-s = slide("開発の歩み ── 約3週間で多タスク統合まで", "全コードAI記述による開発スピード")
-# native horizontal timeline (editable shapes)
-tl_y = 3.7
-line = s.shapes.add_shape(MSO_SHAPE.RECTANGLE, Inches(1.2), Inches(tl_y),
-                          Inches(10.9), Pt(4))
-_fill(line, C_BLUE)
-mile = [
-    (1.7, "7/10", "開発スタート", "BEV Segmentation・\n3D BBox 推論", C_BLUE, True),
-    (6.3, "7/17", "機能追加", "E2E（経路計画）\n機能を追加", C_TEAL, False),
-    (11.3, "現在", "統合・自己改善", "多タスク統合・TensorRT実装\n・自己改善ループ稼働", C_GREEN, True),
-]
-for x, date, head, desc, col, above in mile:
-    dot = s.shapes.add_shape(MSO_SHAPE.OVAL, Inches(x - 0.16), Inches(tl_y - 0.13),
-                             Inches(0.34), Inches(0.34))
-    _fill(dot, col)
-    # date label on the line
-    db = s.shapes.add_textbox(Inches(x - 0.7), Inches(tl_y + 0.25), Inches(1.4),
-                              Inches(0.4))
-    dp = db.text_frame.paragraphs[0]; dp.text = date; dp.alignment = PP_ALIGN.CENTER
-    dp.font.size = Pt(16); dp.font.bold = True; dp.font.color.rgb = col
-    # description card above or below
-    cy = tl_y - 1.85 if above else tl_y + 0.75
-    card = s.shapes.add_shape(MSO_SHAPE.ROUNDED_RECTANGLE, Inches(x - 1.5),
-                              Inches(cy), Inches(3.0), Inches(1.5))
-    _fill(card, RGBColor(0xF2, 0xF4, 0xF6))
-    tf = card.text_frame; tf.word_wrap = True; tf.vertical_anchor = MSO_ANCHOR.MIDDLE
-    hp = tf.paragraphs[0]; hp.text = head; hp.alignment = PP_ALIGN.CENTER
-    hp.font.size = Pt(14); hp.font.bold = True; hp.font.color.rgb = col
-    dp2 = tf.add_paragraph(); dp2.text = desc; dp2.alignment = PP_ALIGN.CENTER
-    dp2.font.size = Pt(11); dp2.font.color.rgb = C_NAVY
-caption(s, "人手を待たずに24時間開発を継続 ── わずか約3週間で認識から計画まで1モデルに統合",
-        y=6.4, col=C_GREEN, size=14)
 
 # ---------------------------------------------------------------- 11 no map
 s = slide("③ No Map ── HDマップ不要", "地図の無い場所でも、その場で認識",
