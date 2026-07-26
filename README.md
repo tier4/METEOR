@@ -11,9 +11,9 @@
 [![Built on CoMET](https://img.shields.io/badge/built_on-CoMET_(Co--MLOps)-orange)](https://co-mlops.tier4.jp/)
 [![GTC 2026](https://img.shields.io/badge/NVIDIA_GTC_2026-session_S81897-76B900)](https://www.nvidia.com/ja-jp/gtc/session-catalog/sessions/gtc26-s81897/)
 [![Tasks](https://img.shields.io/badge/tasks-12-blueviolet)]()
-[![Params](https://img.shields.io/badge/params-45.9M-blue)]()
+[![Params](https://img.shields.io/badge/params-53M-blue)]()
 [![Compute](https://img.shields.io/badge/compute-3.1_TFLOPs-informational)]()
-[![TensorRT](https://img.shields.io/badge/TensorRT-ready-76B900)]()
+[![TensorRT](https://img.shields.io/badge/TensorRT-108ms%2Fframe_(L40S)-76B900)]()
 [![PyTorch](https://img.shields.io/badge/PyTorch-2.x-EE4C2C)]()
 [![Labels](https://img.shields.io/badge/human_labels-0-success)]()
 [![Code](https://img.shields.io/badge/human_written_code-0-success)]()
@@ -21,10 +21,12 @@
 
 <img src="docs/media/inference.gif" width="880" alt="METEOR multi-task inference"/>
 
-*Live inference (v29) — 8 DRS cameras in, everything out: 2D segmentation, 2D & 3D
-detection with parked/stopped flags, metric depth, BEV lane map, 3D occupancy, the
-ego-relevant traffic-light state, a continuous near-range risk field, and multimodal
-end-to-end driving (3 path hypotheses + confidences).*
+*Live inference (v43, round 39) — 8 DRS cameras in, everything out: 2D segmentation,
+2D & 3D detection with parked/stopped flags, metric depth, BEV lane map, 3D occupancy,
+the ego-relevant traffic-light state, a continuous near-range risk field, multimodal
+end-to-end driving (3 path hypotheses + confidences) under a deterministic guardrail,
+per-task residual refiners, and unknown obstacles lifted from 2D detections through
+predicted depth into BEV (white diamonds).*
 
 </div>
 
@@ -55,7 +57,7 @@ From **8 cameras (768×432) + calibration + current speed**, a single forward pa
 | 1 | **BEV lane segmentation** | 9 classes, 160 × 100 m @ 0.2 m |
 | 2 | **Metric depth** | 64 bins × 8 cams @ stride 4 |
 | 3 | **3D oriented boxes** | CenterPoint-style, vehicles + VRU |
-| 4 | **Unknown-object detection** | cones / posts / debris as fixed-size 3D boxes — a class the annotation set does not even contain (GT invented from occupancy blobs) |
+| 4 | **Unknown-object detection** | cones / posts / debris — a class the annotation set does not even contain. Dense BEV head trained on drive-accumulated LiDAR GT with a camera-visibility filter (occluded cells = don't-care), plus a decode-time lift of 2D 'obstacle' detections through predicted depth into BEV |
 | 5 | **2D semantic segmentation** | 21 classes (Cityscapes-like palette) |
 | 6 | **2D detection** | 10 classes, YOLO-style 3-scale |
 | 7 | **Multimodal E2E driving** | K=3 path hypotheses (3 s) + confidences + steering / accel / brake |
@@ -207,21 +209,24 @@ the previous round was worst at (auto-mined, C2) are oversampled 2x.
 
 | Metric | Value |
 |---|---|
-| BEV lane mIoU | **0.302** |
-| 2D seg mIoU (21 cls) | **0.535** |
-| 3D det vehicles (precision / near-corridor recall) | **0.85 / 0.72** |
-| 3D det yaw (axis error / direction flips) | **5.8° / 10 %** |
-| 3D det VRU (precision / near-corridor recall) | **0.73 / 0.44** |
-| E2E trajectory ADE / ADEc / FDE (3 s) | **0.73 m / 0.72 m / 1.54 m** |
-| Traffic-light state accuracy | **0.86** |
-| Agent forecast ADE (3 s) | **1.92 m** |
+| BEV lane mIoU | **0.334** |
+| 2D seg mIoU (21 cls) | **0.555** |
+| 3D det vehicles (precision / near-corridor recall) | **0.78 / 0.71** |
+| 3D det yaw (axis error / direction flips) | **3.7° / 6 %** |
+| 3D det VRU (precision / near-corridor recall) | **0.75 / 0.46** |
+| E2E trajectory ADE / ADEc / FDE (3 s) | **0.87 m / 0.39 m / 1.89 m** |
+| Traffic-light state accuracy | **0.84** |
+| Agent forecast ADE (3 s) | **1.65 m** |
 
-(r22, held-out recording day.) Trained on **2,800+ scenes / two vehicle platforms**,
-list growing continuously as the autolabel factory converts more recordings (rolling
-training rounds; r23 = v31 with the optional-LiDAR input is training now). Trained on
+(r39/v43, held-out recording day.) Trained on **9,600+ scenes (~80 driving hours,
+1.25M keyframes) recorded nationwide across Japan**, the list growing continuously as
+the autolabel factory converts more recordings; ~40 rolling rounds so far lifted BEV
+mIoU 0.302→0.334 and curve ADE 0.72→0.39 m with zero human intervention. Trained on
 Japan-only data, the same engine runs **zero-shot on US recordings** (right-hand
-traffic, different vehicles, 114 km/h highways) — the geometric projection does not
-break when the country does.
+traffic, different vehicles) — the geometric projection does not break when the
+country does. A stock TensorRT fp16 build runs the full graph at **108 ms/frame on
+one L40S** with a device-resident temporal ring (fp16-safe by construction after two
+overflow fixes; see the white paper).
 
 ## Quickstart
 
@@ -233,16 +238,18 @@ python3 bevlane/convert_dtset.py --scenes scene_list.txt --workers 12
 
 # 2) Train the 12-task model (8 GPUs)
 torchrun --nproc_per_node=8 bevlane/train.py \
-  --model v31 --batch 2 --epochs 8 --workers 0 --lr 5e-5 --val-every 500 \
-  --gt-key gt_vec --train-list scenes.txt --train-bg --aug --lidar-drop 0.5 \
+  --model v43 --batch 2 --epochs 8 --workers 0 --lr 4e-5 --val-every 500 \
+  --gt-key gt_cons --train-list scenes.txt --train-bg --aug --lidar-drop 0.5 \
+  --unk-dense-w 1.0 --unk-key unknown_v3 --intent-w 0.5 --bev-rot-aug 10 \
   --seg-w 1.0 --dice-w .5 --lovasz-w .5 --boundary-w 3 --tversky-w .6 --far-w 1 \
   --depth-w 0.6 --box-w 1.2 --seg2d-w 0.35 --bbox2d-w 0.25 --ego-w 0.8 \
   --occ-w 0.4 --traj-w 0.5 --tl-w 0.6 --risk-w 0.3 --lanegraph-w 0.5 \
   --flow-w 0.3 --unk-w 0.5 --seg2d-key seg2d21 --n-seg2d 21 --out out/ckpt
 
 # 3) Render the full multi-task demo video
-python3 bevlane/demo_rgbd_bev.py --model v31 --n-seg2d 21 \
-  --ckpt out/ckpt/best.pt --show-seg2d --scenes <SCENE ...> --out out/demo.mp4
+python3 bevlane/demo_rgbd_bev.py --model v43 --n-seg2d 21 \
+  --ckpt out/ckpt/best.pt --show-seg2d --guard --seg-fuse --unk2d \
+  --scenes <SCENE ...> --out out/demo.mp4   # add --refiner-ckpt / --intent auto
 # add --lidar to run the SAME checkpoint with the optional LiDAR input
 ```
 
