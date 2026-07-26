@@ -2552,7 +2552,10 @@ class BEVSegRefiner(nn.Module):
         y2 = self.m2(s2 + up(self.u3(y3), s2))
         y1 = self.m1(s1 + up(self.u2(y2), s1))
         y0 = s0 + up(self.u1(y1), s0)
-        return seg_logits + self.out(y0)
+        res = self.out(y0)
+        # fp16 safety: one inf activation poisons BN running stats forever
+        # (r39 refiner: seg.out BN died at step 12.6k); bound the residual
+        return seg_logits + 8.0 * torch.tanh(res / 8.0)
 
 
 class BEVBoxRefiner(nn.Module):
@@ -2620,6 +2623,7 @@ class BEVBoxRefiner(nn.Module):
         y1 = self.m1(s1 + up(self.u2(y2), s1))
         y0 = s0 + up(self.u1(y1), s0)
         res = self.out(y0)
+        res = 6.0 * torch.tanh(res / 6.0)     # fp16-safe bounded residual
         return hm + res[:, :2], reg + res[:, 2:]
 
 
@@ -2761,9 +2765,10 @@ class MultiTaskRefiner(nn.Module):
         through DDP so every enabled head's params are tracked each step."""
         out = {}
         if self.seg is not None and seg is not None:
-            out["seg"] = self.seg(seg, seg_ctx)
+            out["seg"] = self.seg(seg.clamp(-20.0, 20.0), seg_ctx)
         if self.box is not None and hm is not None:
-            out["hm"], out["reg"] = self.box(hm, reg)
+            out["hm"], out["reg"] = self.box(hm.clamp(-15.0, 15.0),
+                                             reg.clamp(-20.0, 20.0))
         if self.e2e is not None and ego is not None:
             out["ego"] = self.e2e(ego, v0, fused)
         if self.traj is not None and traj is not None:

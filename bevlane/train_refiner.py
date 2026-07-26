@@ -242,6 +242,21 @@ def main():
               f"e2e={args.do_e2e} traj={args.do_traj} risk={args.do_risk} "
               f"unk={args.do_unk}({args.unk_key}) | "
               f"params={n_par:.2f}M (zero-init residual)", flush=True)
+    # auto-resume: continue from a previous epoch save if present, replacing
+    # any non-finite entries (poisoned BN stats) with safe defaults
+    rck = os.path.join(args.out, "last.pt")
+    if os.path.exists(rck):
+        rsd = torch.load(rck, map_location="cpu").get("refiner", {})
+        fixed = 0
+        for k, v in rsd.items():
+            m_ = ~torch.isfinite(v)
+            if m_.any():
+                v[m_] = 1.0 if "running_var" in k else 0.0
+                fixed += 1
+        miss_r, _ = ref.load_state_dict(rsd, strict=False)
+        if is_main:
+            print(f"[resume] {rck} missing={len(miss_r)} "
+                  f"sanitized={fixed} tensors", flush=True)
     ref = DDP(ref, device_ids=[local]) if ddp else ref
     ref0 = ref.module if ddp else ref
 
@@ -334,10 +349,23 @@ def main():
                 dist.all_reduce(fin, op=dist.ReduceOp.MIN)   # 0 if any rank bad
             if fin.item() < 1.0:
                 sched.step(); step += 1
+                nskip = getattr(main, "_nskip", 0) + 1
+                main._nskip = nskip
                 if is_main:
                     print(f"ep{ep} step{step} SKIP non-finite (all ranks)",
                           flush=True)
+                # r39 lesson: once BN stats are poisoned EVERY step skips and
+                # the normal-path detector below never runs -> check here too
+                if nskip >= 20:
+                    if is_main:
+                        print(f"ep{ep} step{step} {nskip} consecutive skips "
+                              "-- poisoned state, exiting for clean relaunch",
+                              flush=True)
+                    if ddp:
+                        dist.destroy_process_group()
+                    sys.exit(3)
                 continue
+            main._nskip = 0
             scaler.scale(loss).backward()
             scaler.unscale_(opt)                 # clip in true grad scale
             torch.nn.utils.clip_grad_norm_(ref0.parameters(), 1.0)
