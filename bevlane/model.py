@@ -2971,6 +2971,48 @@ class DepthSegIPMNetV43(DepthSegIPMNetV42):
         return (pen * m).sum() / m.sum().clamp(min=1)
 
 
+class DepthSegIPMNetV44(DepthSegIPMNetV43):
+    """v44 (r40): Driving Command -> mode BINDING (structural, zero params).
+
+    v43's context delta moved the path by only ~0.2 m: with GT-following
+    losses, a residual correction is never forced to matter. v44 instead
+    assigns SEMANTICS to the K=3 modes (0=straight, 1=left, 2=right) by
+    adding +MODE_BOOST to the commanded mode's logit inside forward. During
+    training (intent given on 70% of frames) every selection-dependent loss
+    (WTA waypoints, risk-integral selection) then routes turn-frame
+    gradients into the commanded mode -- the binding is learned by the
+    existing losses. At inference a command simply selects its mode: the
+    switch is guaranteed by construction, not by a learned bias.
+    intent_mode_loss additionally aligns the RAW logits with the maneuver
+    so the no-command mode selection improves too."""
+    MODE_BOOST = 8.0
+
+    def forward(self, imgs, K, T_cam_ego, v0=None, prev_bev=None,
+                warp_theta=None, lidar=None, lidar_bev=None, kin=None,
+                intent=None):
+        out = list(super().forward(imgs, K, T_cam_ego, v0, prev_bev,
+                                   warp_theta, lidar=lidar,
+                                   lidar_bev=lidar_bev, kin=kin,
+                                   intent=intent))
+        if intent is not None:
+            e = out[7].clone()
+            e[:, 12 * EGO_K:12 * EGO_K + EGO_K] = \
+                e[:, 12 * EGO_K:12 * EGO_K + EGO_K] \
+                + self.MODE_BOOST * intent.to(e.dtype)
+            out[7] = e
+        return tuple(out)
+
+    def intent_mode_loss(self, ego_pred, intent):
+        """CE on the RAW (pre-boost) mode logits toward the commanded mode,
+        on rows where a command is present."""
+        lg = (ego_pred[:, 12 * EGO_K:12 * EGO_K + EGO_K].float()
+              - self.MODE_BOOST * intent.float())
+        m = intent.sum(1) > 0.5
+        if not m.any():
+            return ego_pred.new_zeros(())
+        return F.cross_entropy(lg[m], intent[m].argmax(1))
+
+
 MODELS = {"v1": IPMSegNet, "v2": IPMSegNetV2, "v3s": IPMSegNetV3,
           "lss": LSSDepthNet, "v8": DepthGatedIPMNet, "v13": DepthSegIPMNet,
           "v13d": DepthSegIPMNetS4, "v14d": DepthSegIPMNetV14,
@@ -2979,4 +3021,4 @@ MODELS = {"v1": IPMSegNet, "v2": IPMSegNetV2, "v3s": IPMSegNetV3,
           "v19": DepthSegIPMNetV19, "v20": DepthSegIPMNetV20,
           "v21": DepthSegIPMNetV21, "v22": DepthSegIPMNetV22,
           "v23": DepthSegIPMNetV23, "v24": DepthSegIPMNetV24,
-          "v25": DepthSegIPMNetV25, "v26": DepthSegIPMNetV26, "v27": DepthSegIPMNetV27, "v28": DepthSegIPMNetV28, "v29": DepthSegIPMNetV29, "v30": DepthSegIPMNetV30, "v31": DepthSegIPMNetV31, "v32": DepthSegIPMNetV32, "v33": DepthSegIPMNetV33, "v34": DepthSegIPMNetV34, "v35": DepthSegIPMNetV35, "v36": DepthSegIPMNetV36, "v37": DepthSegIPMNetV37, "v38": DepthSegIPMNetV38, "v39": DepthSegIPMNetV39, "v40": DepthSegIPMNetV40, "v41": DepthSegIPMNetV41, "v42": DepthSegIPMNetV42, "v43": DepthSegIPMNetV43}
+          "v25": DepthSegIPMNetV25, "v26": DepthSegIPMNetV26, "v27": DepthSegIPMNetV27, "v28": DepthSegIPMNetV28, "v29": DepthSegIPMNetV29, "v30": DepthSegIPMNetV30, "v31": DepthSegIPMNetV31, "v32": DepthSegIPMNetV32, "v33": DepthSegIPMNetV33, "v34": DepthSegIPMNetV34, "v35": DepthSegIPMNetV35, "v36": DepthSegIPMNetV36, "v37": DepthSegIPMNetV37, "v38": DepthSegIPMNetV38, "v39": DepthSegIPMNetV39, "v40": DepthSegIPMNetV40, "v41": DepthSegIPMNetV41, "v42": DepthSegIPMNetV42, "v43": DepthSegIPMNetV43, "v44": DepthSegIPMNetV44}
