@@ -503,7 +503,28 @@ c3_ = s.shapes.add_connector(MSO_CONNECTOR.STRAIGHT,
                              rf.left + rf.width // 2, rf.top)
 _arrow(c3_, RGBColor(0x8E, 0x44, 0xAD))
 link(s, rf, gd, side="v", col=C_TEAL)
-# aux inputs (v0/kin/Command/LiDAR) are annotated in-box to keep wires clean
+# aux inputs: thin ELBOW wires to their consumers (E2E head / IPM) --
+# straight diagonals crossed the whole diagram and were unreadable
+e2e_head = hboxes[3]
+for src, col in ((i2, C_TEAL), (i3, C_TEAL)):
+    ce = s.shapes.add_connector(MSO_CONNECTOR.ELBOW,
+                                src.left + src.width,
+                                src.top + src.height // 2,
+                                e2e_head.left + e2e_head.width // 2,
+                                e2e_head.top + e2e_head.height)
+    ce.line.color.rgb = col; ce.line.width = Pt(1.1)
+    try:
+        ce.begin_connect(src, 3); ce.end_connect(e2e_head, 2)
+    except Exception:
+        pass
+cl = s.shapes.add_connector(MSO_CONNECTOR.ELBOW, i4.left + i4.width,
+                            i4.top + i4.height // 2, ipm.left + ipm.width // 2,
+                            ipm.top + ipm.height)
+cl.line.color.rgb = C_GRAY; cl.line.width = Pt(1.1)
+try:
+    cl.begin_connect(i4, 3); cl.end_connect(ipm, 2)
+except Exception:
+    pass
 caption(s, "CNN構成＝現行SoC（Orin）で動作可能な現実的な設計（LLM/世界モデル化は現行車載HWでは困難なため未着手）"
         "／ 学習データはCoMET自動ラベル（人手0）", y=6.95, col=C_GRAY, size=10.5)
 
