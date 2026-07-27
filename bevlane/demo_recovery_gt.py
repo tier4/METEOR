@@ -61,7 +61,10 @@ def transform_wp(wp, dy, dpsi):
     return np.stack([c * x + s * y, -s * x + c * y], 1)
 
 
-def recovery_target(wp_t, rejoin_k=3):
+def recovery_target(wp_t, v0=0.0):
+    # speed-dependent rejoin horizon: at highway speed take 2 s
+    # (soft, lateral-accel-friendly) instead of 1.5 s
+    rejoin_k = 4 if v0 > 15.0 else 3
     """smooth spline from the perturbed origin (heading straight ahead in
     the new frame) that rejoins the transformed trajectory at waypoint
     rejoin_k -- removes the t=0 kink, exactly what training would use."""
@@ -112,6 +115,8 @@ def main():
     ap.add_argument("--out", default="out/demo_recovery_gt.mp4")
     ap.add_argument("--root", default="out/bevlane")
     ap.add_argument("--fps", type=int, default=10)
+    ap.add_argument("--min-v0", type=float, default=0.0,
+                    help="skip frames slower than this [m/s]")
     args = ap.parse_args()
 
     import json
@@ -123,10 +128,13 @@ def main():
                                           "manifest.json")))
         eg = np.load(os.path.join(args.root, scene, "ego_motion.npz"))
         wp_all, valid = eg["wp"], eg["valid"]
+        v0_all = eg["v0"]
         dy = dpsi = 0.0
         for f in man["frames"]:
             fi = f["frame"]
             if fi >= len(wp_all) or valid[fi] < 0.5 or not f.get("gt"):
+                continue
+            if v0_all[fi] < args.min_v0:
                 continue
             if n % 30 == 0:                # new departure every 3 s
                 dy = float(rng.uniform(0.5, 1.5)) * rng.choice([-1, 1])
@@ -137,10 +145,11 @@ def main():
                 continue
             wp = wp_all[fi].reshape(6, 2).astype(np.float64)
             left = draw_panel(gt, wp, "ORIGINAL (recorded)",
-                              "GT BEV + driven future 3s", (60, 255, 120))
+                              f"GT BEV + driven future 3s | "
+                              f"{v0_all[fi]*3.6:.0f} km/h", (60, 255, 120))
             gt_p = perturb_raster(gt, dy, dpsi)
             wp_t = transform_wp(wp, dy, dpsi)
-            rec = recovery_target(wp_t)
+            rec = recovery_target(wp_t, float(v0_all[fi]))
             right = draw_panel(
                 gt_p, rec, "PERTURBED = departed viewpoint",
                 f"dy={dy:+.2f}m dpsi={np.degrees(dpsi):+.1f}deg -> "
