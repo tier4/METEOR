@@ -125,7 +125,17 @@ def ego_centerline(pts, n):
 def pursuit_target(cl_t, v0, K=6, dt=0.5):
     """idea 2: rejoin the (perturbed-frame) centerline with a speed-aware
     lookahead, then FOLLOW it -- curvature of the lane is baked into the
-    target, so a curve-lag state gets a curve-aware catch-up path."""
+    target, so a curve-lag state gets a curve-aware catch-up path.
+
+    The centerline is EXTRAPOLATED along its end tangent so the 0.5 s
+    waypoint spacing never truncates: a short centerline must not teach a
+    phantom deceleration."""
+    need = max(v0, 2.0) * dt * (K + 2) + 30.0
+    tan = cl_t[-1] - cl_t[-3]
+    tan = tan / max(np.linalg.norm(tan), 1e-6)
+    ext = cl_t[-1][None] + tan[None] * np.arange(1.0, need,
+                                                 2.0)[:, None]
+    cl_t = np.concatenate([cl_t, ext], 0)
     seg = np.linalg.norm(np.diff(cl_t, axis=0), axis=1)
     t = np.concatenate([[0], np.cumsum(seg)])
     L = float(np.clip(1.2 * v0, 8.0, 30.0))     # lookahead [m]
