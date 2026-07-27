@@ -2986,10 +2986,25 @@ class DepthSegIPMNetV44(DepthSegIPMNetV43):
     intent_mode_loss additionally aligns the RAW logits with the maneuver
     so the no-command mode selection improves too."""
     MODE_BOOST = 8.0
+    # J6 sensor-config fine-tune: indices of cameras to hard-zero at every
+    # image entry point (train + all evals + demo see the same 7-cam world)
+    zero_cams = ()
+
+    def _mask_cams(self, imgs):
+        if not self.zero_cams:
+            return imgs
+        imgs = imgs.clone()
+        imgs[:, list(self.zero_cams)] = 0
+        return imgs
+
+    def compute_bev(self, imgs, K, T_cam_ego, *a, **k):
+        return super().compute_bev(self._mask_cams(imgs), K, T_cam_ego,
+                                   *a, **k)
 
     def forward(self, imgs, K, T_cam_ego, v0=None, prev_bev=None,
                 warp_theta=None, lidar=None, lidar_bev=None, kin=None,
                 intent=None):
+        imgs = self._mask_cams(imgs)
         out = list(super().forward(imgs, K, T_cam_ego, v0, prev_bev,
                                    warp_theta, lidar=lidar,
                                    lidar_bev=lidar_bev, kin=kin,

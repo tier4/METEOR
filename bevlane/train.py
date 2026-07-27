@@ -900,6 +900,9 @@ def main():
                     help="v43 command-consistency hinge weight")
     ap.add_argument("--intent-mode-w", type=float, default=0.0,
                     help="v44 command->mode CE weight (raw logits)")
+    ap.add_argument("--zero-cams", default="",
+                    help="comma-separated camera names to hard-zero "
+                         "(J6 7-cam fine-tune: CAM_BACK_NARROW)")
     ap.add_argument("--unk-key", default="unknown_v2",
                     help="dense unknown GT key: unknown_v2 or unknown_v3 "
                          "(camera-visibility-filtered, occluded=don't-care)")
@@ -1105,6 +1108,13 @@ def main():
     mkw = {"n_seg": args.n_seg2d} \
         if args.model in ("v13", "v13d", "v14d", "v15", "v16", "v17", "v18", "v19", "v20", "v21", "v22", "v23", "v24", "v25", "v26", "v27", "v28", "v29", "v30", "v31", "v32", "v33", "v34", "v35", "v36", "v37", "v38", "v39", "v40", "v41", "v42", "v43", "v44") else {}
     model = MODELS[args.model](**mkw).to(device)
+    if args.zero_cams:
+        from bevlane.dataset import CAMS as _CAMS
+        model.zero_cams = tuple(_CAMS.index(c)
+                                for c in args.zero_cams.split(","))
+        if rank == 0:
+            print(f"[zero-cams] {args.zero_cams} -> idx {model.zero_cams}",
+                  flush=True)
     if args.init_ckpt:
         sd = torch.load(args.init_ckpt, map_location="cpu")["model"]
         cur = model.state_dict()   # drop shape-mismatched heads (12->21cls seg)
