@@ -83,12 +83,86 @@ def recovery_target(wp_t, v0=0.0):
     return out
 
 
-def draw_panel(gt, wps, title, sub, path_col, dy=None):
+def ego_centerline(pts, n):
+    """lanegraph polylines are lane BOUNDARIES; the ego-lane centerline is
+    the midline between the nearest left and right laneline. Returns
+    [K,2] on a 1 m forward grid or None."""
+    xg = np.arange(0.0, 46.0, 1.0)
+    offs = []
+    for i in range(int(n)):
+        P = pts[i].astype(np.float64)
+        P = P[np.isfinite(P).all(1)]
+        if len(P) < 4:
+            continue
+        o = np.argsort(P[:, 0])
+        P = P[o]
+        if P[-1, 0] - P[0, 0] < 8 or P[-1, 0] < 15:
+            continue
+        y = np.interp(xg, P[:, 0], P[:, 1],
+                      left=np.nan, right=np.nan)
+        y[(xg < P[0, 0]) | (xg > P[-1, 0])] = np.nan
+        offs.append(y)
+    left = right = None
+    bl = br = 1e9
+    for y in offs:
+        near = y[:16]
+        if np.isnan(near).mean() > 0.6:
+            continue
+        med = np.nanmedian(near)
+        if 0.3 < med < 3.2 and med < bl:
+            left, bl = y, med
+        if -3.2 < med < -0.3 and -med < br:
+            right, br = y, -med
+    if left is None or right is None or not (2.0 < bl + br < 6.0):
+        return None
+    yc = (left + right) / 2.0
+    m = ~np.isnan(yc)
+    if m.sum() < 12:
+        return None
+    return np.stack([xg[m], yc[m]], 1)
+
+
+def pursuit_target(cl_t, v0, K=6, dt=0.5):
+    """idea 2: rejoin the (perturbed-frame) centerline with a speed-aware
+    lookahead, then FOLLOW it -- curvature of the lane is baked into the
+    target, so a curve-lag state gets a curve-aware catch-up path."""
+    seg = np.linalg.norm(np.diff(cl_t, axis=0), axis=1)
+    t = np.concatenate([[0], np.cumsum(seg)])
+    L = float(np.clip(1.2 * v0, 8.0, 30.0))     # lookahead [m]
+    # arc position of the closest point to origin (projection start)
+    i0 = int(np.argmin(np.hypot(cl_t[:, 0], cl_t[:, 1])))
+    s0 = t[i0]
+    def at(a):
+        return np.array([np.interp(a, t, cl_t[:, 0]),
+                         np.interp(a, t, cl_t[:, 1])])
+    P1 = at(s0 + L)
+    d1 = (at(s0 + L + 1.0) - at(s0 + L - 1.0)); d1 /= max(np.linalg.norm(d1), 1e-6)
+    step = max(v0 * dt, 1.0)
+    kj = max(1, min(K - 1, int(round(L / step))))
+    out = np.zeros((K, 2))
+    P0 = np.zeros(2); T0 = np.array([max(step, 2.0), 0.0]); T1 = d1 * step * 2
+    for i in range(kj):                          # hermite: origin -> rejoin
+        u = (i + 1) / (kj + 1)
+        h00 = 2*u**3-3*u**2+1; h10 = u**3-2*u**2+u
+        h01 = -2*u**3+3*u**2;  h11 = u**3-u**2
+        out[i] = h00*P0 + h10*T0 + h01*P1 + h11*T1
+    for i in range(kj, K):                       # then follow the lane
+        out[i] = at(s0 + L + step * (i - kj + 1))
+    return out
+
+
+def draw_panel(gt, wps, title, sub, path_col, dy=None, centerline=None):
     pc = crop_bev(gt, xh_m=60.0, yh_m=25.0)
     BH, BW = 900, int(900 * pc.shape[1] / pc.shape[0])
     bev = draw_ego_and_grid(PAL[pc][:, :, ::-1].copy(), BH, BW,
                             xh_m=60.0, yh_m=25.0)
     sx, sy = BW / 50.0, BH / 120.0
+    if centerline is not None:
+        cpts = [(int((25.0 - y) * sx), int((60.0 - x) * sy))
+                for x, y in centerline if abs(x) <= 60 and abs(y) <= 25]
+        if len(cpts) > 1:
+            cv2.polylines(bev, [np.array(cpts, np.int32).reshape(-1, 1, 2)],
+                          False, (255, 230, 80), 2, cv2.LINE_AA)
     pts = [(int(25.0 * sx), int(60.0 * sy))]
     for x, y in wps:
         if abs(x) > 60 or abs(y) > 25:
@@ -117,6 +191,10 @@ def main():
     ap.add_argument("--fps", type=int, default=10)
     ap.add_argument("--min-v0", type=float, default=0.0,
                     help="skip frames slower than this [m/s]")
+    ap.add_argument("--mode", default="record",
+                    choices=["record", "pursuit"],
+                    help="recovery target: transformed recorded future "
+                         "(idea 1) or lane-centerline pursuit (idea 2)")
     args = ap.parse_args()
 
     import json
@@ -129,6 +207,8 @@ def main():
         eg = np.load(os.path.join(args.root, scene, "ego_motion.npz"))
         wp_all, valid = eg["wp"], eg["valid"]
         v0_all = eg["v0"]
+        lg = (np.load(os.path.join(args.root, scene, "lanegraph.npz"))
+              if args.mode == "pursuit" else None)
         dy = dpsi = 0.0
         for f in man["frames"]:
             fi = f["frame"]
@@ -136,7 +216,7 @@ def main():
                 continue
             if v0_all[fi] < args.min_v0:
                 continue
-            if n % 30 == 0:                # new departure every 3 s
+            if n % 30 == 0 or dy == 0.0:   # new departure every 3 s
                 dy = float(rng.uniform(0.5, 1.5)) * rng.choice([-1, 1])
                 dpsi = float(rng.uniform(-8, 8)) * np.pi / 180
             gt = cv2.imread(os.path.join(args.root, scene, f["gt"]),
@@ -144,16 +224,33 @@ def main():
             if gt is None:
                 continue
             wp = wp_all[fi].reshape(6, 2).astype(np.float64)
+            pass
+            cl0 = None
+            if lg is not None and fi < len(lg["n"]):
+                cl0 = ego_centerline(lg["pts"][fi], lg["n"][fi])
             left = draw_panel(gt, wp, "ORIGINAL (recorded)",
                               f"GT BEV + driven future 3s | "
-                              f"{v0_all[fi]*3.6:.0f} km/h", (60, 255, 120))
+                              f"{v0_all[fi]*3.6:.0f} km/h", (60, 255, 120),
+                              centerline=cl0)
             gt_p = perturb_raster(gt, dy, dpsi)
             wp_t = transform_wp(wp, dy, dpsi)
-            rec = recovery_target(wp_t, float(v0_all[fi]))
+            cl = cl_t = None
+            if lg is not None and fi < len(lg["n"]):
+                cl = ego_centerline(lg["pts"][fi], lg["n"][fi])
+            if args.mode == "pursuit" and cl is None:
+                continue                          # no usable centerline
+            if cl is not None:
+                cl_t = transform_wp(cl, dy, dpsi)
+            if args.mode == "pursuit":
+                rec = pursuit_target(cl_t, float(v0_all[fi]))
+                tag = "PURSUIT(centerline) RECOVERY"
+            else:
+                rec = recovery_target(wp_t, float(v0_all[fi]))
+                tag = "RECOVERY target"
             right = draw_panel(
                 gt_p, rec, "PERTURBED = departed viewpoint",
-                f"dy={dy:+.2f}m dpsi={np.degrees(dpsi):+.1f}deg -> "
-                "RECOVERY target", (0, 80, 255), dy=dy)
+                f"dy={dy:+.2f}m dpsi={np.degrees(dpsi):+.1f}deg -> " + tag,
+                (0, 80, 255), dy=dy, centerline=cl_t)
             frame = np.hstack([left, np.full((left.shape[0], 8, 3), 60,
                                              np.uint8), right])
             frame = cv2.resize(frame, (1280, 720))
