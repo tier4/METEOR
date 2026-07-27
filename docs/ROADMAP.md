@@ -1,6 +1,6 @@
 # METEOR — candidate list for future rounds
 
-## Implementation ledger (updated 2026-07-20)
+## Implementation ledger (updated 2026-07-27)
 
 ### Shipped — model/training rounds
 (🔴 = measured, significant win; effect column = held-out val, before → after)
@@ -26,7 +26,14 @@
 | r31 | 07-19 | 🔴 **E6 intent tokens + ego-w 1.2** | probeE2E ADE **0.78→0.67** |
 | r31 | 07-19 | 🔴 **Consensus GT v2 (+ ceiling measurement)** | GT-vs-GT ceiling quantified (mIoU 0.452, laneline 0.19 → plateau explained); laneline probe **0.14→0.162** on clean labels |
 | r31 | 07-19 | BEV rotation aug ±10°; distributed ADE probe | probe coverage **x8** at same wall time; rotation effect judged at r32 end |
-| r32 | 07-20 | C1 in-training risk selection; longitudinal 2x; v(t) aux head | running — gate: ADE ≤ 0.55 |
+| r32 | 07-20 | C1 in-training risk selection; longitudinal 2x; v(t) aux head | ADEc gate passed |
+| r33/r34 | 07-21..22 | 🔴 **v39 decoupled E2E head** (phi x v composition) | ADEc **0.53→0.43 m** |
+| r35 | 07-22 | 🔴 **Method A refiner grafts** (5-head post-hoc residual refiners trained frozen, grafted back trainable) | mIoU 0.324→0.325→(compounding each round) |
+| r36 | 07-23 | 🔴 **v41 dense unknown head + BOX_FAR_W far-vehicle boost** | veh R **0.47→0.51**, mIoU 0.331 |
+| r37/r38 | 07-24..25 | v42 VRU 25-45 m band; 3014 corpus (+1.3k scenes); unknown_v3 **camera-visibility filter** (median 59% of accumulated GT is occluded → per-cell don't-care) | valUnkD recall first non-zero; pixel recall 0.83 |
+| r39 | 07-26 | 🔴 **v43 + intent losses; unknown_v3 live** | mIoU **0.334**, ADEc **0.39 m** (both records) |
+| r40 | 07-27 | v44 **command→mode binding** (+8 logit boost = structural switch) | ep2 mIoU 0.335; stopped early for J6 round |
+| r41 | 07-27 | **J6 7-camera fine-tune** (--zero-cams CAM_BACK_NARROW) | running — measures the 7-cam accuracy cost (ep2: mIoU −0.004, veh R −8pt, adapting) |
 
 Unresolved despite attempts: lane graph P/R 0.01 (B1 transformer decoder pending verdict), BEV lane mIoU (GT-noise-limited — see consensus GT), ADE absolute ≤0.5 (in progress, 0.67 now).
 
@@ -41,39 +48,44 @@ Unresolved despite attempts: lane graph P/R 0.01 (B1 transformer decoder pending
 | C++ TensorRT runtime | 07-19 | deploy/cpp: engine build, t4dataset parsing, temporal ring, overlay video |
 | Watchdog auto-recovery | 07-19 | crash-detect + relaunch from newest ckpt + completion markers (round chains gated on markers) |
 | Drive-level test holdout | 07-18 | 150 scenes permanently excluded; curve/overtake unseen-drive demos |
+| v41 TRT engine, fp16-safe by construction | 07-24 | stable softplus + scale-then-sum pooling (two fp16 overflow modes fixed); device-resident temporal ring (420→108 ms/frame, 9.3 FPS L40S); NaN probe 0/147 |
+| --t4d root-mode batch inference | 07-24 | one engine + ONE combined video over a dataset root; NaN guards for bad odometry |
+| Per-module TRT profiler | 07-25 | DETAILED-verbosity engine + IProfiler: BEV projection/encoder = 51%, all sparse heads ≈ 1.5% |
+| Refiner NaN hardening | 07-26..27 | tanh-bounded residuals + input clamps on every refiner head; consecutive-skip detector; periodic (1k-step) saves; poisoned-BN forensics |
+| unk2d BEV lift | 07-27 | 2D 'obstacle' detections lifted through predicted depth to BEV (instance-separated markers, cross-camera dedupe) |
+| Corrupt-GT audit | 07-27 | 148/7,846 train scenes with consensus road collapse (sparse high-speed accumulation → spaghetti vectors); cleaned round42 list (7,707) |
+| Recovery-augmentation GT recipe (v45) | 07-27 | departed-viewpoint synthesis + pursuit/record recovery targets (auto fallback, curvature-aware extrapolation, 82% pursuit adoption) — GT demos verified |
 
 ### Planned
 | Item | Target | Detail |
 |---|---|---|
-| r33 = v39 decoupled E2E head | after r32 (~07-21) | heading x speed-profile composition (implemented 07-20, zero-gate verified); full corpus ~5.15k scenes (conversion completes ~07-21 AM) |
-| ADE <= 0.5 gate | r32/r33 | probeE2E ledger; fallback = selection-margin loss, then ego-GT smoothing for 0.3s |
-| Unknown decode calibration | r33 | threshold 0.25 -> P/R sweep target P>=0.5 R>=0.3 |
-| Boundary-tolerant thin-class metric (3b) | this week | consensus-GT companion metric |
-| Guardrail intervention-rate eval | this week | correct vs false interventions on val futures |
-| GT factory 3c/3d | after conversion idle | sub-cell alignment; pose re-smoothing (days, factory re-run) |
-| B1 verdict | r32 eval | if [valLane] still 0.01 after transformer decoder, redesign GT+matching before more training |
-| INT8 + IPM sector mask + E8 distillation | next week | Orin productisation path |
-| E2 self-training | after M1 | pseudo-label the 342 autolabel-less scenes |
+| r42 = clean-list round | after r41 | round42_scenes.txt (corrupt-GT excluded); carry v44; vehicle-recall recovery gate (veh R ≥ 0.51) |
+| v45 recovery augmentation | r42/r43 | departed-viewpoint perturbation into T_cam_ego + pursuit/record recovery targets (GT recipe done); E2E-only loss on perturbed frames, lateral-accel caps |
+| Perf ablation matrix | GPU-idle windows | docs/perf_analysis_plan.md: 7-cam engine (r41 weights), embedded head-set, INT8 PTQ (E2E head fp16), asymmetric grid 80 m fwd / 40 m back, channel pruning 96→64 |
+| Unknown peak decode | no retrain | connected-components → local-maxima decode; object-level P/R re-measure; fuse with unk2d lift |
+| GT re-render for the 148 corrupt scenes | factory idle | hole-filled accumulation at high speed, re-vectorize, re-consensus |
+| Command-following verification | r41 done | forced left/right demos on v44; lateral gap target ≥ 1 m (v43 was 0.2 m) |
+| J6 deployment package | after r41 + matrix | 7-cam export + INT8 engine + guardrail; Orin target |
 
 
 Living list of what we could do next, why, and what it would cost. Nothing
 here is committed work; each entry is sized so it can be picked up
 independently. Ordered within each section by (expected value ÷ risk).
 
-**Baseline to beat** (r26 = v32 ep1 / best-so-far values, held-out recording day):
+**Baseline to beat** (r39 = v43, held-out recording day):
 
 | metric | value |
 |---|---|
-| BEV lane mIoU | 0.314 (r25 ep1; r23 final 0.312) |
-| 2D seg mIoU (21 cls) | 0.535 |
-| 3D det veh P / Rn / yaw / dir-flips | 0.85 / 0.72 / 5.1° / 8% |
-| 3D det VRU P / Rn | 0.75 / 0.47 |
-| E2E ADE / ADEc | 0.69 / 0.47 m (r23) |
-| agent ADE / vehHead / stationary acc | 1.87 m / 26° / 0.70 |
-| TL accuracy | 0.86 (recovered, red class still weak ~0.5) |
-| unknown obj P / R | 0.07 / 0.02 (first non-zero, v3 GT) |
-| +LiDAR mIoU delta (same weights) | +0.004 and widening (C6b) |
-| lane graph P / R | 0.01 / 0.01 (not learning — see B1) |
+| BEV lane mIoU | 0.334 (record) |
+| 2D seg mIoU (21 cls) | 0.555 |
+| 3D det veh P / R / Rn / yaw / dir-flips | 0.78 / 0.49 / 0.71 / 3.7° / 6% (veh R record = 0.51 @ r36) |
+| 3D det VRU P / R50 / Rn | 0.75 / 0.34 / 0.46 |
+| E2E ADE / ADEc | 0.87 / 0.39 m (ADEc record) |
+| agent ADE / stationary acc | 1.65 m / 0.70 |
+| TL accuracy | 0.84 (red 0.50) |
+| unknown (dense, visibility-filtered GT) | pixel R 0.83; object-level decode pending peak rework |
+| TRT fp16 full graph | 108 ms / 9.3 FPS (L40S), NaN-free |
+| lane graph P / R | 0.01 (unchanged — B1 verdict still open) |
 
 **Rule of thumb**: every candidate must be checkable with `--val-every`
 (BEV mIoU + 3D det every N steps, ~90 s). A change that cannot be measured
