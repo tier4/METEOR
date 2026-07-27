@@ -87,7 +87,7 @@ def ego_centerline(pts, n):
     """lanegraph polylines are lane BOUNDARIES; the ego-lane centerline is
     the midline between the nearest left and right laneline. Returns
     [K,2] on a 1 m forward grid or None."""
-    xg = np.arange(0.0, 46.0, 1.0)
+    xg = np.arange(0.0, 61.0, 1.0)
     offs = []
     for i in range(int(n)):
         P = pts[i].astype(np.float64)
@@ -113,9 +113,14 @@ def ego_centerline(pts, n):
             left, bl = y, med
         if -3.2 < med < -0.3 and -med < br:
             right, br = y, -med
-    if left is None or right is None or not (2.0 < bl + br < 6.0):
+    if left is not None and right is not None and 2.0 < bl + br < 6.0:
+        yc = (left + right) / 2.0
+    elif left is not None:                      # single boundary + 1.75 m
+        yc = left - 1.75
+    elif right is not None:
+        yc = right + 1.75
+    else:
         return None
-    yc = (left + right) / 2.0
     m = ~np.isnan(yc)
     if m.sum() < 12:
         return None
@@ -131,6 +136,8 @@ def pursuit_target(cl_t, v0, K=6, dt=0.5):
     waypoint spacing never truncates: a short centerline must not teach a
     phantom deceleration."""
     need = max(v0, 2.0) * dt * (K + 2) + 30.0
+    seg0 = np.linalg.norm(np.diff(cl_t, axis=0), axis=1)
+    s_orig = float(seg0.sum())
     tan = cl_t[-1] - cl_t[-3]
     tan = tan / max(np.linalg.norm(tan), 1e-6)
     ext = cl_t[-1][None] + tan[None] * np.arange(1.0, need,
@@ -158,7 +165,18 @@ def pursuit_target(cl_t, v0, K=6, dt=0.5):
         out[i] = h00*P0 + h10*T0 + h01*P1 + h11*T1
     for i in range(kj, K):                       # then follow the lane
         out[i] = at(s0 + L + step * (i - kj + 1))
-    return out
+    s_need = s0 + L + step * (K - kj)
+    ext_frac = max(0.0, (s_need - s_orig) / max(s_need - s0, 1e-6))
+    # if the centerline END is straight, extrapolation is trustworthy:
+    # report a reduced effective fraction so straight highways stay PURSUIT
+    tail = cl_t[max(0, len(cl_t) - len(ext) - 8):len(cl_t) - len(ext)]
+    if len(tail) >= 6:
+        d = np.diff(tail, axis=0)
+        ang = np.arctan2(d[:, 1], d[:, 0])
+        curv = float(np.abs(np.diff(ang)).mean())
+        if curv < 0.01:                          # < ~0.6 deg/m: straight
+            ext_frac *= 0.25
+    return out, ext_frac
 
 
 def draw_panel(gt, wps, title, sub, path_col, dy=None, centerline=None):
@@ -202,7 +220,7 @@ def main():
     ap.add_argument("--min-v0", type=float, default=0.0,
                     help="skip frames slower than this [m/s]")
     ap.add_argument("--mode", default="record",
-                    choices=["record", "pursuit"],
+                    choices=["record", "pursuit", "auto"],
                     help="recovery target: transformed recorded future "
                          "(idea 1) or lane-centerline pursuit (idea 2)")
     args = ap.parse_args()
@@ -218,7 +236,7 @@ def main():
         wp_all, valid = eg["wp"], eg["valid"]
         v0_all = eg["v0"]
         lg = (np.load(os.path.join(args.root, scene, "lanegraph.npz"))
-              if args.mode == "pursuit" else None)
+              if args.mode in ("pursuit", "auto") else None)
         dy = dpsi = 0.0
         for f in man["frames"]:
             fi = f["frame"]
@@ -251,12 +269,18 @@ def main():
                 continue                          # no usable centerline
             if cl is not None:
                 cl_t = transform_wp(cl, dy, dpsi)
-            if args.mode == "pursuit":
-                rec = pursuit_target(cl_t, float(v0_all[fi]))
-                tag = "PURSUIT(centerline) RECOVERY"
+            use_pursuit = False
+            if args.mode in ("pursuit", "auto") and cl_t is not None:
+                rec_p, ext_frac = pursuit_target(cl_t, float(v0_all[fi]))
+                use_pursuit = (args.mode == "pursuit"
+                               or ext_frac <= 0.30)
+            if use_pursuit:
+                rec = rec_p
+                tag = f"PURSUIT recovery (extrap {ext_frac*100:.0f}%)"
             else:
                 rec = recovery_target(wp_t, float(v0_all[fi]))
-                tag = "RECOVERY target"
+                tag = ("RECORD recovery (fallback)"
+                       if args.mode == "auto" else "RECOVERY target")
             right = draw_panel(
                 gt_p, rec, "PERTURBED = departed viewpoint",
                 f"dy={dy:+.2f}m dpsi={np.degrees(dpsi):+.1f}deg -> " + tag,
