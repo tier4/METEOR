@@ -26,7 +26,8 @@ class BevLaneDataset(Dataset):
                  with_agenttraj=False, with_temporal=False, with_tl=False,
                  with_risk=False, with_lanegraph=False, temporal_hist=0,
                  with_unknown=False, with_lidarbev=False,
-                 with_unknown_v2=False, unk2_key="unknown_v2"):
+                 with_unknown_v2=False, unk2_key="unknown_v2",
+                 with_sdmap=False):
         self.root = root
         self.with_lidarbev = with_lidarbev
         self.gt_key = gt_key
@@ -49,6 +50,7 @@ class BevLaneDataset(Dataset):
         self.with_unknown = with_unknown
         self.with_unknown_v2 = with_unknown_v2
         self.unk2_key = unk2_key
+        self.with_sdmap = with_sdmap
         self._unk_cache = {}
         self.temporal_hist = temporal_hist   # v29: N history slots
         self._tl_cache = {}
@@ -328,6 +330,18 @@ class BevLaneDataset(Dataset):
                 except Exception:
                     pass
             out.append(torch.from_numpy(lb))
+        if self.with_sdmap:
+            # OSM SD-map prior [4,400,250] (road/centerline/inters/cross);
+            # zeros when the scene has no GNSS/OSM raster (= prior off)
+            sd = np.zeros((4, 400, 250), np.float32)
+            p_ = f.get("sdmap")
+            if p_:
+                try:
+                    sd = np.load(os.path.join(self.root, s, p_)
+                                 )["sd"].astype(np.float32)
+                except Exception:
+                    pass
+            out.append(torch.from_numpy(sd))
         if self.with_temporal and self.temporal_hist > 0:
             # v29 memory queue: N history frames at fi-2, fi-6, fi-14
             HN = self.temporal_hist

@@ -3056,6 +3056,49 @@ class DepthSegIPMNetV45(DepthSegIPMNetV44):
             * (2.0 * self.quant_noise)
 
 
+class DepthSegIPMNetV46(DepthSegIPMNetV45):
+    """v46 (r44): FREE SD-map (OpenStreetMap) prior as an OPTIONAL input.
+
+    Identical recipe to the v32 LiDAR raster: sdmap [B,4,400,250] (road
+    area / centerline / intersections / crossings+signals, rendered into
+    the ego frame from per-pose GNSS + OSM) -> zero-init conv stem ->
+    flag-gated residual on the BEV. An all-zero input is bit-equal to
+    no-map, and training drops the map on half the samples, so ONE set of
+    weights serves both GNSS-less and map-assisted operation."""
+
+    def __init__(self, *a, **k):
+        super().__init__(*a, **k)
+        self.sdmap_stem = nn.Sequential(
+            nn.Conv2d(4, 48, 3, padding=1), nn.ReLU(inplace=True),
+            nn.Conv2d(48, 96, 3, padding=1), nn.ReLU(inplace=True),
+            nn.Conv2d(96, 96, 1))
+        nn.init.zeros_(self.sdmap_stem[-1].weight)
+        nn.init.zeros_(self.sdmap_stem[-1].bias)
+        self._sdmap = None
+
+    def bev_extra(self, bev):
+        bev = super().bev_extra(bev)
+        if self._sdmap is None:
+            return bev
+        sd = self._sdmap.to(bev.dtype)
+        flag = (sd.abs().sum((1, 2, 3), keepdim=True) > 0).to(bev.dtype)
+        res = F.interpolate(self.sdmap_stem(sd), bev.shape[-2:],
+                            mode="bilinear", align_corners=False)
+        return bev + flag * res
+
+    def forward(self, imgs, K, T_cam_ego, v0=None, prev_bev=None,
+                warp_theta=None, lidar=None, lidar_bev=None, kin=None,
+                intent=None, sdmap=None):
+        self._sdmap = sdmap
+        try:
+            return super().forward(imgs, K, T_cam_ego, v0, prev_bev,
+                                   warp_theta, lidar=lidar,
+                                   lidar_bev=lidar_bev, kin=kin,
+                                   intent=intent)
+        finally:
+            self._sdmap = None          # history compute_bev stays map-free
+
+
 MODELS = {"v1": IPMSegNet, "v2": IPMSegNetV2, "v3s": IPMSegNetV3,
           "lss": LSSDepthNet, "v8": DepthGatedIPMNet, "v13": DepthSegIPMNet,
           "v13d": DepthSegIPMNetS4, "v14d": DepthSegIPMNetV14,
@@ -3064,4 +3107,4 @@ MODELS = {"v1": IPMSegNet, "v2": IPMSegNetV2, "v3s": IPMSegNetV3,
           "v19": DepthSegIPMNetV19, "v20": DepthSegIPMNetV20,
           "v21": DepthSegIPMNetV21, "v22": DepthSegIPMNetV22,
           "v23": DepthSegIPMNetV23, "v24": DepthSegIPMNetV24,
-          "v25": DepthSegIPMNetV25, "v26": DepthSegIPMNetV26, "v27": DepthSegIPMNetV27, "v28": DepthSegIPMNetV28, "v29": DepthSegIPMNetV29, "v30": DepthSegIPMNetV30, "v31": DepthSegIPMNetV31, "v32": DepthSegIPMNetV32, "v33": DepthSegIPMNetV33, "v34": DepthSegIPMNetV34, "v35": DepthSegIPMNetV35, "v36": DepthSegIPMNetV36, "v37": DepthSegIPMNetV37, "v38": DepthSegIPMNetV38, "v39": DepthSegIPMNetV39, "v40": DepthSegIPMNetV40, "v41": DepthSegIPMNetV41, "v42": DepthSegIPMNetV42, "v43": DepthSegIPMNetV43, "v44": DepthSegIPMNetV44, "v45": DepthSegIPMNetV45}
+          "v25": DepthSegIPMNetV25, "v26": DepthSegIPMNetV26, "v27": DepthSegIPMNetV27, "v28": DepthSegIPMNetV28, "v29": DepthSegIPMNetV29, "v30": DepthSegIPMNetV30, "v31": DepthSegIPMNetV31, "v32": DepthSegIPMNetV32, "v33": DepthSegIPMNetV33, "v34": DepthSegIPMNetV34, "v35": DepthSegIPMNetV35, "v36": DepthSegIPMNetV36, "v37": DepthSegIPMNetV37, "v38": DepthSegIPMNetV38, "v39": DepthSegIPMNetV39, "v40": DepthSegIPMNetV40, "v41": DepthSegIPMNetV41, "v42": DepthSegIPMNetV42, "v43": DepthSegIPMNetV43, "v44": DepthSegIPMNetV44, "v45": DepthSegIPMNetV45, "v46": DepthSegIPMNetV46}

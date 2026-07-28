@@ -897,7 +897,7 @@ def main():
     ap.add_argument("--workers", type=int, default=6)
     ap.add_argument("--out", default="out/bevlane_ckpt")
     ap.add_argument("--limit-train", type=int, default=None)
-    ap.add_argument("--model", default="v1", choices=["v1", "v2", "v3s", "lss", "v8", "v13", "v13d", "v14d", "v15", "v16", "v17", "v18", "v19", "v20", "v21", "v22", "v23", "v24", "v25", "v26", "v27", "v28", "v29", "v30", "v31", "v32", "v33", "v34", "v35", "v36", "v37", "v38", "v39", "v40", "v41", "v42", "v43", "v44", "v45"])
+    ap.add_argument("--model", default="v1", choices=["v1", "v2", "v3s", "lss", "v8", "v13", "v13d", "v14d", "v15", "v16", "v17", "v18", "v19", "v20", "v21", "v22", "v23", "v24", "v25", "v26", "v27", "v28", "v29", "v30", "v31", "v32", "v33", "v34", "v35", "v36", "v37", "v38", "v39", "v40", "v41", "v42", "v43", "v44", "v45", "v46"])
     ap.add_argument("--depth-w", type=float, default=0.3)
     ap.add_argument("--seg2d-w", type=float, default=0.5)
     ap.add_argument("--seg2d-key", default="seg2d",
@@ -936,6 +936,10 @@ def main():
                     help="fraction of samples given a lateral offset")
     ap.add_argument("--quant-noise", type=float, default=0.0,
                     help="v45 INT8-robust feature noise (1.0 = 1 LSB)")
+    ap.add_argument("--use-sdmap", action="store_true",
+                    help="v46: feed the OSM SD-map raster (optional input)")
+    ap.add_argument("--sdmap-drop", type=float, default=0.5,
+                    help="whole-sample SD-map dropout (modality dropout)")
     ap.add_argument("--zero-cams", default="",
                     help="comma-separated camera names to hard-zero "
                          "(J6 7-cam fine-tune: CAM_BACK_NARROW)")
@@ -1000,31 +1004,32 @@ def main():
         os.makedirs(args.out, exist_ok=True)
 
     train_s, val_s = split_scenes(args.root)
-    use_depth = args.model in ("lss", "v8", "v13", "v13d", "v14d", "v15", "v16", "v17", "v18", "v19", "v20", "v21", "v22", "v23", "v24", "v25", "v26", "v27", "v28", "v29", "v30", "v31", "v32", "v33", "v34", "v35", "v36", "v37", "v38", "v39", "v40", "v41", "v42", "v43", "v44", "v45") and args.depth_w > 0
-    use_seg2d = args.model in ("v13", "v13d", "v14d", "v15", "v16", "v17", "v18", "v19", "v20", "v21", "v22", "v23", "v24", "v25", "v26", "v27", "v28", "v29", "v30", "v31", "v32", "v33", "v34", "v35", "v36", "v37", "v38", "v39", "v40", "v41", "v42", "v43", "v44", "v45") and args.seg2d_w > 0
+    use_depth = args.model in ("lss", "v8", "v13", "v13d", "v14d", "v15", "v16", "v17", "v18", "v19", "v20", "v21", "v22", "v23", "v24", "v25", "v26", "v27", "v28", "v29", "v30", "v31", "v32", "v33", "v34", "v35", "v36", "v37", "v38", "v39", "v40", "v41", "v42", "v43", "v44", "v45", "v46") and args.depth_w > 0
+    use_seg2d = args.model in ("v13", "v13d", "v14d", "v15", "v16", "v17", "v18", "v19", "v20", "v21", "v22", "v23", "v24", "v25", "v26", "v27", "v28", "v29", "v30", "v31", "v32", "v33", "v34", "v35", "v36", "v37", "v38", "v39", "v40", "v41", "v42", "v43", "v44", "v45", "v46") and args.seg2d_w > 0
     use_box = args.model == "v15" and args.box_w > 0
-    use_boxdet = args.model in ("v16", "v17", "v18", "v19", "v20", "v21", "v22", "v23", "v24", "v25", "v26", "v27", "v28", "v29", "v30", "v31", "v32", "v33", "v34", "v35", "v36", "v37", "v38", "v39", "v40", "v41", "v42", "v43", "v44", "v45") and args.box_w > 0
-    use_bbox2d = args.model in ("v17", "v18", "v19", "v20", "v21", "v22", "v23", "v24", "v25", "v26", "v27", "v28", "v29", "v30", "v31", "v32", "v33", "v34", "v35", "v36", "v37", "v38", "v39", "v40", "v41", "v42", "v43", "v44", "v45") and args.bbox2d_w > 0
-    use_ego = args.model in ("v18", "v19", "v20", "v21", "v22", "v23", "v24", "v25", "v26", "v27", "v28", "v29", "v30", "v31", "v32", "v33", "v34", "v35", "v36", "v37", "v38", "v39", "v40", "v41", "v42", "v43", "v44", "v45") and args.ego_w > 0
-    use_occ = args.model in ("v20", "v21", "v22", "v23", "v24", "v25", "v26", "v27", "v28", "v29", "v30", "v31", "v32", "v33", "v34", "v35", "v36", "v37", "v38", "v39", "v40", "v41", "v42", "v43", "v44", "v45") and args.occ_w > 0
-    use_traj = args.model in ("v21", "v22", "v23", "v24", "v25", "v26", "v27", "v28", "v29", "v30", "v31", "v32", "v33", "v34", "v35", "v36", "v37", "v38", "v39", "v40", "v41", "v42", "v43", "v44", "v45") and args.traj_w > 0
-    use_temporal = args.model in ("v22", "v23", "v24", "v25", "v26", "v27", "v28", "v29", "v30", "v31", "v32", "v33", "v34", "v35", "v36", "v37", "v38", "v39", "v40", "v41", "v42", "v43", "v44", "v45")
-    use_tl = args.model in ("v27", "v28", "v29", "v30", "v31", "v32", "v33", "v34", "v35", "v36", "v37", "v38", "v39", "v40", "v41", "v42", "v43", "v44", "v45") and args.tl_w > 0
-    use_risk = args.model in ("v28", "v29", "v30", "v31", "v32", "v33", "v34", "v35", "v36", "v37", "v38", "v39", "v40", "v41", "v42", "v43", "v44", "v45") and args.risk_w > 0
-    use_lg = args.model in ("v29", "v30", "v31", "v32", "v33", "v34", "v35", "v36", "v37", "v38", "v39", "v40", "v41", "v42", "v43", "v44", "v45") and args.lanegraph_w > 0
-    use_unk = args.model in ("v30", "v31", "v32", "v33", "v34", "v35", "v36", "v37", "v38", "v39", "v40", "v41", "v42", "v43", "v44", "v45") and args.unk_w > 0
-    use_unk_v2 = args.model in ("v41", "v42", "v43", "v44", "v45") and args.unk_dense_w > 0
+    use_boxdet = args.model in ("v16", "v17", "v18", "v19", "v20", "v21", "v22", "v23", "v24", "v25", "v26", "v27", "v28", "v29", "v30", "v31", "v32", "v33", "v34", "v35", "v36", "v37", "v38", "v39", "v40", "v41", "v42", "v43", "v44", "v45", "v46") and args.box_w > 0
+    use_bbox2d = args.model in ("v17", "v18", "v19", "v20", "v21", "v22", "v23", "v24", "v25", "v26", "v27", "v28", "v29", "v30", "v31", "v32", "v33", "v34", "v35", "v36", "v37", "v38", "v39", "v40", "v41", "v42", "v43", "v44", "v45", "v46") and args.bbox2d_w > 0
+    use_ego = args.model in ("v18", "v19", "v20", "v21", "v22", "v23", "v24", "v25", "v26", "v27", "v28", "v29", "v30", "v31", "v32", "v33", "v34", "v35", "v36", "v37", "v38", "v39", "v40", "v41", "v42", "v43", "v44", "v45", "v46") and args.ego_w > 0
+    use_occ = args.model in ("v20", "v21", "v22", "v23", "v24", "v25", "v26", "v27", "v28", "v29", "v30", "v31", "v32", "v33", "v34", "v35", "v36", "v37", "v38", "v39", "v40", "v41", "v42", "v43", "v44", "v45", "v46") and args.occ_w > 0
+    use_traj = args.model in ("v21", "v22", "v23", "v24", "v25", "v26", "v27", "v28", "v29", "v30", "v31", "v32", "v33", "v34", "v35", "v36", "v37", "v38", "v39", "v40", "v41", "v42", "v43", "v44", "v45", "v46") and args.traj_w > 0
+    use_temporal = args.model in ("v22", "v23", "v24", "v25", "v26", "v27", "v28", "v29", "v30", "v31", "v32", "v33", "v34", "v35", "v36", "v37", "v38", "v39", "v40", "v41", "v42", "v43", "v44", "v45", "v46")
+    use_tl = args.model in ("v27", "v28", "v29", "v30", "v31", "v32", "v33", "v34", "v35", "v36", "v37", "v38", "v39", "v40", "v41", "v42", "v43", "v44", "v45", "v46") and args.tl_w > 0
+    use_risk = args.model in ("v28", "v29", "v30", "v31", "v32", "v33", "v34", "v35", "v36", "v37", "v38", "v39", "v40", "v41", "v42", "v43", "v44", "v45", "v46") and args.risk_w > 0
+    use_lg = args.model in ("v29", "v30", "v31", "v32", "v33", "v34", "v35", "v36", "v37", "v38", "v39", "v40", "v41", "v42", "v43", "v44", "v45", "v46") and args.lanegraph_w > 0
+    use_unk = args.model in ("v30", "v31", "v32", "v33", "v34", "v35", "v36", "v37", "v38", "v39", "v40", "v41", "v42", "v43", "v44", "v45", "v46") and args.unk_w > 0
+    use_unk_v2 = args.model in ("v41", "v42", "v43", "v44", "v45", "v46") and args.unk_dense_w > 0
+    use_sdmap = args.model == "v46" and args.use_sdmap
     # v31 reuses the depth4 GT tensor as the (train-time) LiDAR input
-    use_lidar = args.model in ("v31", "v32", "v33", "v34", "v35", "v36", "v37", "v38", "v39", "v40", "v41", "v42", "v43", "v44", "v45")
+    use_lidar = args.model in ("v31", "v32", "v33", "v34", "v35", "v36", "v37", "v38", "v39", "v40", "v41", "v42", "v43", "v44", "v45", "v46")
     # v32 additionally takes the pillar BEV raster (extract_lidar_bev.py)
-    use_lidarbev = args.model in ("v32", "v33", "v34", "v35", "v36", "v37", "v38", "v39", "v40", "v41", "v42", "v43", "v44", "v45")
-    use_flow = args.model in ("v29", "v30", "v31", "v32", "v33", "v34", "v35", "v36", "v37", "v38", "v39", "v40", "v41", "v42", "v43", "v44", "v45") and args.flow_w > 0
-    hist_n = 3 if args.model in ("v29", "v30", "v31", "v32", "v33", "v34", "v35", "v36", "v37", "v38", "v39", "v40", "v41", "v42", "v43", "v44", "v45") else 0
+    use_lidarbev = args.model in ("v32", "v33", "v34", "v35", "v36", "v37", "v38", "v39", "v40", "v41", "v42", "v43", "v44", "v45", "v46")
+    use_flow = args.model in ("v29", "v30", "v31", "v32", "v33", "v34", "v35", "v36", "v37", "v38", "v39", "v40", "v41", "v42", "v43", "v44", "v45", "v46") and args.flow_w > 0
+    hist_n = 3 if args.model in ("v29", "v30", "v31", "v32", "v33", "v34", "v35", "v36", "v37", "v38", "v39", "v40", "v41", "v42", "v43", "v44", "v45", "v46") else 0
     if args.train_list:                       # restrict train to a scene list
         keep = set(open(args.train_list).read().split())
         train_s = [s for s in train_s if s in keep]
     # v13d depth GT is stride-4 of 768 (108x192); resize any mixed-res depth
-    depth_hw = (108, 192) if args.model in ("v13d", "v14d", "v15", "v16", "v17", "v18", "v19", "v20", "v21", "v22", "v23", "v24", "v25", "v26", "v27", "v28", "v29", "v30", "v31", "v32", "v33", "v34", "v35", "v36", "v37", "v38", "v39", "v40", "v41", "v42", "v43", "v44", "v45") else None
+    depth_hw = (108, 192) if args.model in ("v13d", "v14d", "v15", "v16", "v17", "v18", "v19", "v20", "v21", "v22", "v23", "v24", "v25", "v26", "v27", "v28", "v29", "v30", "v31", "v32", "v33", "v34", "v35", "v36", "v37", "v38", "v39", "v40", "v41", "v42", "v43", "v44", "v45", "v46") else None
     tr = BevLaneDataset(args.root, train_s, gt_key=args.gt_key,
                         dontcare_sidewalk=args.dontcare_sidewalk,
                         with_depth=use_depth, augment=args.aug,
@@ -1038,6 +1043,7 @@ def main():
                         with_lanegraph=use_lg, temporal_hist=hist_n,
                         with_unknown=use_unk, with_lidarbev=use_lidarbev,
                         with_unknown_v2=use_unk_v2, unk2_key=args.unk_key,
+                        with_sdmap=use_sdmap,
                         trim_start=3, trim_end=args.trim_end,
                         min_cov_core=args.min_cov_core,
                         min_cov_fwd=args.min_cov_fwd,
@@ -1057,6 +1063,7 @@ def main():
                             with_lidarbev=use_lidarbev,
                             with_unknown_v2=use_unk_v2,
                             unk2_key=args.unk_key,
+                            with_sdmap=use_sdmap,
                             trim_start=3, trim_end=args.trim_end)
         seen = min(args.limit_train or len(tr), len(tr)) * args.epochs
         print(f"train {len(tr)} samples / {len(train_s)} scenes; "
@@ -1142,7 +1149,7 @@ def main():
                     drop_last=True, **dl_kw)
 
     mkw = {"n_seg": args.n_seg2d} \
-        if args.model in ("v13", "v13d", "v14d", "v15", "v16", "v17", "v18", "v19", "v20", "v21", "v22", "v23", "v24", "v25", "v26", "v27", "v28", "v29", "v30", "v31", "v32", "v33", "v34", "v35", "v36", "v37", "v38", "v39", "v40", "v41", "v42", "v43", "v44", "v45") else {}
+        if args.model in ("v13", "v13d", "v14d", "v15", "v16", "v17", "v18", "v19", "v20", "v21", "v22", "v23", "v24", "v25", "v26", "v27", "v28", "v29", "v30", "v31", "v32", "v33", "v34", "v35", "v36", "v37", "v38", "v39", "v40", "v41", "v42", "v43", "v44", "v45", "v46") else {}
     model = MODELS[args.model](**mkw).to(device)
     if args.quant_noise > 0:
         model.quant_noise = args.quant_noise
@@ -1168,7 +1175,7 @@ def main():
         model = torch.nn.parallel.DistributedDataParallel(
             model, device_ids=[local],
             find_unused_parameters=(args.seg_w == 0 or
-                                    (args.model in ("v13", "v13d", "v14d", "v15", "v16", "v17", "v18", "v19", "v20", "v21", "v22", "v23", "v24", "v25", "v26", "v27", "v28", "v29", "v30", "v31", "v32", "v33", "v34", "v35", "v36", "v37", "v38", "v39", "v40", "v41", "v42", "v43", "v44", "v45") and not use_seg2d)))
+                                    (args.model in ("v13", "v13d", "v14d", "v15", "v16", "v17", "v18", "v19", "v20", "v21", "v22", "v23", "v24", "v25", "v26", "v27", "v28", "v29", "v30", "v31", "v32", "v33", "v34", "v35", "v36", "v37", "v38", "v39", "v40", "v41", "v42", "v43", "v44", "v45", "v46") and not use_seg2d)))
     opt = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-4)
     total_steps = len(dl) * args.epochs
     sched = torch.optim.lr_scheduler.OneCycleLR(opt, max_lr=lr,
@@ -1231,6 +1238,8 @@ def main():
             bi += 1 if use_unk_v2 else 0
             lidbev = batch[bi] if use_lidarbev else None
             bi += 1 if use_lidarbev else 0
+            sdmap_t = batch[bi] if use_sdmap else None
+            bi += 1 if use_sdmap else 0
             if use_temporal:
                 prev_imgs, rel_pose, prev_valid = (batch[bi], batch[bi + 1],
                                                    batch[bi + 2])
@@ -1276,9 +1285,9 @@ def main():
                 pb = pb.float()
                 theta = make_warp_theta(rel_pose)
             intent_oh = None
-            if args.model in ("v37", "v38", "v39", "v40", "v41", "v42", "v43", "v44", "v45") and ego_gt is not None:
+            if args.model in ("v37", "v38", "v39", "v40", "v41", "v42", "v43", "v44", "v45", "v46") and ego_gt is not None:
                 lat = ego_gt[:, 11]
-                if args.model in ("v43", "v44", "v45"):
+                if args.model in ("v43", "v44", "v45", "v46"):
                     # v43: earlier-firing command -- ANY waypoint (1.5-3 s)
                     # crossing +-2.0 m counts, so the command is active on
                     # the approach, not only mid-turn (matches the pseudo-nav
@@ -1302,6 +1311,11 @@ def main():
                 lid = depth_gt * keep
                 if use_lidarbev and lidbev is not None:
                     lidbev = lidbev * keep
+            sd_in = None
+            if use_sdmap and sdmap_t is not None:
+                keep_sd = (torch.rand(imgs.shape[0], 1, 1, 1, device=device)
+                           >= args.sdmap_drop).to(sdmap_t.dtype)
+                sd_in = sdmap_t * keep_sd
             with torch.autocast("cuda", torch.float16):
                 # v18+ is conditioned on the current speed (ego_gt col 12)
                 if use_temporal:
@@ -1310,10 +1324,11 @@ def main():
                                 **({"lidar": lid} if use_lidar else {}),
                                 **({"lidar_bev": lidbev}
                                    if use_lidarbev else {}),
+                                **({"sdmap": sd_in} if use_sdmap else {}),
                                 **({"kin": rel_pose}
-                                   if args.model in ("v36", "v37", "v38", "v39", "v40", "v41", "v42", "v43", "v44", "v45") else {}),
+                                   if args.model in ("v36", "v37", "v38", "v39", "v40", "v41", "v42", "v43", "v44", "v45", "v46") else {}),
                                 **({"intent": intent_oh}
-                                   if args.model in ("v37", "v38", "v39", "v40", "v41", "v42", "v43", "v44", "v45") else {}))
+                                   if args.model in ("v37", "v38", "v39", "v40", "v41", "v42", "v43", "v44", "v45", "v46") else {}))
                 elif use_ego:
                     out = model(imgs, K, Tc, ego_gt[:, 12])
                 else:
@@ -1353,7 +1368,7 @@ def main():
                 if hm is not None and use_boxdet:
                     loss = loss + args.box_w * net0.boxdet_loss(hm, rg, det_boxes,
                                                                 det_n)
-                if args.model in ("v38", "v39", "v40", "v41", "v42", "v43", "v44", "v45") and use_ego and ego_gt is not None:
+                if args.model in ("v38", "v39", "v40", "v41", "v42", "v43", "v44", "v45", "v46") and use_ego and ego_gt is not None:
                     loss = loss + 0.3 * net0.vprof_loss(ego_gt)
                 if traj_pred is not None and use_traj:
                     loss = loss + args.traj_w * net0.traj_loss(
@@ -1379,11 +1394,11 @@ def main():
                 if use_unk_v2 and len(out) >= 18:
                     loss = loss + args.unk_dense_w * net0.unk_dense_loss(
                         out[17], unk_v2)
-                if (args.intent_w > 0 and args.model in ("v43", "v44", "v45")
+                if (args.intent_w > 0 and args.model in ("v43", "v44", "v45", "v46")
                         and intent_oh is not None and ego_pred is not None):
                     loss = loss + args.intent_w * net0.intent_loss(
                         ego_pred, intent_oh)
-                if (args.intent_mode_w > 0 and args.model in ("v44", "v45")
+                if (args.intent_mode_w > 0 and args.model in ("v44", "v45", "v46")
                         and intent_oh is not None and ego_pred is not None):
                     loss = loss + args.intent_mode_w * net0.intent_mode_loss(
                         ego_pred, intent_oh)
@@ -1456,7 +1471,8 @@ def main():
                                                      + 4 * int(use_lg)
                                                      + 2 * int(use_unk)
                                                      + int(use_unk_v2)
-                                                     + int(use_lidarbev))
+                                                     + int(use_lidarbev)
+                                                     + int(use_sdmap))
                                             if use_temporal else None)
                         msg += (f" | vehRn={dq['vehn']:.2f} P={dq['veh'][0]:.2f}"
                                 f" vruRn={dq['vrun']:.2f}"
@@ -1478,7 +1494,8 @@ def main():
                                  + int(use_ego) + int(use_occ)
                                  + int(use_tl) + int(use_risk)
                                  + 4 * int(use_lg) + 2 * int(use_unk)
-                                 + int(use_unk_v2) + int(use_lidarbev)))
+                                 + int(use_unk_v2) + int(use_lidarbev)
+                                 + int(use_sdmap)))
                     torch.cuda.empty_cache()
                     if ddp:
                         dist.all_reduce(sums)
@@ -1524,7 +1541,7 @@ def main():
             vtmp = (4 + int(use_seg2d) + 4 * int(use_traj) + int(use_ego)
                     + int(use_occ) + int(use_tl) + int(use_risk)
                     + 4 * int(use_lg) + 2 * int(use_unk) + int(use_unk_v2)
-                    + int(use_lidarbev)) \
+                    + int(use_lidarbev) + int(use_sdmap)) \
                 if use_temporal else None
             if use_traj and use_boxdet:
                 d3 = evaluate_det3d(net, dv, device, 4 + int(use_seg2d),
