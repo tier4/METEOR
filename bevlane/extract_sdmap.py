@@ -145,6 +145,55 @@ def render_frame(ways, widths, inters, cross, pose):
     return sd
 
 
+def refine_alignment(ways, widths, eg_pose, root, scene, man):
+    """The exported geocoordinate is rounded to ~6 significant digits
+    (lon 3 decimals = ~90 m quantisation!), so the geo fit is only a
+    coarse seed. Refine a single SE(2) map-frame correction per scene by
+    maximising overlap between the OSM road raster and the trusted GT
+    road, on a few sampled frames. (At deployment the vehicle's own
+    localisation provides the accurate pose; this rounding is a dataset
+    export artifact.)"""
+    frames = [f for f in man["frames"][20:130:22] if f.get("gt")]
+    gts = []
+    for f in frames:
+        g = cv2.imread(os.path.join(root, scene, f["gt"]), 0)
+        if g is None:
+            continue
+        g = cv2.resize(g, (GW, GH), interpolation=cv2.INTER_NEAREST)
+        gts.append((f["frame"], (g == 1) | (g == 7)))
+    if not gts:
+        return 0.0, 0.0, 0.0, -1.0
+
+    def score(dx, dy, dth):
+        tot = 0.0
+        for fi, gm in gts:
+            x0, y0, yaw = eg_pose[fi]
+            cs, sn = np.cos(yaw), np.sin(yaw)
+            # correction expressed in map frame
+            sd = render_frame(ways, widths, np.zeros((0, 2)),
+                              np.zeros((0, 2)),
+                              (x0 + dx, y0 + dy, yaw + dth))
+            inter = float((sd[0].astype(bool) & gm).sum())
+            union = float((sd[0].astype(bool) | gm).sum())
+            tot += inter / max(union, 1)
+        return tot / len(gts)
+
+    best = (0.0, 0.0, 0.0, score(0, 0, 0))
+    for dx in range(-48, 49, 6):
+        for dy in range(-48, 49, 6):
+            sc = score(dx, dy, 0.0)
+            if sc > best[3]:
+                best = (float(dx), float(dy), 0.0, sc)
+    bx, by = best[0], best[1]
+    for dx in np.arange(bx - 5, bx + 5.1, 1.0):
+        for dy in np.arange(by - 5, by + 5.1, 1.0):
+            for dth in np.radians([-3, -1.5, 0, 1.5, 3]):
+                sc = score(dx, dy, dth)
+                if sc > best[3]:
+                    best = (float(dx), float(dy), float(dth), sc)
+    return best
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--scene", required=True, help="converted scene name")
@@ -158,7 +207,17 @@ def main():
           f"{len(cross)} crossings | geo-fit residual {err:.2f} m", flush=True)
 
     eg = np.load(os.path.join(args.root, args.scene, "ego_motion.npz"))
-    pose = eg["pose"]
+    pose = eg["pose"].astype(np.float64)
+    man0 = json.load(open(os.path.join(args.root, args.scene,
+                                       "manifest.json")))
+    dx, dy, dth, iou = refine_alignment(ways, widths, pose, args.root,
+                                        args.scene, man0)
+    print(f"[refine] dx={dx:+.1f} dy={dy:+.1f} dth={np.degrees(dth):+.1f}deg "
+          f"road-IoU={iou:.3f}", flush=True)
+    pose = pose.copy()
+    pose[:, 0] += dx
+    pose[:, 1] += dy
+    pose[:, 2] += dth
     if args.viz:
         from autolabel_bev import PALETTE
         PAL = np.zeros((256, 3), np.uint8); PAL[:len(PALETTE)] = PALETTE
