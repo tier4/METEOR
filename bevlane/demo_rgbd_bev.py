@@ -682,6 +682,12 @@ def main():
                         sc = cv2.resize(sc, (cw, ch),
                                         interpolation=cv2.INTER_NEAREST)
                         img = cv2.addWeighted(img, 0.62, sc, 0.38, 0)
+                    if args.zero_cams and chn in args.zero_cams.split(","):
+                        img = (img * 0.15).astype(np.uint8)
+                        cv2.putText(img, "DISABLED (J6 7-cam)",
+                                    (int(cw * 0.16), ch // 2),
+                                    cv2.FONT_HERSHEY_SIMPLEX, 0.7,
+                                    (0, 80, 255), 2, cv2.LINE_AA)
                     if "NARROW" in chn:
                         label(img, "NARROW", (0, 255, 0))
                     if det_boxes:
