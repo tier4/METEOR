@@ -528,6 +528,67 @@ except Exception:
 caption(s, "CNN構成＝現行SoC（Orin）で動作可能な現実的な設計（LLM/世界モデル化は現行車載HWでは困難なため未着手）"
         "／ 学習データはCoMET自動ラベル（人手0）", y=6.95, col=C_GRAY, size=10.5)
 
+
+# ------------------------------------------------- 5b extended architecture
+def _dashed(shape):
+    ln = shape.line._get_or_add_ln()
+    d = ln.makeelement(qn("a:prstDash"), {"val": "dash"})
+    ln.append(d)
+
+
+s = slide("拡張アーキテクチャ ── 信号認識・地図情報の追加（開発中）",
+          "どちらも「あっても無くても」動く任意入力 ── 無い時は従来と完全に同一の出力")
+# --- new optional inputs (dashed = optional/new) ---
+ntl = nbox(s, 0.3, 1.6, 2.3, 1.25, "信号認識モジュール（外部）",
+           "前方カメラの2D枠 +\n色（赤/黄/青）+ 矢印方向", fc=F_AMBER, fs=10.5, sfs=8.5)
+nsd = nbox(s, 0.3, 3.15, 2.3, 1.45, "SDマップ（無料OSM）",
+           "道路網・交差点・横断歩道\n・法定速度・一時停止\n（将来HDマップに差替可）",
+           fc=F_AMBER, fs=10.5, sfs=8.5)
+nex = nbox(s, 0.3, 4.9, 2.3, 0.9, "従来入力", "8カメラ・車速履歴\nCommand・LiDAR(任意)",
+           fc=F_GRAY, fs=10, sfs=8.5)
+_dashed(ntl); _dashed(nsd)
+# --- adapters ---
+atl = nbox(s, 3.15, 1.6, 2.35, 1.25, "信号状態ベクトル",
+           "自車関連の信号を選択\n状態+距離を数値化", fc=F_PURP, fs=10.5, sfs=8.5)
+asd = nbox(s, 3.15, 3.15, 2.35, 1.45, "地図ラスタ変換 + Stem",
+           "自車周辺±80mを俯瞰画像化\nゼロ初期化CNN（無入力=無影響）",
+           fc=F_PURP, fs=10.5, sfs=8.5)
+_dashed(atl); _dashed(asd)
+# --- existing pipeline (condensed) ---
+core = nbox(s, 6.1, 3.0, 2.5, 1.75, "既存パイプライン",
+            "バックボーン → 深度付き\n俯瞰変換 → 時系列融合\n→ BEVエンコーダ",
+            fc=F_GREEN, fs=11, sfs=9)
+# --- heads ---
+h_e2e = nbox(s, 9.3, 1.7, 3.3, 0.95, "E2E経路計画（強化）",
+             "赤信号で停止・青で発進\n交差点の先の道路を地図で先読み",
+             fc=F_BLUE, fs=10.5, sfs=8.5)
+h_tls = nbox(s, 9.3, 2.9, 3.3, 0.8, "信号状態ヘッド（強化）",
+             "認識モジュールとの融合で高信頼化", fc=F_BLUE, fs=10.5, sfs=8.5)
+h_rest = nbox(s, 9.3, 3.95, 3.3, 0.8, "BEVセグ・3D検出 ほか8タスク",
+              "遠方・遮蔽部分の精度向上", fc=F_BLUE, fs=10.5, sfs=8.5)
+gd2 = nbox(s, 9.3, 5.0, 3.3, 0.8, "自己ガードレール（決定論）",
+           "赤信号通過・逸脱・衝突をチェック", fc=F_PURP, fs=10.5, sfs=8.5)
+# --- wires ---
+link(s, ntl, atl, col=C_AMBER)
+link(s, nsd, asd, col=C_AMBER)
+link(s, atl, h_e2e, col=C_AMBER)
+link(s, asd, core, col=C_AMBER)
+link(s, nex, core, col=C_GRAY)
+link(s, core, h_e2e); link(s, core, h_tls); link(s, core, h_rest)
+link(s, h_rest, gd2, side="v", col=C_TEAL)
+ce2 = s.shapes.add_connector(MSO_CONNECTOR.ELBOW,
+                             atl.left + atl.width, atl.top + atl.height // 2,
+                             h_tls.left, h_tls.top + h_tls.height // 2)
+ce2.line.color.rgb = C_AMBER; ce2.line.width = Pt(1.3)
+try:
+    ce2.begin_connect(atl, 3); ce2.end_connect(h_tls, 1)
+except Exception:
+    pass
+caption(s, "点線＝新規の任意入力（実データ検証済み：信号の色・矢印は既存ラベルで供給可、"
+        "標識・横断歩道は無料OSMから取得済み）", y=6.6, col=C_AMBER, size=11)
+caption(s, "期待効果：交差点の先の道路をカメラ視界外でも予測（地図prior）／"
+        "信号・標識に整合した停止・発進の計画", y=7.0, col=C_GRAY, size=10.5)
+
 # ---------------------------------------------------------------- 6 screen guide (before the video)
 s = slide("デモ画面の見方", "1枚の画面に「見る・測る・理解する・決める」が全部出ます")
 img_w, img_h = 8.6, 4.84
