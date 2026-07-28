@@ -240,29 +240,39 @@ def evaluate_seg2d(model, loader, device, n_cls, max_batches=40):
 
 def bev_rotation_aug(theta_max_deg, Tc, gt, det_boxes, det_n, traj_gt,
                      ego_gt, occ_gt, risk_gt, lg_pts, unk_c, rel_pose,
-                     unk_v2=None, p_apply=0.5):
-    """BEV-space rotation augmentation: rotate the EGO FRAME, not pixels.
+                     unk_v2=None, p_apply=0.5, lat_max=0.0, lat_p=0.0):
+    """BEV-space SE(2) augmentation: rotate/TRANSLATE the EGO FRAME, not
+    pixels.
 
-    T_cam_ego absorbs the rotation, so the projected BEV features are
-    rebuilt exactly by the geometry (no feature interpolation, image-space
-    heads untouched); every BEV-space GT is rotated by the same angle.
-    Physically = the same scene recorded with the rig yawed by theta."""
+    T_cam_ego absorbs the transform; because features are lifted by
+    per-pixel DEPTH before projection, a rigid SE(2) of the rig is exact
+    for ALL structures (not just the ground plane). Rotation = the rig
+    yawed by theta (r31+). NEW (v45): lateral offset dy simulates a
+    LANE-DEPARTED ego; the recorded future, re-expressed in the offset
+    frame and hermite-smoothed from the new origin, becomes a
+    recovery-to-lane target (ChauffeurNet-style)."""
     B = Tc.shape[0]
     dev = Tc.device
     th = (torch.rand(B, device=dev) * 2 - 1) * math.radians(theta_max_deg)
     th = th * (torch.rand(B, device=dev) < p_apply).float()
+    dy = torch.zeros(B, device=dev)
+    if lat_max > 0 and lat_p > 0:
+        mag = 0.3 + (lat_max - 0.3) * torch.rand(B, device=dev)
+        sgn = torch.where(torch.rand(B, device=dev) < 0.5, -1.0, 1.0)
+        dy = mag * sgn * (torch.rand(B, device=dev) < lat_p).float()
     c, s = th.cos(), th.sin()
     # 1. extrinsics: p_old = Rz(th) p_new -> Tc' = Tc @ Rz(th)
     R = torch.zeros(B, 4, 4, device=dev, dtype=Tc.dtype)
     R[:, 0, 0] = c; R[:, 0, 1] = -s
     R[:, 1, 0] = s; R[:, 1, 1] = c
     R[:, 2, 2] = 1; R[:, 3, 3] = 1
+    R[:, 1, 3] = dy.to(Tc.dtype)         # SE(2): virtual lateral offset
     Tc = Tc @ R[:, None]
-    # 2D rotation for points expressed in NEW frame: p_new = R(-th) p_old
+    # SE(2) for points expressed in NEW frame: p_new = R(-th)(p_old - t)
     def rot_pts(xy):                     # [...,2] (x,y)
         shp = [B] + [1] * (xy.dim() - 2)
         cc, ss = c.view(shp), s.view(shp)
-        x, y = xy[..., 0], xy[..., 1]
+        x, y = xy[..., 0], xy[..., 1] - dy.view(shp)
         return torch.stack([cc * x + ss * y, -ss * x + cc * y], -1)
     # 2. label rasters via inverse-rotated sampling grid
     def rot_raster(r, fill, nearest=True):
@@ -272,6 +282,7 @@ def bev_rotation_aug(theta_max_deg, Tc, gt, det_boxes, det_n, traj_gt,
         A = torch.zeros(B, 2, 3, device=dev, dtype=torch.float32)
         A[:, 0, 0] = c; A[:, 0, 1] = -s * (r4.shape[2] / r4.shape[3])
         A[:, 1, 0] = s * (r4.shape[3] / r4.shape[2]); A[:, 1, 1] = c
+        A[:, 0, 2] = -dy / 50.0          # lateral half-extent is 50 m
         g = F.affine_grid(A, list(r4.shape), align_corners=False)
         out = F.grid_sample(r4 + 1.0, g, mode="nearest" if nearest
                             else "bilinear", padding_mode="zeros",
@@ -294,7 +305,26 @@ def bev_rotation_aug(theta_max_deg, Tc, gt, det_boxes, det_n, traj_gt,
             traj_gt = rot_pts(traj_gt)
     if ego_gt is not None:
         ego_gt = ego_gt.clone()
-        ego_gt[:, :12] = rot_pts(ego_gt[:, :12].view(B, 6, 2)).reshape(B, 12)
+        wp = rot_pts(ego_gt[:, :12].view(B, 6, 2))
+        # v45 recovery target: for laterally offset samples, smooth-connect
+        # from the (departed) origin so the target is a kink-free
+        # return-to-lane path, not a teleport
+        for b in range(B):
+            if abs(float(dy[b])) < 1e-6:
+                continue
+            v0b = float(ego_gt[b, 12])
+            k = 4 if v0b > 15.0 else 3
+            P0 = wp.new_zeros(2)
+            T0 = wp.new_tensor([max(v0b * 0.5, 2.0), 0.0])
+            P1 = wp[b, k]
+            T1 = (wp[b, k + 1] - wp[b, k - 1]) if k + 1 < 6 \
+                else (wp[b, k] - wp[b, k - 1])
+            for i in range(k):
+                u = (i + 1) / (k + 1)
+                h00 = 2*u**3 - 3*u**2 + 1; h10 = u**3 - 2*u**2 + u
+                h01 = -2*u**3 + 3*u**2;    h11 = u**3 - u**2
+                wp[b, i] = h00*P0 + h10*T0 + h01*P1 + h11*T1
+        ego_gt[:, :12] = wp.reshape(B, 12)
     if lg_pts is not None:
         lg_pts = rot_pts(lg_pts)
     if unk_c is not None:
@@ -867,7 +897,7 @@ def main():
     ap.add_argument("--workers", type=int, default=6)
     ap.add_argument("--out", default="out/bevlane_ckpt")
     ap.add_argument("--limit-train", type=int, default=None)
-    ap.add_argument("--model", default="v1", choices=["v1", "v2", "v3s", "lss", "v8", "v13", "v13d", "v14d", "v15", "v16", "v17", "v18", "v19", "v20", "v21", "v22", "v23", "v24", "v25", "v26", "v27", "v28", "v29", "v30", "v31", "v32", "v33", "v34", "v35", "v36", "v37", "v38", "v39", "v40", "v41", "v42", "v43", "v44"])
+    ap.add_argument("--model", default="v1", choices=["v1", "v2", "v3s", "lss", "v8", "v13", "v13d", "v14d", "v15", "v16", "v17", "v18", "v19", "v20", "v21", "v22", "v23", "v24", "v25", "v26", "v27", "v28", "v29", "v30", "v31", "v32", "v33", "v34", "v35", "v36", "v37", "v38", "v39", "v40", "v41", "v42", "v43", "v44", "v45"])
     ap.add_argument("--depth-w", type=float, default=0.3)
     ap.add_argument("--seg2d-w", type=float, default=0.5)
     ap.add_argument("--seg2d-key", default="seg2d",
@@ -900,6 +930,12 @@ def main():
                     help="v43 command-consistency hinge weight")
     ap.add_argument("--intent-mode-w", type=float, default=0.0,
                     help="v44 command->mode CE weight (raw logits)")
+    ap.add_argument("--lat-aug", type=float, default=0.0,
+                    help="v45 recovery aug: max lateral ego offset [m]")
+    ap.add_argument("--lat-p", type=float, default=0.25,
+                    help="fraction of samples given a lateral offset")
+    ap.add_argument("--quant-noise", type=float, default=0.0,
+                    help="v45 INT8-robust feature noise (1.0 = 1 LSB)")
     ap.add_argument("--zero-cams", default="",
                     help="comma-separated camera names to hard-zero "
                          "(J6 7-cam fine-tune: CAM_BACK_NARROW)")
@@ -964,31 +1000,31 @@ def main():
         os.makedirs(args.out, exist_ok=True)
 
     train_s, val_s = split_scenes(args.root)
-    use_depth = args.model in ("lss", "v8", "v13", "v13d", "v14d", "v15", "v16", "v17", "v18", "v19", "v20", "v21", "v22", "v23", "v24", "v25", "v26", "v27", "v28", "v29", "v30", "v31", "v32", "v33", "v34", "v35", "v36", "v37", "v38", "v39", "v40", "v41", "v42", "v43", "v44") and args.depth_w > 0
-    use_seg2d = args.model in ("v13", "v13d", "v14d", "v15", "v16", "v17", "v18", "v19", "v20", "v21", "v22", "v23", "v24", "v25", "v26", "v27", "v28", "v29", "v30", "v31", "v32", "v33", "v34", "v35", "v36", "v37", "v38", "v39", "v40", "v41", "v42", "v43", "v44") and args.seg2d_w > 0
+    use_depth = args.model in ("lss", "v8", "v13", "v13d", "v14d", "v15", "v16", "v17", "v18", "v19", "v20", "v21", "v22", "v23", "v24", "v25", "v26", "v27", "v28", "v29", "v30", "v31", "v32", "v33", "v34", "v35", "v36", "v37", "v38", "v39", "v40", "v41", "v42", "v43", "v44", "v45") and args.depth_w > 0
+    use_seg2d = args.model in ("v13", "v13d", "v14d", "v15", "v16", "v17", "v18", "v19", "v20", "v21", "v22", "v23", "v24", "v25", "v26", "v27", "v28", "v29", "v30", "v31", "v32", "v33", "v34", "v35", "v36", "v37", "v38", "v39", "v40", "v41", "v42", "v43", "v44", "v45") and args.seg2d_w > 0
     use_box = args.model == "v15" and args.box_w > 0
-    use_boxdet = args.model in ("v16", "v17", "v18", "v19", "v20", "v21", "v22", "v23", "v24", "v25", "v26", "v27", "v28", "v29", "v30", "v31", "v32", "v33", "v34", "v35", "v36", "v37", "v38", "v39", "v40", "v41", "v42", "v43", "v44") and args.box_w > 0
-    use_bbox2d = args.model in ("v17", "v18", "v19", "v20", "v21", "v22", "v23", "v24", "v25", "v26", "v27", "v28", "v29", "v30", "v31", "v32", "v33", "v34", "v35", "v36", "v37", "v38", "v39", "v40", "v41", "v42", "v43", "v44") and args.bbox2d_w > 0
-    use_ego = args.model in ("v18", "v19", "v20", "v21", "v22", "v23", "v24", "v25", "v26", "v27", "v28", "v29", "v30", "v31", "v32", "v33", "v34", "v35", "v36", "v37", "v38", "v39", "v40", "v41", "v42", "v43", "v44") and args.ego_w > 0
-    use_occ = args.model in ("v20", "v21", "v22", "v23", "v24", "v25", "v26", "v27", "v28", "v29", "v30", "v31", "v32", "v33", "v34", "v35", "v36", "v37", "v38", "v39", "v40", "v41", "v42", "v43", "v44") and args.occ_w > 0
-    use_traj = args.model in ("v21", "v22", "v23", "v24", "v25", "v26", "v27", "v28", "v29", "v30", "v31", "v32", "v33", "v34", "v35", "v36", "v37", "v38", "v39", "v40", "v41", "v42", "v43", "v44") and args.traj_w > 0
-    use_temporal = args.model in ("v22", "v23", "v24", "v25", "v26", "v27", "v28", "v29", "v30", "v31", "v32", "v33", "v34", "v35", "v36", "v37", "v38", "v39", "v40", "v41", "v42", "v43", "v44")
-    use_tl = args.model in ("v27", "v28", "v29", "v30", "v31", "v32", "v33", "v34", "v35", "v36", "v37", "v38", "v39", "v40", "v41", "v42", "v43", "v44") and args.tl_w > 0
-    use_risk = args.model in ("v28", "v29", "v30", "v31", "v32", "v33", "v34", "v35", "v36", "v37", "v38", "v39", "v40", "v41", "v42", "v43", "v44") and args.risk_w > 0
-    use_lg = args.model in ("v29", "v30", "v31", "v32", "v33", "v34", "v35", "v36", "v37", "v38", "v39", "v40", "v41", "v42", "v43", "v44") and args.lanegraph_w > 0
-    use_unk = args.model in ("v30", "v31", "v32", "v33", "v34", "v35", "v36", "v37", "v38", "v39", "v40", "v41", "v42", "v43", "v44") and args.unk_w > 0
-    use_unk_v2 = args.model in ("v41", "v42", "v43", "v44") and args.unk_dense_w > 0
+    use_boxdet = args.model in ("v16", "v17", "v18", "v19", "v20", "v21", "v22", "v23", "v24", "v25", "v26", "v27", "v28", "v29", "v30", "v31", "v32", "v33", "v34", "v35", "v36", "v37", "v38", "v39", "v40", "v41", "v42", "v43", "v44", "v45") and args.box_w > 0
+    use_bbox2d = args.model in ("v17", "v18", "v19", "v20", "v21", "v22", "v23", "v24", "v25", "v26", "v27", "v28", "v29", "v30", "v31", "v32", "v33", "v34", "v35", "v36", "v37", "v38", "v39", "v40", "v41", "v42", "v43", "v44", "v45") and args.bbox2d_w > 0
+    use_ego = args.model in ("v18", "v19", "v20", "v21", "v22", "v23", "v24", "v25", "v26", "v27", "v28", "v29", "v30", "v31", "v32", "v33", "v34", "v35", "v36", "v37", "v38", "v39", "v40", "v41", "v42", "v43", "v44", "v45") and args.ego_w > 0
+    use_occ = args.model in ("v20", "v21", "v22", "v23", "v24", "v25", "v26", "v27", "v28", "v29", "v30", "v31", "v32", "v33", "v34", "v35", "v36", "v37", "v38", "v39", "v40", "v41", "v42", "v43", "v44", "v45") and args.occ_w > 0
+    use_traj = args.model in ("v21", "v22", "v23", "v24", "v25", "v26", "v27", "v28", "v29", "v30", "v31", "v32", "v33", "v34", "v35", "v36", "v37", "v38", "v39", "v40", "v41", "v42", "v43", "v44", "v45") and args.traj_w > 0
+    use_temporal = args.model in ("v22", "v23", "v24", "v25", "v26", "v27", "v28", "v29", "v30", "v31", "v32", "v33", "v34", "v35", "v36", "v37", "v38", "v39", "v40", "v41", "v42", "v43", "v44", "v45")
+    use_tl = args.model in ("v27", "v28", "v29", "v30", "v31", "v32", "v33", "v34", "v35", "v36", "v37", "v38", "v39", "v40", "v41", "v42", "v43", "v44", "v45") and args.tl_w > 0
+    use_risk = args.model in ("v28", "v29", "v30", "v31", "v32", "v33", "v34", "v35", "v36", "v37", "v38", "v39", "v40", "v41", "v42", "v43", "v44", "v45") and args.risk_w > 0
+    use_lg = args.model in ("v29", "v30", "v31", "v32", "v33", "v34", "v35", "v36", "v37", "v38", "v39", "v40", "v41", "v42", "v43", "v44", "v45") and args.lanegraph_w > 0
+    use_unk = args.model in ("v30", "v31", "v32", "v33", "v34", "v35", "v36", "v37", "v38", "v39", "v40", "v41", "v42", "v43", "v44", "v45") and args.unk_w > 0
+    use_unk_v2 = args.model in ("v41", "v42", "v43", "v44", "v45") and args.unk_dense_w > 0
     # v31 reuses the depth4 GT tensor as the (train-time) LiDAR input
-    use_lidar = args.model in ("v31", "v32", "v33", "v34", "v35", "v36", "v37", "v38", "v39", "v40", "v41", "v42", "v43", "v44")
+    use_lidar = args.model in ("v31", "v32", "v33", "v34", "v35", "v36", "v37", "v38", "v39", "v40", "v41", "v42", "v43", "v44", "v45")
     # v32 additionally takes the pillar BEV raster (extract_lidar_bev.py)
-    use_lidarbev = args.model in ("v32", "v33", "v34", "v35", "v36", "v37", "v38", "v39", "v40", "v41", "v42", "v43", "v44")
-    use_flow = args.model in ("v29", "v30", "v31", "v32", "v33", "v34", "v35", "v36", "v37", "v38", "v39", "v40", "v41", "v42", "v43", "v44") and args.flow_w > 0
-    hist_n = 3 if args.model in ("v29", "v30", "v31", "v32", "v33", "v34", "v35", "v36", "v37", "v38", "v39", "v40", "v41", "v42", "v43", "v44") else 0
+    use_lidarbev = args.model in ("v32", "v33", "v34", "v35", "v36", "v37", "v38", "v39", "v40", "v41", "v42", "v43", "v44", "v45")
+    use_flow = args.model in ("v29", "v30", "v31", "v32", "v33", "v34", "v35", "v36", "v37", "v38", "v39", "v40", "v41", "v42", "v43", "v44", "v45") and args.flow_w > 0
+    hist_n = 3 if args.model in ("v29", "v30", "v31", "v32", "v33", "v34", "v35", "v36", "v37", "v38", "v39", "v40", "v41", "v42", "v43", "v44", "v45") else 0
     if args.train_list:                       # restrict train to a scene list
         keep = set(open(args.train_list).read().split())
         train_s = [s for s in train_s if s in keep]
     # v13d depth GT is stride-4 of 768 (108x192); resize any mixed-res depth
-    depth_hw = (108, 192) if args.model in ("v13d", "v14d", "v15", "v16", "v17", "v18", "v19", "v20", "v21", "v22", "v23", "v24", "v25", "v26", "v27", "v28", "v29", "v30", "v31", "v32", "v33", "v34", "v35", "v36", "v37", "v38", "v39", "v40", "v41", "v42", "v43", "v44") else None
+    depth_hw = (108, 192) if args.model in ("v13d", "v14d", "v15", "v16", "v17", "v18", "v19", "v20", "v21", "v22", "v23", "v24", "v25", "v26", "v27", "v28", "v29", "v30", "v31", "v32", "v33", "v34", "v35", "v36", "v37", "v38", "v39", "v40", "v41", "v42", "v43", "v44", "v45") else None
     tr = BevLaneDataset(args.root, train_s, gt_key=args.gt_key,
                         dontcare_sidewalk=args.dontcare_sidewalk,
                         with_depth=use_depth, augment=args.aug,
@@ -1106,8 +1142,12 @@ def main():
                     drop_last=True, **dl_kw)
 
     mkw = {"n_seg": args.n_seg2d} \
-        if args.model in ("v13", "v13d", "v14d", "v15", "v16", "v17", "v18", "v19", "v20", "v21", "v22", "v23", "v24", "v25", "v26", "v27", "v28", "v29", "v30", "v31", "v32", "v33", "v34", "v35", "v36", "v37", "v38", "v39", "v40", "v41", "v42", "v43", "v44") else {}
+        if args.model in ("v13", "v13d", "v14d", "v15", "v16", "v17", "v18", "v19", "v20", "v21", "v22", "v23", "v24", "v25", "v26", "v27", "v28", "v29", "v30", "v31", "v32", "v33", "v34", "v35", "v36", "v37", "v38", "v39", "v40", "v41", "v42", "v43", "v44", "v45") else {}
     model = MODELS[args.model](**mkw).to(device)
+    if args.quant_noise > 0:
+        model.quant_noise = args.quant_noise
+        if rank == 0:
+            print(f"[quant-noise] {args.quant_noise} LSB", flush=True)
     if args.zero_cams:
         from bevlane.dataset import CAMS as _CAMS
         model.zero_cams = tuple(_CAMS.index(c)
@@ -1128,7 +1168,7 @@ def main():
         model = torch.nn.parallel.DistributedDataParallel(
             model, device_ids=[local],
             find_unused_parameters=(args.seg_w == 0 or
-                                    (args.model in ("v13", "v13d", "v14d", "v15", "v16", "v17", "v18", "v19", "v20", "v21", "v22", "v23", "v24", "v25", "v26", "v27", "v28", "v29", "v30", "v31", "v32", "v33", "v34", "v35", "v36", "v37", "v38", "v39", "v40", "v41", "v42", "v43", "v44") and not use_seg2d)))
+                                    (args.model in ("v13", "v13d", "v14d", "v15", "v16", "v17", "v18", "v19", "v20", "v21", "v22", "v23", "v24", "v25", "v26", "v27", "v28", "v29", "v30", "v31", "v32", "v33", "v34", "v35", "v36", "v37", "v38", "v39", "v40", "v41", "v42", "v43", "v44", "v45") and not use_seg2d)))
     opt = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-4)
     total_steps = len(dl) * args.epochs
     sched = torch.optim.lr_scheduler.OneCycleLR(opt, max_lr=lr,
@@ -1201,7 +1241,7 @@ def main():
                  lg_pts_gt, unk_c, rel_pose, unk_v2) = bev_rotation_aug(
                     args.bev_rot_aug, Tc, gt, det_boxes, det_n, traj_gt,
                     ego_gt, occ_gt, risk_gt, lg_pts_gt, unk_c, rel_pose,
-                    unk_v2=unk_v2)
+                    unk_v2=unk_v2, lat_max=args.lat_aug, lat_p=args.lat_p)
             if use_temporal and hist_n > 0:
                 # v29 memory queue: N history BEVs, each in its own no_grad
                 # + autocast region (r12 autocast-cache lesson).
@@ -1236,9 +1276,9 @@ def main():
                 pb = pb.float()
                 theta = make_warp_theta(rel_pose)
             intent_oh = None
-            if args.model in ("v37", "v38", "v39", "v40", "v41", "v42", "v43", "v44") and ego_gt is not None:
+            if args.model in ("v37", "v38", "v39", "v40", "v41", "v42", "v43", "v44", "v45") and ego_gt is not None:
                 lat = ego_gt[:, 11]
-                if args.model in ("v43", "v44"):
+                if args.model in ("v43", "v44", "v45"):
                     # v43: earlier-firing command -- ANY waypoint (1.5-3 s)
                     # crossing +-2.0 m counts, so the command is active on
                     # the approach, not only mid-turn (matches the pseudo-nav
@@ -1271,9 +1311,9 @@ def main():
                                 **({"lidar_bev": lidbev}
                                    if use_lidarbev else {}),
                                 **({"kin": rel_pose}
-                                   if args.model in ("v36", "v37", "v38", "v39", "v40", "v41", "v42", "v43", "v44") else {}),
+                                   if args.model in ("v36", "v37", "v38", "v39", "v40", "v41", "v42", "v43", "v44", "v45") else {}),
                                 **({"intent": intent_oh}
-                                   if args.model in ("v37", "v38", "v39", "v40", "v41", "v42", "v43", "v44") else {}))
+                                   if args.model in ("v37", "v38", "v39", "v40", "v41", "v42", "v43", "v44", "v45") else {}))
                 elif use_ego:
                     out = model(imgs, K, Tc, ego_gt[:, 12])
                 else:
@@ -1313,7 +1353,7 @@ def main():
                 if hm is not None and use_boxdet:
                     loss = loss + args.box_w * net0.boxdet_loss(hm, rg, det_boxes,
                                                                 det_n)
-                if args.model in ("v38", "v39", "v40", "v41", "v42", "v43", "v44") and use_ego and ego_gt is not None:
+                if args.model in ("v38", "v39", "v40", "v41", "v42", "v43", "v44", "v45") and use_ego and ego_gt is not None:
                     loss = loss + 0.3 * net0.vprof_loss(ego_gt)
                 if traj_pred is not None and use_traj:
                     loss = loss + args.traj_w * net0.traj_loss(
@@ -1339,11 +1379,11 @@ def main():
                 if use_unk_v2 and len(out) >= 18:
                     loss = loss + args.unk_dense_w * net0.unk_dense_loss(
                         out[17], unk_v2)
-                if (args.intent_w > 0 and args.model in ("v43", "v44")
+                if (args.intent_w > 0 and args.model in ("v43", "v44", "v45")
                         and intent_oh is not None and ego_pred is not None):
                     loss = loss + args.intent_w * net0.intent_loss(
                         ego_pred, intent_oh)
-                if (args.intent_mode_w > 0 and args.model == "v44"
+                if (args.intent_mode_w > 0 and args.model in ("v44", "v45")
                         and intent_oh is not None and ego_pred is not None):
                     loss = loss + args.intent_mode_w * net0.intent_mode_loss(
                         ego_pred, intent_oh)

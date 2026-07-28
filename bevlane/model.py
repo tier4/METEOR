@@ -3028,6 +3028,34 @@ class DepthSegIPMNetV44(DepthSegIPMNetV43):
         return F.cross_entropy(lg[m], intent[m].argmax(1))
 
 
+class DepthSegIPMNetV45(DepthSegIPMNetV44):
+    """v45 (r43): lateral-departure recovery + INT8 robustness.
+
+    1. Recovery: train-side SE(2) lateral offset of the ego frame
+       (bev_rotation_aug lat_max/lat_p) with hermite-smoothed
+       return-to-lane E2E targets -- exact under the depth-lifted
+       projection, ChauffeurNet-style. No model change needed here.
+    2. INT8-robust features (quant_noise > 0): forward hooks on the
+       image-feature fuse and the temporal BEV fuse inject per-channel
+       uniform noise of one int8 rounding step (ch_absmax/127), making
+       activations tolerant to post-training quantization.
+    Zero new parameters."""
+
+    def __init__(self, *a, **k):
+        super().__init__(*a, **k)
+        self.quant_noise = 0.0
+        self.fuse.register_forward_hook(self._qnoise_hook)
+        self.tfuse3.register_forward_hook(self._qnoise_hook)
+
+    def _qnoise_hook(self, module, inp, out):
+        if not self.training or self.quant_noise <= 0:
+            return None
+        amax = out.detach().abs().amax(dim=(0, 2, 3), keepdim=True)
+        delta = amax / 127.0
+        return out + (torch.rand_like(out) - 0.5) * delta \
+            * (2.0 * self.quant_noise)
+
+
 MODELS = {"v1": IPMSegNet, "v2": IPMSegNetV2, "v3s": IPMSegNetV3,
           "lss": LSSDepthNet, "v8": DepthGatedIPMNet, "v13": DepthSegIPMNet,
           "v13d": DepthSegIPMNetS4, "v14d": DepthSegIPMNetV14,
@@ -3036,4 +3064,4 @@ MODELS = {"v1": IPMSegNet, "v2": IPMSegNetV2, "v3s": IPMSegNetV3,
           "v19": DepthSegIPMNetV19, "v20": DepthSegIPMNetV20,
           "v21": DepthSegIPMNetV21, "v22": DepthSegIPMNetV22,
           "v23": DepthSegIPMNetV23, "v24": DepthSegIPMNetV24,
-          "v25": DepthSegIPMNetV25, "v26": DepthSegIPMNetV26, "v27": DepthSegIPMNetV27, "v28": DepthSegIPMNetV28, "v29": DepthSegIPMNetV29, "v30": DepthSegIPMNetV30, "v31": DepthSegIPMNetV31, "v32": DepthSegIPMNetV32, "v33": DepthSegIPMNetV33, "v34": DepthSegIPMNetV34, "v35": DepthSegIPMNetV35, "v36": DepthSegIPMNetV36, "v37": DepthSegIPMNetV37, "v38": DepthSegIPMNetV38, "v39": DepthSegIPMNetV39, "v40": DepthSegIPMNetV40, "v41": DepthSegIPMNetV41, "v42": DepthSegIPMNetV42, "v43": DepthSegIPMNetV43, "v44": DepthSegIPMNetV44}
+          "v25": DepthSegIPMNetV25, "v26": DepthSegIPMNetV26, "v27": DepthSegIPMNetV27, "v28": DepthSegIPMNetV28, "v29": DepthSegIPMNetV29, "v30": DepthSegIPMNetV30, "v31": DepthSegIPMNetV31, "v32": DepthSegIPMNetV32, "v33": DepthSegIPMNetV33, "v34": DepthSegIPMNetV34, "v35": DepthSegIPMNetV35, "v36": DepthSegIPMNetV36, "v37": DepthSegIPMNetV37, "v38": DepthSegIPMNetV38, "v39": DepthSegIPMNetV39, "v40": DepthSegIPMNetV40, "v41": DepthSegIPMNetV41, "v42": DepthSegIPMNetV42, "v43": DepthSegIPMNetV43, "v44": DepthSegIPMNetV44, "v45": DepthSegIPMNetV45}
