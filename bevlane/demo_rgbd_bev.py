@@ -683,11 +683,7 @@ def main():
                                         interpolation=cv2.INTER_NEAREST)
                         img = cv2.addWeighted(img, 0.62, sc, 0.38, 0)
                     if args.zero_cams and chn in args.zero_cams.split(","):
-                        img = (img * 0.15).astype(np.uint8)
-                        cv2.putText(img, "DISABLED (J6 7-cam)",
-                                    (int(cw * 0.16), ch // 2),
-                                    cv2.FONT_HERSHEY_SIMPLEX, 0.7,
-                                    (0, 80, 255), 2, cv2.LINE_AA)
+                        img = np.zeros((ch, cw, 3), np.uint8)   # blank tile
                     if "NARROW" in chn:
                         label(img, "NARROW", (0, 255, 0))
                     if det_boxes:
@@ -704,11 +700,21 @@ def main():
                     frame[rgb_y0 + r * ch:rgb_y0 + (r + 1) * ch, x:x + cw] = img
                 # depth directly under the same camera cell
                 ci = CAMS.index(chn)
-                d = depth[ci].numpy()
-                dc = cv2.applyColorMap(np.clip(d / 80 * 255, 0, 255).astype(np.uint8),
-                                       cv2.COLORMAP_TURBO)
-                dc = cv2.resize(dc, (cw, ch), interpolation=cv2.INTER_NEAREST)
-                label(dc, chn.split("CAM_")[-1], (255, 255, 255))
+                if args.zero_cams and chn in args.zero_cams.split(","):
+                    if occ_pred is not None:      # OCC takes the free cell
+                        dc = cv2.resize(cube_render(occ_pred, W=900, H=760),
+                                        (cw, ch))
+                        label(dc, "pred OCC voxel +-24m", (220, 220, 220))
+                    else:
+                        dc = np.zeros((ch, cw, 3), np.uint8)
+                else:
+                    d = depth[ci].numpy()
+                    dc = cv2.applyColorMap(
+                        np.clip(d / 80 * 255, 0, 255).astype(np.uint8),
+                        cv2.COLORMAP_TURBO)
+                    dc = cv2.resize(dc, (cw, ch),
+                                    interpolation=cv2.INTER_NEAREST)
+                    label(dc, chn.split("CAM_")[-1], (255, 255, 255))
                 frame[dep_y0 + r * ch:dep_y0 + (r + 1) * ch, x:x + cw] = dc
             cv2.putText(frame, "RGB + predicted 2D Seg overlay" if args.show_seg2d
                         else "RGB input (surround + tele NARROW)", (10, 32),
@@ -960,7 +966,7 @@ def main():
             bx = min(bx0, VW - BW2)                          # flush to right edge
             frame[40:40 + BH2, bx:bx + BW2] = bev
 
-            if occ_pred is not None:
+            if occ_pred is not None and not args.zero_cams:
                 iso = cube_render(occ_pred, W=900, H=760)
                 iso = cv2.resize(iso, (426, 360))
                 oy0 = VH - 368
