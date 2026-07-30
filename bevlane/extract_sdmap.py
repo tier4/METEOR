@@ -43,8 +43,15 @@ def fit_geo2map(ep):
     geo = np.array([e["geocoordinate"][:2] for e in ep], np.float64)
     mxy = np.array([e["translation"][:2] for e in ep], np.float64)
     lat0, lon0 = geo.mean(0)
-    ex = (geo[:, 1] - lon0) * np.cos(np.radians(lat0)) * 111320.0
-    ey = (geo[:, 0] - lat0) * 110540.0
+    # WGS84 meters-per-degree at lat0 (series expansion, <0.01% error);
+    # fixed constants were off by ~0.4% N / ~0.1% E at Japanese latitudes.
+    p = np.radians(lat0)
+    m_lat = (111132.92 - 559.82 * np.cos(2 * p) + 1.175 * np.cos(4 * p)
+             - 0.0023 * np.cos(6 * p))
+    m_lon = (111412.84 * np.cos(p) - 93.5 * np.cos(3 * p)
+             + 0.118 * np.cos(5 * p))
+    ex = (geo[:, 1] - lon0) * m_lon
+    ey = (geo[:, 0] - lat0) * m_lat
     src = np.stack([ex, ey], 1)
     ms, mm = src.mean(0), mxy.mean(0)
     s0, m0 = src - ms, mxy - mm
@@ -52,29 +59,109 @@ def fit_geo2map(ep):
     d = np.sign(np.linalg.det(Vt.T @ U.T))
     D = np.diag([1.0, d])
     R = Vt.T @ D @ U.T
-    scale = np.trace(np.diag(S) @ D) / (s0 ** 2).sum() * len(src)
+    # Both ENU and map are metric: scale is 1 by construction. Fitting it on
+    # quantized GNSS (~90 m grid) inflates src variance and shrinks the map
+    # by 8-23%, so pin it.
+    scale = 1.0
     t = mm - scale * (R @ ms)
     res = (scale * (R @ src.T)).T + t - mxy
-    return (lat0, lon0), scale, R, t, float(np.abs(res).mean())
+    return (lat0, lon0, m_lat, m_lon), scale, R, t, float(np.abs(res).mean())
+
+
+TILE_DEG = 0.02          # ~2 km tiles; recordings cluster, so tiles are shared
+
+
+def _fetch_tile(ti, tj, cache_dir):
+    """Fetch (or load cached) one Overpass tile. Rate-limited across
+    parallel workers by 3 flock slots with >=2 s spacing per slot."""
+    cp = os.path.join(cache_dir, f"tile_{ti}_{tj}.json")
+    if os.path.isfile(cp):
+        try:
+            return json.load(open(cp))
+        except Exception:
+            pass
+    la0, lo0 = ti * TILE_DEG, tj * TILE_DEG
+    q = f"""[out:json][timeout:60];
+(way["highway"]({la0},{lo0},{la0 + TILE_DEG},{lo0 + TILE_DEG});
+ node["highway"~"crossing|traffic_signals"]({la0},{lo0},{la0 + TILE_DEG},{lo0 + TILE_DEG}););
+(._;>;);out body;"""
+    endpoints = [
+        "https://overpass-api.de/api/interpreter",
+        "https://overpass.kumi.systems/api/interpreter",
+    ]
+    import fcntl, time, random
+    slots = list(range(3))
+    random.shuffle(slots)
+    lockf = None
+    for s in slots:
+        f = open(os.path.join(cache_dir, f".fetch{s}.lock"), "a+")
+        try:
+            fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            lockf, slot = f, s
+            break
+        except OSError:
+            f.close()
+    if lockf is None:
+        slot = slots[0]
+        lockf = open(os.path.join(cache_dir, f".fetch{slot}.lock"), "a+")
+        fcntl.flock(lockf, fcntl.LOCK_EX)
+    ts = os.path.join(cache_dir, f".fetch{slot}.ts")
+    last = None
+    try:
+        # another worker may have fetched this tile while we waited
+        if os.path.isfile(cp):
+            try:
+                return json.load(open(cp))
+            except Exception:
+                pass
+        for rnd in range(4):
+            for url in endpoints:
+                try:
+                    try:
+                        dt = time.time() - os.path.getmtime(ts)
+                    except OSError:
+                        dt = 1e9
+                    if dt < 2.0:
+                        time.sleep(2.0 - dt)
+                    req = urllib.request.Request(
+                        url, data=q.encode(),
+                        headers={"User-Agent": "METEOR-sdmap/1.0"})
+                    with urllib.request.urlopen(req, timeout=45) as r:
+                        data = json.loads(r.read())
+                    open(ts, "w").close()
+                    tmp = cp + f".tmp{os.getpid()}"
+                    json.dump(data, open(tmp, "w"))
+                    os.replace(tmp, cp)
+                    return data
+                except Exception as e:
+                    last = e
+                    print(f"[fetch_osm] {url} failed: {e}", flush=True)
+                    open(ts, "w").close()
+            time.sleep(10 * (rnd + 1))
+    finally:
+        fcntl.flock(lockf, fcntl.LOCK_UN)
+    raise last
 
 
 def fetch_osm(lat_min, lat_max, lon_min, lon_max):
-    q = f"""[out:json][timeout:60];
-(way["highway"]({lat_min},{lon_min},{lat_max},{lon_max});
- node["highway"~"crossing|traffic_signals"]({lat_min},{lon_min},{lat_max},{lon_max}););
-(._;>;);out body;"""
-    req = urllib.request.Request(
-        "https://overpass-api.de/api/interpreter",
-        data=q.encode(), headers={"User-Agent": "METEOR-sdmap/1.0"})
-    with urllib.request.urlopen(req, timeout=90) as r:
-        return json.loads(r.read())
+    cache_dir = os.environ.get("METEOR_OSM_CACHE", "out/osm_cache")
+    os.makedirs(cache_dir, exist_ok=True)
+    els = {}
+    for ti in range(int(np.floor(lat_min / TILE_DEG)),
+                    int(np.floor(lat_max / TILE_DEG)) + 1):
+        for tj in range(int(np.floor(lon_min / TILE_DEG)),
+                        int(np.floor(lon_max / TILE_DEG)) + 1):
+            d = _fetch_tile(ti, tj, cache_dir)
+            for e in d.get("elements", []):
+                els[(e["type"], e["id"])] = e
+    return {"elements": list(els.values())}
 
 
 def build_scene_map(raw_dir):
     ep = json.load(open(os.path.join(raw_dir, "annotation/ego_pose.json")))
     ep = [e for e in ep if e.get("geocoordinate")]
     ep.sort(key=lambda e: e["timestamp"])
-    (lat0, lon0), scale, R, t, err = fit_geo2map(ep)
+    (lat0, lon0, m_lat, m_lon), scale, R, t, err = fit_geo2map(ep)
     geo = np.array([e["geocoordinate"][:2] for e in ep])
     pad = 0.004                                  # ~400 m
     osm = fetch_osm(geo[:, 0].min() - pad, geo[:, 0].max() + pad,
@@ -83,8 +170,8 @@ def build_scene_map(raw_dir):
              if el["type"] == "node"}
 
     def to_map(lat, lon):
-        ex = (lon - lon0) * np.cos(np.radians(lat0)) * 111320.0
-        ey = (lat - lat0) * 110540.0
+        ex = (lon - lon0) * m_lon
+        ey = (lat - lat0) * m_lat
         return scale * (R @ np.array([ex, ey])) + t
 
     ways, widths = [], []
@@ -116,7 +203,29 @@ def build_scene_map(raw_dir):
                       if el["type"] == "node"
                       and el.get("tags", {}).get("highway") in
                       ("crossing", "traffic_signals")])
-    return ways, widths, inters, cross, err
+    # sign metadata (map frame) for demo icons / future v47 input channels
+    meta = {"signals": [], "stops": [], "speed_cameras": [], "maxspeed": []}
+    for el in osm["elements"]:
+        if el["type"] != "node":
+            continue
+        hw = el.get("tags", {}).get("highway")
+        if hw == "traffic_signals":
+            meta["signals"].append(to_map(el["lat"], el["lon"]).tolist())
+        elif hw in ("stop", "give_way"):
+            meta["stops"].append(to_map(el["lat"], el["lon"]).tolist())
+        elif hw == "speed_camera":
+            meta["speed_cameras"].append(to_map(el["lat"], el["lon"]).tolist())
+    for el in osm["elements"]:
+        if el["type"] == "way" and "maxspeed" in el.get("tags", {}):
+            try:
+                v = float(el["tags"]["maxspeed"])
+            except ValueError:
+                continue
+            pts = [to_map(*nodes[n]).tolist() for n in el["nodes"]
+                   if n in nodes]
+            if len(pts) >= 2:
+                meta["maxspeed"].append({"kmh": v, "pts": pts})
+    return ways, widths, inters, cross, err, meta
 
 
 def render_frame(ways, widths, inters, cross, pose):
@@ -145,53 +254,262 @@ def render_frame(ways, widths, inters, cross, pose):
     return sd
 
 
-def refine_alignment(ways, widths, eg_pose, root, scene, man):
+def refine_alignment(ways, widths, eg_pose, root, scene, man, cross=None):
     """The exported geocoordinate is rounded to ~6 significant digits
     (lon 3 decimals = ~90 m quantisation!), so the geo fit is only a
-    coarse seed. Refine a single SE(2) map-frame correction per scene by
-    maximising overlap between the OSM road raster and the trusted GT
-    road, on a few sampled frames. (At deployment the vehicle's own
+    coarse seed. Refine an SE(2) map-frame correction per scene against
+    the trusted GT road. Score = fraction of OSM *centerline* pixels
+    inside GT road (sharp optimum even when rendered road width does not
+    match the painted GT width) + 0.5 * road-area IoU (breaks lateral
+    ties toward centered). The correction is time-varying: a global
+    coarse fit, then local re-fits on early/mid/late anchor windows,
+    linearly interpolated over frames — GNSS quantisation error is not
+    constant along a 30 s scene. (At deployment the vehicle's own
     localisation provides the accurate pose; this rounding is a dataset
     export artifact.)"""
-    frames = [f for f in man["frames"][20:130:22] if f.get("gt")]
+    n = len(man["frames"])
+    step = max(1, (n - 15) // 8)
+    frames = [f for f in man["frames"][10:n - 4:step] if f.get("gt")]
     gts = []
+    cwc = {}                   # GT crosswalk centroids per anchor (ego m)
     for f in frames:
         g = cv2.imread(os.path.join(root, scene, f["gt"]), 0)
         if g is None:
             continue
         g = cv2.resize(g, (GW, GH), interpolation=cv2.INTER_NEAREST)
-        gts.append((f["frame"], (g == 1) | (g == 7)))
+        # road area = road + crosswalk + markings (all painted ON the road)
+        gts.append((f["frame"], (g == 1) | (g == 3) | (g == 7)))
+        nlab, _, stats, cent = cv2.connectedComponentsWithStats(
+            (g == 3).astype(np.uint8))   # class 3 = CROSSWALK (7 is MARKING:
+                                         # lane arrows, painted BEFORE the
+                                         # crossing -- matching those pulled
+                                         # the map tens of meters backward)
+        pts = [(80.0 - cent[k][1] * RES, 50.0 - cent[k][0] * RES)
+               for k in range(1, nlab)
+               if stats[k, cv2.CC_STAT_AREA] >= 6]
+        if pts:
+            cwc[f["frame"]] = np.array(pts)
+    zero = np.zeros(len(eg_pose))
     if not gts:
-        return 0.0, 0.0, 0.0, -1.0
+        return zero, zero, zero, -1.0
 
-    def score(dx, dy, dth):
+    # Drop clip-boundary anchors: near the ends of a 30 s clip the GT only
+    # covers where the ego has driven (e.g. a scene ending at a red light
+    # has NO road beyond the stop line). Matching the complete OSM map to
+    # such one-sided GT drags the whole map tens of meters along-track.
+    def _balanced(gm):
+        ahead = int(gm[:GH // 2 - 25].sum())     # x > +10 m
+        behind = int(gm[GH // 2 + 25:].sum())    # x < -10 m
+        return min(ahead, behind) > 2500
+    bal_keys = {fi for fi, gm in gts if _balanced(gm)}
+
+    # Restrict scoring to a corridor around the driven trajectory: on city
+    # grids a parallel avenue rotated onto the GT road keeps the plain score
+    # flat over tens of degrees (verified on a straight avenue scene).
+    traj = eg_pose[::4, :2]
+    gts_full = list(gts)      # unmasked: keeps the gate metric comparable
+    side_gm = {}              # GT road OUTSIDE the corridor = side-street
+    cors = {}
+    for i, (fi, gm) in enumerate(gts):
+        x0, y0, yaw = eg_pose[fi]
+        cs, sn = np.cos(-yaw), np.sin(-yaw)
+        X = cs * (traj[:, 0] - x0) - sn * (traj[:, 1] - y0)
+        Y = sn * (traj[:, 0] - x0) + cs * (traj[:, 1] - y0)
+        px = np.stack([(50.0 - Y) / RES, (80.0 - X) / RES],
+                      1).astype(np.int32)
+        cor = np.zeros((GH, GW), np.uint8)
+        cv2.polylines(cor, [px.reshape(-1, 1, 2)], False, 1, int(16 / RES))
+        # side-street mouths: LiDAR sees intersection openings even on the
+        # not-yet-driven side, so this is the one along-track feature that
+        # exists fore AND aft (GT crosswalks only complete behind the ego)
+        side_gm[fi] = gm & (cor == 0)
+        cors[fi] = cor > 0
+        gts[i] = (fi, gm & (cor > 0))
+
+    gts_all = list(gts)
+    if len(bal_keys) >= 3:
+        gts = [(fi, gm) for fi, gm in gts if fi in bal_keys]
+
+    # analytic rotation seed: the way under the ego must parallel ego yaw
+    diffs = []
+    for fi, _ in gts:
+        x0, y0, yaw = eg_pose[fi]
+        bd, bang = 1e9, None
+        for P in ways:
+            d2 = (P[:, 0] - x0) ** 2 + (P[:, 1] - y0) ** 2
+            j = int(np.argmin(d2))
+            if d2[j] < bd and len(P) > 1:
+                k = min(j, len(P) - 2)
+                seg = P[k + 1] - P[k]
+                bd, bang = d2[j], np.arctan2(seg[1], seg[0])
+        if bang is not None and bd < 30 ** 2:
+            # correction dth must take rendered way angle to ego heading
+            d = (bang - yaw + np.pi / 2) % np.pi - np.pi / 2
+            diffs.append(d)
+    th0 = float(np.median(diffs)) if diffs else 0.0
+    if abs(th0) > np.radians(25):
+        th0 = 0.0
+
+    have_cw = cross is not None and len(cross) and cwc
+
+    def score(sub, dx, dy, dth, cw=None):  # cw = match tol in m (None=off)
         tot = 0.0
-        for fi, gm in gts:
+        for fi, gm in sub:
             x0, y0, yaw = eg_pose[fi]
-            cs, sn = np.cos(yaw), np.sin(yaw)
-            # correction expressed in map frame
             sd = render_frame(ways, widths, np.zeros((0, 2)),
                               np.zeros((0, 2)),
                               (x0 + dx, y0 + dy, yaw + dth))
-            inter = float((sd[0].astype(bool) & gm).sum())
-            union = float((sd[0].astype(bool) | gm).sum())
-            tot += inter / max(union, 1)
-        return tot / len(gts)
+            road, cl = sd[0].astype(bool), sd[1].astype(bool)
+            inside = float((cl & gm).sum()) / max(float(cl.sum()), 1.0)
+            inter = float((road & gm).sum())
+            union = float((road | gm).sum())
+            tot += inside + 0.5 * inter / max(union, 1.0)
+            # intersection openings: OSM side-street area must land on GT
+            # road outside the corridor (visible fore AND aft) -- the only
+            # along-track feature not biased to behind-the-ego
+            side_sd = road & ~cors[fi]
+            n_sd = float(side_sd.sum())
+            if n_sd > 50:
+                tot += 0.6 * float((side_sd & side_gm[fi]).sum()) / n_sd
+            # crosswalk anchor: GT crosswalk blobs vs OSM crossing nodes.
+            # Point features break the parallel-avenue ambiguity of grids.
+            if cw is not None and have_cw and len(cwc.get(fi, ())) >= 2:
+                cs2 = np.cos(-(yaw + dth))
+                sn2 = np.sin(-(yaw + dth))
+                P = cross - [x0 + dx, y0 + dy]
+                ex = cs2 * P[:, 0] - sn2 * P[:, 1]
+                ey = sn2 * P[:, 0] + cs2 * P[:, 1]
+                C = cwc[fi]
+                dd = np.hypot(C[:, 0, None] - ex[None],
+                              C[:, 1, None] - ey[None]).min(1)
+                # support term only: too strong a weight (0.8, 6 m) let
+                # dense-crosswalk grids support a wrongly rotated fit
+                tot += 0.4 * float((dd < cw).mean())
+        return tot / len(sub)
 
-    best = (0.0, 0.0, 0.0, score(0, 0, 0))
-    for dx in range(-48, 49, 6):
-        for dy in range(-48, 49, 6):
-            sc = score(dx, dy, 0.0)
+    def iou(sub, dx, dy, dth):
+        tot = 0.0
+        for fi, gm in sub:
+            x0, y0, yaw = eg_pose[fi]
+            sd = render_frame(ways, widths, np.zeros((0, 2)),
+                              np.zeros((0, 2)),
+                              (x0 + dx, y0 + dy, yaw + dth))
+            road = sd[0].astype(bool)
+            tot += float((road & gm).sum()) / max(float((road | gm).sum()), 1.0)
+        return tot / len(sub)
+
+    # --- global fit ---
+    coarse = gts[::2] or gts   # half the anchors: coarse stage dominates cost
+    best = (0.0, 0.0, th0, score(coarse, 0, 0, th0, cw=10.0))
+    for dx in range(-60, 61, 6):
+        for dy in range(-60, 61, 6):
+            sc = score(coarse, dx, dy, th0, cw=10.0)                 - 0.0004 * float(np.hypot(dx, dy))
             if sc > best[3]:
-                best = (float(dx), float(dy), 0.0, sc)
-    bx, by = best[0], best[1]
-    for dx in np.arange(bx - 5, bx + 5.1, 1.0):
-        for dy in np.arange(by - 5, by + 5.1, 1.0):
-            for dth in np.radians([-3, -1.5, 0, 1.5, 3]):
-                sc = score(dx, dy, dth)
+                best = (float(dx), float(dy), th0, sc)
+    # re-baseline on the full anchor set before comparing across stages
+    # (keep the seeded rotation — resetting it to 0 here re-tilted grids)
+    best = (best[0], best[1], best[2],
+            score(gts, best[0], best[1], best[2]))
+    # rotation and translation couple on city grids: alternate them.
+    # Straight-line scenes constrain the geo-fit rotation poorly under the
+    # ~90 m GNSS quantisation, so the first sweep must be wide (±16 deg).
+    for rng, st in ((16, 4), (4, 2)):
+        for dth in best[2] + np.radians(
+                [v for v in range(-rng, rng + 1, st) if v]):
+            sc = score(gts, best[0], best[1], dth)
+            if sc > best[3]:
+                best = (best[0], best[1], float(dth), sc)
+        for dx in np.arange(best[0] - 18, best[0] + 18.1, 3.0):
+            for dy in np.arange(best[1] - 18, best[1] + 18.1, 3.0):
+                sc = score(gts, dx, dy, best[2], cw=10.0)                     - 0.0004 * float(np.hypot(dx, dy))
+                if sc > best[3]:
+                    best = (float(dx), float(dy), best[2], sc)
+    bx, by, bth = best[0], best[1], best[2]
+
+    # --- along-track stage: the corridor/area terms barely change when the
+    # map slides along a straight road, so the longitudinal offset must be
+    # pinned by the crosswalk point anchors over a wide range ---
+    if have_cw:
+        yaw_mid = float(np.median([eg_pose[fi][2] for fi, _ in gts]))
+        ca, sa = np.cos(yaw_mid), np.sin(yaw_mid)
+        sb = (bx, by, score(gts, bx, by, bth, cw=4.0))
+        for s_ in np.arange(-36, 36.1, 3.0):
+            sc = score(gts, bx + s_ * ca, by + s_ * sa, bth, cw=4.0)
+            if sc > sb[2]:
+                sb = (float(bx + s_ * ca), float(by + s_ * sa), sc)
+        bx, by = sb[0], sb[1]
+
+    best = (bx, by, bth, score(gts, bx, by, bth, cw=4.0))
+    for dx in np.arange(bx - 3, bx + 3.1, 1.0):
+        for dy in np.arange(by - 3, by + 3.1, 1.0):
+            for dth in bth + np.radians([-1.5, -0.75, 0, 0.75, 1.5]):
+                sc = score(gts, dx, dy, dth, cw=4.0)
                 if sc > best[3]:
                     best = (float(dx), float(dy), float(dth), sc)
-    return best
+    bx, by, bth = best[0], best[1], best[2]
+
+    # --- per-anchor drift tracking ---
+    # The quantized GNSS makes the geo-fit correction vary by tens of
+    # meters WITHIN one 30 s scene; a global fit + small window nudges
+    # cannot follow it. Estimate an independent along-track / lateral
+    # offset per anchor from local point/opening features, reject
+    # low-confidence anchors, median-smooth, and interpolate.
+    anchors_f, s_arr, t_arr = [], [], []
+    for fi, gm in gts_all:
+        yaw_i = eg_pose[fi][2]
+        ca, sa = np.cos(yaw_i), np.sin(yaw_i)
+        na, nb = -sa, ca                      # lateral (left) direction
+        sub = [(fi, gm)]
+
+        def lsc(s_, t_):
+            return score(sub, bx + s_ * ca + t_ * na,
+                         by + s_ * sa + t_ * nb, bth, cw=4.0)
+
+        cand = np.arange(-50, 50.1, 2.0)
+        vals = np.array([lsc(s_, 0.0) for s_ in cand])
+        j = int(np.argmax(vals))
+        conf = float(vals[j] - np.median(vals))
+        if conf < 0.15:
+            continue                           # ambiguous anchor: skip
+        s_i = float(cand[j])
+        tc = np.arange(-8, 8.1, 1.0)
+        tv = np.array([lsc(s_i, t_) for t_ in tc])
+        t_i = float(tc[int(np.argmax(tv))])
+        anchors_f.append(float(fi))
+        s_arr.append(s_i)
+        t_arr.append(t_i)
+
+    fi_all = np.arange(len(eg_pose), dtype=np.float64)
+
+    def theil_sen(f, v, max_slope):
+        # robust linear drift model: SLAM-vs-GNSS drift is smooth, so a
+        # line beats interpolating noisy per-anchor picks (which wandered)
+        f = np.asarray(f, np.float64); v = np.asarray(v, np.float64)
+        sl = [(v[j] - v[i]) / (f[j] - f[i])
+              for i in range(len(f)) for j in range(i + 1, len(f))
+              if f[j] - f[i] >= 8]
+        b = float(np.clip(np.median(sl) if sl else 0.0,
+                          -max_slope, max_slope))
+        a = float(np.median(v - b * f))
+        return a, b
+
+    if len(anchors_f) >= 4:
+        a_s, b_s = theil_sen(anchors_f, s_arr, 0.30)
+        a_t, b_t = theil_sen(anchors_f, t_arr, 0.10)
+        s_f = np.clip(a_s + b_s * fi_all, -55, 55)
+        t_f = np.clip(a_t + b_t * fi_all, -12, 12)
+        yawf = eg_pose[:, 2]
+        dxa = bx + s_f * np.cos(yawf) - t_f * np.sin(yawf)
+        dya = by + s_f * np.sin(yawf) + t_f * np.cos(yawf)
+        dtha = np.full(len(eg_pose), bth)
+    else:
+        dxa = np.full(len(eg_pose), bx)
+        dya = np.full(len(eg_pose), by)
+        dtha = np.full(len(eg_pose), bth)
+
+    miou = np.mean([iou([(fi, gm)], dxa[fi], dya[fi], dtha[fi])
+                    for fi, gm in gts_full])
+    return dxa, dya, dtha, float(miou)
 
 
 def main():
@@ -202,7 +520,7 @@ def main():
     ap.add_argument("--viz", default=None, help="write overlay mp4 and exit")
     args = ap.parse_args()
 
-    ways, widths, inters, cross, err = build_scene_map(args.raw)
+    ways, widths, inters, cross, err, meta = build_scene_map(args.raw)
     print(f"OSM: {len(ways)} ways, {len(inters)} intersections, "
           f"{len(cross)} crossings | geo-fit residual {err:.2f} m", flush=True)
 
@@ -211,8 +529,10 @@ def main():
     man0 = json.load(open(os.path.join(args.root, args.scene,
                                        "manifest.json")))
     dx, dy, dth, iou = refine_alignment(ways, widths, pose, args.root,
-                                        args.scene, man0)
-    print(f"[refine] dx={dx:+.1f} dy={dy:+.1f} dth={np.degrees(dth):+.1f}deg "
+                                        args.scene, man0, cross=cross)
+    print(f"[refine] dx={dx.min():+.1f}..{dx.max():+.1f} "
+          f"dy={dy.min():+.1f}..{dy.max():+.1f} "
+          f"dth={np.degrees(dth.min()):+.1f}..{np.degrees(dth.max()):+.1f}deg "
           f"road-IoU={iou:.3f}", flush=True)
     pose = pose.copy()
     pose[:, 0] += dx
@@ -255,8 +575,19 @@ def main():
         print(f"viz -> {args.viz}", flush=True)
         return
 
+    if iou < 0.15:
+        # Alignment gate: a wrong-basin fit would inject a confidently wrong
+        # prior. Leave the scene raster-less — dataset falls back to zeros,
+        # which is bit-equal to "no map" for the v46 stem.
+        print(f"[gate] road-IoU {iou:.3f} < 0.15 — no rasters written",
+              flush=True)
+        return
     od = os.path.join(args.root, args.scene, "sdmap")
     os.makedirs(od, exist_ok=True)
+    # per-scene refinement correction + sign metadata (map frame)
+    meta["refine"] = {"dx": dx.tolist(), "dy": dy.tolist(),
+                      "dth": dth.tolist(), "iou": iou}
+    json.dump(meta, open(os.path.join(od, "meta.json"), "w"))
     man_p = os.path.join(args.root, args.scene, "manifest.json")
     man = json.load(open(man_p))
     for f in man["frames"]:

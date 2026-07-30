@@ -201,6 +201,10 @@ def main():
     ap.add_argument("--workers", type=int, default=4)
     ap.add_argument("--limit-train", type=int, default=0)
     ap.add_argument("--out", default="out/refiner_r34")
+    ap.add_argument("--shuffle-seed", type=int, default=0)
+    ap.add_argument("--exclude-scenes", default=None,
+                    help="file of scene names to drop from refiner training "
+                         "(e.g. US batch without unknown_v3 / odd calib)")
     args = ap.parse_args()
 
     ddp = "RANK" in os.environ
@@ -218,6 +222,12 @@ def main():
         os.makedirs(args.out, exist_ok=True)
 
     train_s, val_s = split_scenes(args.root)
+    if args.exclude_scenes:
+        excl = {l.strip() for l in open(args.exclude_scenes) if l.strip()}
+        n0 = len(train_s)
+        train_s = [s_ for s_ in train_s if s_ not in excl]
+        print(f"[exclude] {n0 - len(train_s)} scenes dropped "
+              f"({args.exclude_scenes})", flush=True)
 
     # frozen backbone (eval, no grad)
     frozen = MODELS[args.model](n_seg=args.n_seg2d).to(device)
@@ -290,7 +300,7 @@ def main():
     step = 0
     for ep in range(args.epochs):
         if ddp:
-            sampler.set_epoch(ep)
+            sampler.set_epoch(ep + args.shuffle_seed)
         for bidx, batch in enumerate(dl):
             if args.limit_train and bidx >= args.limit_train:
                 break
@@ -309,6 +319,10 @@ def main():
                 unk = out[17].float() if args.do_unk else None
                 ctx = frozen.lane_input().float() if args.ctx else None
                 fused = frozen._fused_bev.float() if args.do_e2e else None
+            # snapshot refiner BN stats: one pathological batch poisons them
+            # IN the forward pass, before any loss check can catch it
+            bn_bak = {k: v.detach().clone() for k, v in ref0.named_buffers()
+                      if "running_" in k}
             with torch.autocast("cuda", torch.float16):
                 r = ref(seg=seg if args.do_seg else None, hm=hm, reg=reg,
                         ego=ego, v0=v0, fused=fused, seg_ctx=ctx,
@@ -348,6 +362,13 @@ def main():
             if ddp:
                 dist.all_reduce(fin, op=dist.ReduceOp.MIN)   # 0 if any rank bad
             if fin.item() < 1.0:
+                # restore pre-batch BN stats: the bad forward already
+                # updated them (this, not the grads, was what kept
+                # poisoning checkpoints)
+                with torch.no_grad():
+                    for k, v in ref0.named_buffers():
+                        if "running_" in k:
+                            v.copy_(bn_bak[k])
                 sched.step(); step += 1
                 nskip = getattr(main, "_nskip", 0) + 1
                 main._nskip = nskip
@@ -395,10 +416,20 @@ def main():
             if is_main and step % 1000 == 0:
                 _report(evaluate(frozen, ref0, dv, device, args), ep, step)
                 # periodic save: BN-poisoning incidents cost 20k steps when
-                # only epoch-end saves existed
-                torch.save({"refiner": ref0.state_dict(), "epoch": ep,
-                            "step": step, "args": vars(args)},
-                           os.path.join(args.out, "last.pt"))
+                # only epoch-end saves existed. Never overwrite with a state
+                # that is finite-but-huge (r43 incident: such a save poisoned
+                # every subsequent resume) — keep the previous good save.
+                sd_ = ref0.state_dict()
+                ok_ = all(torch.isfinite(v).all()
+                          and float(v.abs().max()) < 1e6
+                          for v in sd_.values() if v.numel())
+                if ok_:
+                    torch.save({"refiner": sd_, "epoch": ep,
+                                "step": step, "args": vars(args)},
+                               os.path.join(args.out, "last.pt"))
+                else:
+                    print(f"ep{ep} step{step} SAVE SKIPPED "
+                          "(non-finite/huge state)", flush=True)
         if is_main:
             torch.save({"refiner": ref0.state_dict(), "epoch": ep,
                         "args": vars(args)},

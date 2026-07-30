@@ -3099,6 +3099,59 @@ class DepthSegIPMNetV46(DepthSegIPMNetV45):
             self._sdmap = None          # history compute_bev stays map-free
 
 
+class DepthSegIPMNetV47(DepthSegIPMNetV46):
+    """v47 (r45): per-camera BOX-LEVEL traffic-light states as an OPTIONAL
+    input (from an external recognizer; dummy = dataset color_shape ann).
+
+    Input tl [B,N,7,27,48]: per camera a raster painted inside each light
+    element's bbox -- channels [red, yellow, green, is_ped, is_arrow,
+    sin(orient), cos(orient)] (orientation: 0=up, +pi/2=right, clockwise).
+    Injection: bias-free zero-init stem added onto the per-camera image
+    feature, so the depth-lift carries the states into BEV with the
+    camera's own geometry. Bias-free + linear head guarantees an all-zero
+    raster (or tl=None) is BIT-EQUAL to a no-input run -- ON/OFF safe."""
+
+    TL_CH, TL_H, TL_W = 7, 27, 48
+
+    def __init__(self, *a, **k):
+        super().__init__(*a, **k)
+        self.tl_stem = nn.Sequential(
+            nn.Conv2d(self.TL_CH, 48, 3, padding=1, bias=False),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(48, self.ctx.in_channels, 1, bias=False))
+        nn.init.zeros_(self.tl_stem[-1].weight)
+        self._tl = None
+
+    def image_feats(self, imgs):
+        f = super().image_feats(imgs)
+        tl = self._tl
+        if tl is None and self.training and torch.is_grad_enabled():
+            # DDP: the stem must join every grad pass (bias-free, so an
+            # all-zero raster contributes exactly nothing numerically)
+            B, N = imgs.shape[:2]
+            tl = imgs.new_zeros(B, N, self.TL_CH, self.TL_H, self.TL_W)
+        if tl is not None:
+            self._tl = None            # one-shot: history passes stay TL-free
+            B, N = tl.shape[:2]
+            res = self.tl_stem(tl.reshape(B * N, self.TL_CH,
+                                          self.TL_H, self.TL_W).to(f.dtype))
+            f = f + F.interpolate(res, f.shape[-2:], mode="bilinear",
+                                  align_corners=False)
+        return f
+
+    def forward(self, imgs, K, T_cam_ego, v0=None, prev_bev=None,
+                warp_theta=None, lidar=None, lidar_bev=None, kin=None,
+                intent=None, sdmap=None, tl=None):
+        self._tl = tl
+        try:
+            return super().forward(imgs, K, T_cam_ego, v0, prev_bev,
+                                   warp_theta, lidar=lidar,
+                                   lidar_bev=lidar_bev, kin=kin,
+                                   intent=intent, sdmap=sdmap)
+        finally:
+            self._tl = None
+
+
 MODELS = {"v1": IPMSegNet, "v2": IPMSegNetV2, "v3s": IPMSegNetV3,
           "lss": LSSDepthNet, "v8": DepthGatedIPMNet, "v13": DepthSegIPMNet,
           "v13d": DepthSegIPMNetS4, "v14d": DepthSegIPMNetV14,
@@ -3107,4 +3160,4 @@ MODELS = {"v1": IPMSegNet, "v2": IPMSegNetV2, "v3s": IPMSegNetV3,
           "v19": DepthSegIPMNetV19, "v20": DepthSegIPMNetV20,
           "v21": DepthSegIPMNetV21, "v22": DepthSegIPMNetV22,
           "v23": DepthSegIPMNetV23, "v24": DepthSegIPMNetV24,
-          "v25": DepthSegIPMNetV25, "v26": DepthSegIPMNetV26, "v27": DepthSegIPMNetV27, "v28": DepthSegIPMNetV28, "v29": DepthSegIPMNetV29, "v30": DepthSegIPMNetV30, "v31": DepthSegIPMNetV31, "v32": DepthSegIPMNetV32, "v33": DepthSegIPMNetV33, "v34": DepthSegIPMNetV34, "v35": DepthSegIPMNetV35, "v36": DepthSegIPMNetV36, "v37": DepthSegIPMNetV37, "v38": DepthSegIPMNetV38, "v39": DepthSegIPMNetV39, "v40": DepthSegIPMNetV40, "v41": DepthSegIPMNetV41, "v42": DepthSegIPMNetV42, "v43": DepthSegIPMNetV43, "v44": DepthSegIPMNetV44, "v45": DepthSegIPMNetV45, "v46": DepthSegIPMNetV46}
+          "v25": DepthSegIPMNetV25, "v26": DepthSegIPMNetV26, "v27": DepthSegIPMNetV27, "v28": DepthSegIPMNetV28, "v29": DepthSegIPMNetV29, "v30": DepthSegIPMNetV30, "v31": DepthSegIPMNetV31, "v32": DepthSegIPMNetV32, "v33": DepthSegIPMNetV33, "v34": DepthSegIPMNetV34, "v35": DepthSegIPMNetV35, "v36": DepthSegIPMNetV36, "v37": DepthSegIPMNetV37, "v38": DepthSegIPMNetV38, "v39": DepthSegIPMNetV39, "v40": DepthSegIPMNetV40, "v41": DepthSegIPMNetV41, "v42": DepthSegIPMNetV42, "v43": DepthSegIPMNetV43, "v44": DepthSegIPMNetV44, "v45": DepthSegIPMNetV45, "v46": DepthSegIPMNetV46, "v47": DepthSegIPMNetV47}

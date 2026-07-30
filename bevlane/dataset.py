@@ -27,7 +27,7 @@ class BevLaneDataset(Dataset):
                  with_risk=False, with_lanegraph=False, temporal_hist=0,
                  with_unknown=False, with_lidarbev=False,
                  with_unknown_v2=False, unk2_key="unknown_v2",
-                 with_sdmap=False):
+                 with_sdmap=False, with_tlin=False):
         self.root = root
         self.with_lidarbev = with_lidarbev
         self.gt_key = gt_key
@@ -51,6 +51,7 @@ class BevLaneDataset(Dataset):
         self.with_unknown_v2 = with_unknown_v2
         self.unk2_key = unk2_key
         self.with_sdmap = with_sdmap
+        self.with_tlin = with_tlin
         self._unk_cache = {}
         self.temporal_hist = temporal_hist   # v29: N history slots
         self._tl_cache = {}
@@ -342,6 +343,30 @@ class BevLaneDataset(Dataset):
                 except Exception:
                     pass
             out.append(torch.from_numpy(sd))
+        if self.with_tlin:
+            # per-camera BOX-LEVEL traffic-light raster [8,7,27,48]:
+            # [red,yel,grn,is_ped,is_arrow,sin,cos] painted in each bbox.
+            # zeros = recognizer off (bit-equal to no-input in v47).
+            tlr = np.zeros((8, 7, 27, 48), np.float32)
+            p_ = f.get("tl")
+            if p_:
+                try:
+                    bx = np.load(os.path.join(self.root, s, p_))["boxes"]
+                    for b in bx:
+                        ci = int(b[0])
+                        if not 0 <= ci < 8:
+                            continue
+                        x1 = int(np.clip(b[1] * 48, 0, 47))
+                        x2 = int(np.clip(b[3] * 48, 0, 47)) + 1
+                        y1 = int(np.clip(b[2] * 27, 0, 26))
+                        y2 = int(np.clip(b[4] * 27, 0, 26)) + 1
+                        for ch in range(7):
+                            v = float(b[5 + ch])
+                            if v != 0.0:
+                                tlr[ci, ch, y1:y2, x1:x2] = v
+                except Exception:
+                    pass
+            out.append(torch.from_numpy(tlr))
         if self.with_temporal and self.temporal_hist > 0:
             # v29 memory queue: N history frames at fi-2, fi-6, fi-14
             HN = self.temporal_hist
