@@ -22,7 +22,8 @@ torch.multiprocessing.set_sharing_strategy("file_system")
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from bevlane.dataset import BevLaneDataset  # noqa: E402
-from bevlane.model import MODELS, N_CLASSES, make_warp_theta  # noqa: E402
+from bevlane.model import (MODELS, N_CLASSES, EGO_K,  # noqa: E402
+                           make_warp_theta)
 
 CLASS_NAMES = ["unlabeled", "road", "sidewalk", "crosswalk", "laneline",
                "stopline", "road_edge", "marking", "parking"]
@@ -972,6 +973,15 @@ def main():
                     help="v45 INT8-robust feature noise (1.0 = 1 LSB)")
     ap.add_argument("--use-sdmap", action="store_true",
                     help="v46: feed the OSM SD-map raster (optional input)")
+    ap.add_argument("--rl-w", type=float, default=0.0,
+                    help="r48: weight of the GRPO-style reward "
+                         "loss on the E2E mode logits (0 = off)")
+    ap.add_argument("--rl-ent", type=float, default=0.01,
+                    help="entropy bonus in the RL mode loss")
+    ap.add_argument("--rl-imit-w", type=float, default=0.5,
+                    help="imitation-error term inside the reward")
+    ap.add_argument("--rl-tl-w", type=float, default=1.0,
+                    help="red-light compliance term in the reward")
     ap.add_argument("--pseudo-lidar-w", type=float, default=0.0,
                     help="v48: weight of the pseudo-LiDAR "
                          "distillation loss (0 = head off)")
@@ -1069,6 +1079,7 @@ def main():
     use_sdmap = args.model in ("v46", "v47", "v48") and args.use_sdmap
     use_tlin = args.model in ("v47", "v48") and args.use_tl
     use_pl = args.model == "v48" and args.pseudo_lidar_w > 0
+    use_rl = args.rl_w > 0 and use_ego
     # v31 reuses the depth4 GT tensor as the (train-time) LiDAR input
     use_lidar = args.model in ("v31", "v32", "v33", "v34", "v35", "v36", "v37", "v38", "v39", "v40", "v41", "v42", "v43", "v44", "v45", "v46", "v47", "v48")
     # v32 additionally takes the pillar BEV raster (extract_lidar_bev.py)
@@ -1201,6 +1212,9 @@ def main():
     mkw = {"n_seg": args.n_seg2d} \
         if args.model in ("v13", "v13d", "v14d", "v15", "v16", "v17", "v18", "v19", "v20", "v21", "v22", "v23", "v24", "v25", "v26", "v27", "v28", "v29", "v30", "v31", "v32", "v33", "v34", "v35", "v36", "v37", "v38", "v39", "v40", "v41", "v42", "v43", "v44", "v45", "v46", "v47", "v48") else {}
     model = MODELS[args.model](**mkw).to(device)
+    if use_rl and is_main:
+        print(f"[rl] GRPO mode loss w={args.rl_w} ent={args.rl_ent} "
+              f"imit={args.rl_imit_w} tl={args.rl_tl_w}", flush=True)
     if use_pl:
         model.pl_feed = True
         model.pl_feed_p = args.pl_feed_p
@@ -1242,6 +1256,7 @@ def main():
                                                 total_steps=total_steps)
     scaler = torch.cuda.amp.GradScaler()
     pl_acc = [0.0, 0.0, 0.0, 0.0]   # occ inter/union, z abs-err, n
+    rl_acc = [0.0, 0.0, 0.0, 0.0]   # rew sel/best, pick acc, n
     cw = CLASS_W.clone()
     ignore = 0
     if args.train_bg:
@@ -1468,6 +1483,31 @@ def main():
                 if use_unk_v2 and len(out) >= 18:
                     loss = loss + args.unk_dense_w * net0.unk_dense_loss(
                         out[17], unk_v2)
+                if use_rl and ego_pred is not None:
+                    from bevlane.e2e_reward import (candidate_rewards,
+                                                    grpo_mode_loss)
+                    _K = EGO_K
+                    _e = ego_pred.float()
+                    _wp = _e[:, :12 * _K].view(-1, _K, 6, 2)
+                    _lg = _e[:, 12 * _K:12 * _K + _K]
+                    if intent_oh is not None:      # undo the command boost
+                        _lg = _lg - getattr(net0, 'MODE_BOOST', 0.0) \
+                            * intent_oh.to(_lg.dtype)
+                    _rew, _parts = candidate_rewards(
+                        _wp.detach(), gt=gt, boxes=det_boxes, nbox=det_n,
+                        traj=traj_gt, tvalid=tvalid_gt,
+                        tl=(tl_t if use_tlin else None),
+                        v0=ego_gt[:, 12], ego_gt=ego_gt,
+                        w={"imit": args.rl_imit_w, "tl": args.rl_tl_w})
+                    _rl, _st = grpo_mode_loss(_lg, _rew,
+                                              valid=ego_gt[:, 16] > 0.5,
+                                              ent_w=args.rl_ent)
+                    loss = loss + args.rl_w * _rl
+                    if _st["n"] > 0:
+                        rl_acc[0] += _st["rew_sel"] * _st["n"]
+                        rl_acc[1] += _st["rew_best"] * _st["n"]
+                        rl_acc[2] += _st["pick_acc"] * _st["n"]
+                        rl_acc[3] += _st["n"]
                 if use_pl and len(out) >= 19:
                     loss = loss + args.pseudo_lidar_w * \
                         net0.pseudo_lidar_loss(out[18], pl_gt)
@@ -1550,6 +1590,11 @@ def main():
                                       use_lidar=True)
                         msg += (f" | +lidar mIoU="
                                 f"{float(np.nanmean(list(il.values()))):.3f}")
+                    if use_rl and rl_acc[3] > 0:
+                        msg += (f" | RL sel={rl_acc[0] / rl_acc[3]:+.3f}"
+                                f" best={rl_acc[1] / rl_acc[3]:+.3f}"
+                                f" pick={rl_acc[2] / rl_acc[3]:.2f}")
+                        rl_acc[:] = [0.0, 0.0, 0.0, 0.0]
                     if use_pl and pl_acc[1] > 0:
                         msg += (f" | PL occIoU={pl_acc[0] / pl_acc[1]:.3f}"
                                 f" zMAE={pl_acc[2] / max(pl_acc[3], 1):.2f}m")
