@@ -3044,8 +3044,10 @@ class DepthSegIPMNetV45(DepthSegIPMNetV44):
     def __init__(self, *a, **k):
         super().__init__(*a, **k)
         self.quant_noise = 0.0
+        self.bev_dropblock = 0.0       # r46: MAE-like BEV block masking
         self.fuse.register_forward_hook(self._qnoise_hook)
         self.tfuse3.register_forward_hook(self._qnoise_hook)
+        self.tfuse3.register_forward_hook(self._dropblock_hook)
 
     def _qnoise_hook(self, module, inp, out):
         if not self.training or self.quant_noise <= 0:
@@ -3054,6 +3056,75 @@ class DepthSegIPMNetV45(DepthSegIPMNetV44):
         delta = amax / 127.0
         return out + (torch.rand_like(out) - 0.5) * delta \
             * (2.0 * self.quant_noise)
+
+    def _dropblock_hook(self, module, inp, out):
+        """MAE-like masking on the temporal-fused BEV feature: zero a few
+        16-40 m rectangles per sample so every head must inpaint them from
+        surrounding context + temporal memory (GT stays complete). Train
+        only; probability per sample = self.bev_dropblock."""
+        if not self.training or self.bev_dropblock <= 0:
+            return None
+        B, _, H, W = out.shape
+        m = torch.ones(B, 1, H, W, device=out.device, dtype=out.dtype)
+        hit = False
+        for b in range(B):
+            if torch.rand(()) >= self.bev_dropblock:
+                continue
+            hit = True
+            for _ in range(int(torch.randint(2, 5, ()))):
+                bh = int(torch.randint(H // 10, H // 4 + 1, ()))
+                bw = int(torch.randint(W // 10, W // 4 + 1, ()))
+                r0 = int(torch.randint(0, H - bh + 1, ()))
+                c0 = int(torch.randint(0, W - bw + 1, ()))
+                m[b, :, r0:r0 + bh, c0:c0 + bw] = 0
+        return out * m if hit else None
+
+    @staticmethod
+    def stat_loss(stat, boxes, nbox, traj, tvalid):
+        """r46 stationary supervision v2: paint the label over the WHOLE
+        rotated box footprint on the det grid (v26 used only the centre
+        cell -> ~20x sparser signal), keep the 0.35-0.8 m creep dead-band,
+        and balance the classes per batch (parked cars dominate)."""
+        B = boxes.shape[0]
+        dev = stat.device
+        lbl = torch.full((B, DET_H, DET_W), -1.0, device=dev)
+        for b in range(B):
+            for k in range(int(nbox[b])):
+                if boxes[b, k, 3] <= 0 or tvalid[b, k, 5] < 0.5:
+                    continue
+                d3 = float(traj[b, k, 5].norm())
+                if 0.35 < d3 < 0.8:          # ambiguous creep band
+                    continue
+                xe, ye = float(boxes[b, k, 1]), float(boxes[b, k, 2])
+                l_ = float(boxes[b, k, 3]); w_ = float(boxes[b, k, 4])
+                yaw = float(boxes[b, k, 5]) if boxes.shape[2] > 5 else 0.0
+                rc = (80.0 - xe) / DET_RES
+                cc = (50.0 - ye) / DET_RES
+                half = max(l_, w_) / (2 * DET_RES) + 1
+                r0, r1 = int(max(0, rc - half)), int(min(DET_H, rc + half + 1))
+                c0, c1 = int(max(0, cc - half)), int(min(DET_W, cc + half + 1))
+                if r0 >= r1 or c0 >= c1:
+                    continue
+                rr = torch.arange(r0, r1, device=dev, dtype=torch.float32)
+                cx = torch.arange(c0, c1, device=dev, dtype=torch.float32)
+                X = 80.0 - (rr[:, None] + 0.5) * DET_RES - xe
+                Y = 50.0 - (cx[None, :] + 0.5) * DET_RES - ye
+                ca, sa = math.cos(yaw), math.sin(yaw)
+                u = X * ca + Y * sa
+                v = -X * sa + Y * ca
+                inside = (u.abs() <= l_ / 2) & (v.abs() <= w_ / 2)
+                lbl[b, r0:r1, c0:c1][inside] = float(d3 <= 0.35)
+        m = lbl >= 0
+        if not m.any():
+            return stat.sum() * 0.0
+        logits = stat[:, 0].float().clamp(-15, 15)[m]
+        target = lbl[m]
+        n_pos = float(target.sum()); n_neg = float(len(target)) - n_pos
+        # inverse-frequency weight, clamped: parked (pos) usually dominates
+        w_pos = min(max(n_neg / max(n_pos, 1.0), 0.5), 4.0)
+        w = torch.where(target > 0.5, torch.full_like(target, w_pos),
+                        torch.ones_like(target))
+        return F.binary_cross_entropy_with_logits(logits, target, weight=w)
 
 
 class DepthSegIPMNetV46(DepthSegIPMNetV45):
@@ -3152,6 +3223,113 @@ class DepthSegIPMNetV47(DepthSegIPMNetV46):
             self._tl = None
 
 
+class DepthSegIPMNetV48(DepthSegIPMNetV47):
+    """v48 (r47): PSEUDO-LiDAR -- predict the LiDAR BEV raster from cameras
+    and feed it back through the SAME optional-LiDAR stem.
+
+    The head reads the CAMERA-ONLY BEV (before any LiDAR/SD-map residual),
+    so it cannot cheat by copying an injected real sweep, and predicts the
+    4-channel raster extract_lidar_bev.py produces: log-count, max z,
+    mean z, occupancy (no intensity -- cameras cannot infer reflectance).
+    Supervision is the real raster where a sweep exists; the prediction is
+    DETACHED before it is fed back, so the head is shaped only by that
+    distillation loss and never by "whatever helps the other heads".
+
+    Feeding reuses v32's zero-init `lidar_stem`, per sample:
+        real sweep  > pseudo raster > nothing (zero residual)
+    Training drops real LiDAR (--lidar-drop) and feeds the pseudo raster on
+    a fraction of the rest (--pl-feed-p), so ONE checkpoint serves all three
+    modes and `pl_feed=False` stays bit-equal to the camera-only network:
+    inference-time ON/OFF, no re-training."""
+
+    def __init__(self, *a, **k):
+        super().__init__(*a, **k)
+        self.pl_head = nn.Sequential(
+            nn.Conv2d(96, 96, 3, stride=2, padding=1, bias=False),
+            nn.BatchNorm2d(96), nn.ReLU(inplace=True),
+            ConvBlock(96, 96),
+            nn.Conv2d(96, 4, 1))
+        self.pl_feed = False       # inference switch (or pl_feed= per call)
+        self.pl_feed_p = 1.0       # train: fraction of eligible samples fed
+        self._pl_want = False
+        self._pl_raw = None
+
+    @staticmethod
+    def pl_activate(raw, hard=False):
+        """logits -> a raster in the real one's units/sparsity.
+        hard=True gates by occupancy>0.5 so the fed raster looks like a
+        real sweep (empty cells exactly 0), which is what lidar_stem saw."""
+        occ = torch.sigmoid(raw[:, 3:4].float())
+        cnt = F.softplus(raw[:, 0:1].float())
+        zmax = -1.0 + 5.0 * torch.sigmoid(raw[:, 1:2].float())
+        zmean = -1.0 + 5.0 * torch.sigmoid(raw[:, 2:3].float())
+        g = (occ > 0.5).to(occ.dtype) if hard else occ
+        return torch.cat([cnt * g, zmax * g, zmean * g,
+                          g if hard else occ], 1)
+
+    def bev_extra(self, bev):
+        if self._pl_want:
+            self._pl_want = False           # current frame only
+            raw = self.pl_head(bev)         # camera-only BEV -> raster
+            self._pl_raw = raw
+            if self.pl_feed:
+                pl = self.pl_activate(raw, hard=True).detach().to(bev.dtype)
+                if self.training and self.pl_feed_p < 1.0:
+                    keep = (torch.rand(pl.shape[0], 1, 1, 1,
+                                       device=pl.device)
+                            < self.pl_feed_p).to(pl.dtype)
+                    pl = pl * keep
+                if self._lidar_bev is None:
+                    self._lidar_bev = pl
+                else:                        # real sweep wins per sample
+                    real = self._lidar_bev.to(pl.dtype)
+                    has = (real.abs().sum((1, 2, 3), keepdim=True) > 0
+                           ).to(pl.dtype)
+                    self._lidar_bev = real * has + pl * (1 - has)
+        return super().bev_extra(bev)
+
+    def pseudo_lidar_loss(self, raw, lb):
+        """BCE on occupancy + L1 on log-count/heights inside GT-occupied
+        cells. Frames without a sweep contribute 0 but stay in the graph."""
+        if raw is None:
+            return None
+        if lb is None:
+            return raw.float().sum() * 0.0
+        lb = lb.to(raw.device).float()
+        if lb.shape[-2:] != raw.shape[-2:]:
+            lb = F.interpolate(lb, raw.shape[-2:], mode="nearest")
+        valid = (lb.abs().sum((1, 2, 3), keepdim=True) > 0).float()
+        occ_gt = (lb[:, 3:4] > 0.5).float()
+        bce = F.binary_cross_entropy_with_logits(
+            raw[:, 3:4].float().clamp(-15, 15), occ_gt, reduction="none")
+        bce = (bce * valid).sum() / valid.expand_as(bce).sum().clamp(min=1)
+        act = self.pl_activate(raw, hard=False)
+        m = occ_gt * valid
+        den = m.sum().clamp(min=1)
+        l1 = ((act[:, 0:1] - lb[:, 0:1]).abs() * m).sum() / den
+        l1 = l1 + 0.5 * ((act[:, 1:2] - lb[:, 1:2]).abs() * m).sum() / den
+        l1 = l1 + 0.5 * ((act[:, 2:3] - lb[:, 2:3]).abs() * m).sum() / den
+        return bce + 0.2 * l1
+
+    def forward(self, imgs, K, T_cam_ego, v0=None, prev_bev=None,
+                warp_theta=None, lidar=None, lidar_bev=None, kin=None,
+                intent=None, sdmap=None, tl=None, pl_feed=None):
+        self._pl_want = True
+        self._pl_raw = None
+        prev = self.pl_feed
+        if pl_feed is not None:
+            self.pl_feed = bool(pl_feed)
+        try:
+            out = super().forward(imgs, K, T_cam_ego, v0, prev_bev,
+                                  warp_theta, lidar=lidar,
+                                  lidar_bev=lidar_bev, kin=kin,
+                                  intent=intent, sdmap=sdmap, tl=tl)
+        finally:
+            self._pl_want = False
+            self.pl_feed = prev
+        return tuple(out) + (self._pl_raw,)      # out[18] = pseudo-LiDAR
+
+
 MODELS = {"v1": IPMSegNet, "v2": IPMSegNetV2, "v3s": IPMSegNetV3,
           "lss": LSSDepthNet, "v8": DepthGatedIPMNet, "v13": DepthSegIPMNet,
           "v13d": DepthSegIPMNetS4, "v14d": DepthSegIPMNetV14,
@@ -3160,4 +3338,5 @@ MODELS = {"v1": IPMSegNet, "v2": IPMSegNetV2, "v3s": IPMSegNetV3,
           "v19": DepthSegIPMNetV19, "v20": DepthSegIPMNetV20,
           "v21": DepthSegIPMNetV21, "v22": DepthSegIPMNetV22,
           "v23": DepthSegIPMNetV23, "v24": DepthSegIPMNetV24,
-          "v25": DepthSegIPMNetV25, "v26": DepthSegIPMNetV26, "v27": DepthSegIPMNetV27, "v28": DepthSegIPMNetV28, "v29": DepthSegIPMNetV29, "v30": DepthSegIPMNetV30, "v31": DepthSegIPMNetV31, "v32": DepthSegIPMNetV32, "v33": DepthSegIPMNetV33, "v34": DepthSegIPMNetV34, "v35": DepthSegIPMNetV35, "v36": DepthSegIPMNetV36, "v37": DepthSegIPMNetV37, "v38": DepthSegIPMNetV38, "v39": DepthSegIPMNetV39, "v40": DepthSegIPMNetV40, "v41": DepthSegIPMNetV41, "v42": DepthSegIPMNetV42, "v43": DepthSegIPMNetV43, "v44": DepthSegIPMNetV44, "v45": DepthSegIPMNetV45, "v46": DepthSegIPMNetV46, "v47": DepthSegIPMNetV47}
+          "v25": DepthSegIPMNetV25, "v26": DepthSegIPMNetV26, "v27": DepthSegIPMNetV27, "v28": DepthSegIPMNetV28, "v29": DepthSegIPMNetV29, "v30": DepthSegIPMNetV30, "v31": DepthSegIPMNetV31, "v32": DepthSegIPMNetV32, "v33": DepthSegIPMNetV33, "v34": DepthSegIPMNetV34, "v35": DepthSegIPMNetV35, "v36": DepthSegIPMNetV36, "v37": DepthSegIPMNetV37, "v38": DepthSegIPMNetV38, "v39": DepthSegIPMNetV39, "v40": DepthSegIPMNetV40, "v41": DepthSegIPMNetV41, "v42": DepthSegIPMNetV42, "v43": DepthSegIPMNetV43, "v44": DepthSegIPMNetV44, "v45": DepthSegIPMNetV45, "v46": DepthSegIPMNetV46, "v47": DepthSegIPMNetV47,
+          "v48": DepthSegIPMNetV48}

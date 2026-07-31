@@ -798,6 +798,7 @@ def evaluate_det3d(model, loader, device, bx_idx, max_batches=30,
     fn50 = [0, 0]
     tpn = [0, 0]
     fnn = [0, 0]
+    s_tp = s_fp = s_tn = s_fn = 0        # stationary-flag confusion
     for bi, batch in enumerate(loader):
         if bi >= max_batches:
             break
@@ -810,6 +811,35 @@ def evaluate_det3d(model, loader, device, bx_idx, max_batches=30,
                 else model(imgs, K, Tc)
         dets = model.decode_boxes(out[3].float(), out[4].float(),
                                   thresh=thresh, topk=64)
+        # stationary-flag accuracy at GT vehicle centres (r46 metric):
+        # GT static = 3 s displacement <=0.35 m; 0.35-0.8 m dead-band
+        if len(out) >= 11 and len(batch) > bx_idx + 3:
+            traj_g = batch[bx_idx + 2]
+            tval_g = batch[bx_idx + 3]
+            stat_p = out[10][:, 0].float().sigmoid().cpu()
+            from bevlane.model import DET_RES as _DR
+            for b in range(bx.shape[0]):
+                for k in range(int(nb[b])):
+                    if bx[b, k, 3] <= 0 or tval_g[b, k, 5] < 0.5                             or bx[b, k, 0] >= 1.5:
+                        continue
+                    d3 = float(traj_g[b, k, 5].norm())
+                    if 0.35 < d3 < 0.8:
+                        continue
+                    ri = int((80.0 - float(bx[b, k, 1])) / _DR)
+                    ci = int((50.0 - float(bx[b, k, 2])) / _DR)
+                    if not (0 <= ri < stat_p.shape[-2]
+                            and 0 <= ci < stat_p.shape[-1]):
+                        continue
+                    pred_s = float(stat_p[b, ri, ci]) > 0.5
+                    gt_s = d3 <= 0.35
+                    if pred_s and gt_s:
+                        s_tp += 1
+                    elif pred_s and not gt_s:
+                        s_fp += 1
+                    elif not pred_s and gt_s:
+                        s_fn += 1
+                    else:
+                        s_tn += 1
         for b in range(bx.shape[0]):
             gt = [(0 if bx[b, k, 0] < 1.5 else 1,
                    float(bx[b, k, 1]), float(bx[b, k, 2]),
@@ -856,6 +886,10 @@ def evaluate_det3d(model, loader, device, bx_idx, max_batches=30,
         r[nm + "_flip"] = yflip[c] / max(tp[c], 1)
         r[nm + "50"] = tp50[c] / max(tp50[c] + fn50[c], 1)
         r[nm + "n"] = tpn[c] / max(tpn[c] + fnn[c], 1)
+    tot = s_tp + s_fp + s_tn + s_fn
+    r["stat"] = (s_tp / max(s_tp + s_fp, 1), s_tp / max(s_tp + s_fn, 1),
+                 (s_tp + s_tn) / max(tot, 1),
+                 (s_tn) / max(s_tn + s_fp, 1), tot)
     return r
 
 
@@ -897,7 +931,7 @@ def main():
     ap.add_argument("--workers", type=int, default=6)
     ap.add_argument("--out", default="out/bevlane_ckpt")
     ap.add_argument("--limit-train", type=int, default=None)
-    ap.add_argument("--model", default="v1", choices=["v1", "v2", "v3s", "lss", "v8", "v13", "v13d", "v14d", "v15", "v16", "v17", "v18", "v19", "v20", "v21", "v22", "v23", "v24", "v25", "v26", "v27", "v28", "v29", "v30", "v31", "v32", "v33", "v34", "v35", "v36", "v37", "v38", "v39", "v40", "v41", "v42", "v43", "v44", "v45", "v46", "v47"])
+    ap.add_argument("--model", default="v1", choices=["v1", "v2", "v3s", "lss", "v8", "v13", "v13d", "v14d", "v15", "v16", "v17", "v18", "v19", "v20", "v21", "v22", "v23", "v24", "v25", "v26", "v27", "v28", "v29", "v30", "v31", "v32", "v33", "v34", "v35", "v36", "v37", "v38", "v39", "v40", "v41", "v42", "v43", "v44", "v45", "v46", "v47", "v48"])
     ap.add_argument("--depth-w", type=float, default=0.3)
     ap.add_argument("--seg2d-w", type=float, default=0.5)
     ap.add_argument("--seg2d-key", default="seg2d",
@@ -938,6 +972,16 @@ def main():
                     help="v45 INT8-robust feature noise (1.0 = 1 LSB)")
     ap.add_argument("--use-sdmap", action="store_true",
                     help="v46: feed the OSM SD-map raster (optional input)")
+    ap.add_argument("--pseudo-lidar-w", type=float, default=0.0,
+                    help="v48: weight of the pseudo-LiDAR "
+                         "distillation loss (0 = head off)")
+    ap.add_argument("--pl-feed-p", type=float, default=0.5,
+                    help="v48: fraction of LiDAR-less samples "
+                         "that get the predicted raster fed back")
+    ap.add_argument("--stat-w", type=float, default=None,
+                    help="stationary-flag loss weight (default: traj-w)")
+    ap.add_argument("--bev-dropblock", type=float, default=0.0,
+                    help="MAE-like BEV block-mask prob per sample")
     ap.add_argument("--use-tl", action="store_true",
                     help="v47: per-camera box-level traffic-light input")
     ap.add_argument("--tl-drop", type=float, default=0.5,
@@ -1008,33 +1052,34 @@ def main():
         os.makedirs(args.out, exist_ok=True)
 
     train_s, val_s = split_scenes(args.root)
-    use_depth = args.model in ("lss", "v8", "v13", "v13d", "v14d", "v15", "v16", "v17", "v18", "v19", "v20", "v21", "v22", "v23", "v24", "v25", "v26", "v27", "v28", "v29", "v30", "v31", "v32", "v33", "v34", "v35", "v36", "v37", "v38", "v39", "v40", "v41", "v42", "v43", "v44", "v45", "v46", "v47") and args.depth_w > 0
-    use_seg2d = args.model in ("v13", "v13d", "v14d", "v15", "v16", "v17", "v18", "v19", "v20", "v21", "v22", "v23", "v24", "v25", "v26", "v27", "v28", "v29", "v30", "v31", "v32", "v33", "v34", "v35", "v36", "v37", "v38", "v39", "v40", "v41", "v42", "v43", "v44", "v45", "v46", "v47") and args.seg2d_w > 0
+    use_depth = args.model in ("lss", "v8", "v13", "v13d", "v14d", "v15", "v16", "v17", "v18", "v19", "v20", "v21", "v22", "v23", "v24", "v25", "v26", "v27", "v28", "v29", "v30", "v31", "v32", "v33", "v34", "v35", "v36", "v37", "v38", "v39", "v40", "v41", "v42", "v43", "v44", "v45", "v46", "v47", "v48") and args.depth_w > 0
+    use_seg2d = args.model in ("v13", "v13d", "v14d", "v15", "v16", "v17", "v18", "v19", "v20", "v21", "v22", "v23", "v24", "v25", "v26", "v27", "v28", "v29", "v30", "v31", "v32", "v33", "v34", "v35", "v36", "v37", "v38", "v39", "v40", "v41", "v42", "v43", "v44", "v45", "v46", "v47", "v48") and args.seg2d_w > 0
     use_box = args.model == "v15" and args.box_w > 0
-    use_boxdet = args.model in ("v16", "v17", "v18", "v19", "v20", "v21", "v22", "v23", "v24", "v25", "v26", "v27", "v28", "v29", "v30", "v31", "v32", "v33", "v34", "v35", "v36", "v37", "v38", "v39", "v40", "v41", "v42", "v43", "v44", "v45", "v46", "v47") and args.box_w > 0
-    use_bbox2d = args.model in ("v17", "v18", "v19", "v20", "v21", "v22", "v23", "v24", "v25", "v26", "v27", "v28", "v29", "v30", "v31", "v32", "v33", "v34", "v35", "v36", "v37", "v38", "v39", "v40", "v41", "v42", "v43", "v44", "v45", "v46", "v47") and args.bbox2d_w > 0
-    use_ego = args.model in ("v18", "v19", "v20", "v21", "v22", "v23", "v24", "v25", "v26", "v27", "v28", "v29", "v30", "v31", "v32", "v33", "v34", "v35", "v36", "v37", "v38", "v39", "v40", "v41", "v42", "v43", "v44", "v45", "v46", "v47") and args.ego_w > 0
-    use_occ = args.model in ("v20", "v21", "v22", "v23", "v24", "v25", "v26", "v27", "v28", "v29", "v30", "v31", "v32", "v33", "v34", "v35", "v36", "v37", "v38", "v39", "v40", "v41", "v42", "v43", "v44", "v45", "v46", "v47") and args.occ_w > 0
-    use_traj = args.model in ("v21", "v22", "v23", "v24", "v25", "v26", "v27", "v28", "v29", "v30", "v31", "v32", "v33", "v34", "v35", "v36", "v37", "v38", "v39", "v40", "v41", "v42", "v43", "v44", "v45", "v46", "v47") and args.traj_w > 0
-    use_temporal = args.model in ("v22", "v23", "v24", "v25", "v26", "v27", "v28", "v29", "v30", "v31", "v32", "v33", "v34", "v35", "v36", "v37", "v38", "v39", "v40", "v41", "v42", "v43", "v44", "v45", "v46", "v47")
-    use_tl = args.model in ("v27", "v28", "v29", "v30", "v31", "v32", "v33", "v34", "v35", "v36", "v37", "v38", "v39", "v40", "v41", "v42", "v43", "v44", "v45", "v46", "v47") and args.tl_w > 0
-    use_risk = args.model in ("v28", "v29", "v30", "v31", "v32", "v33", "v34", "v35", "v36", "v37", "v38", "v39", "v40", "v41", "v42", "v43", "v44", "v45", "v46", "v47") and args.risk_w > 0
-    use_lg = args.model in ("v29", "v30", "v31", "v32", "v33", "v34", "v35", "v36", "v37", "v38", "v39", "v40", "v41", "v42", "v43", "v44", "v45", "v46", "v47") and args.lanegraph_w > 0
-    use_unk = args.model in ("v30", "v31", "v32", "v33", "v34", "v35", "v36", "v37", "v38", "v39", "v40", "v41", "v42", "v43", "v44", "v45", "v46", "v47") and args.unk_w > 0
-    use_unk_v2 = args.model in ("v41", "v42", "v43", "v44", "v45", "v46", "v47") and args.unk_dense_w > 0
-    use_sdmap = args.model in ("v46", "v47") and args.use_sdmap
-    use_tlin = args.model == "v47" and args.use_tl
+    use_boxdet = args.model in ("v16", "v17", "v18", "v19", "v20", "v21", "v22", "v23", "v24", "v25", "v26", "v27", "v28", "v29", "v30", "v31", "v32", "v33", "v34", "v35", "v36", "v37", "v38", "v39", "v40", "v41", "v42", "v43", "v44", "v45", "v46", "v47", "v48") and args.box_w > 0
+    use_bbox2d = args.model in ("v17", "v18", "v19", "v20", "v21", "v22", "v23", "v24", "v25", "v26", "v27", "v28", "v29", "v30", "v31", "v32", "v33", "v34", "v35", "v36", "v37", "v38", "v39", "v40", "v41", "v42", "v43", "v44", "v45", "v46", "v47", "v48") and args.bbox2d_w > 0
+    use_ego = args.model in ("v18", "v19", "v20", "v21", "v22", "v23", "v24", "v25", "v26", "v27", "v28", "v29", "v30", "v31", "v32", "v33", "v34", "v35", "v36", "v37", "v38", "v39", "v40", "v41", "v42", "v43", "v44", "v45", "v46", "v47", "v48") and args.ego_w > 0
+    use_occ = args.model in ("v20", "v21", "v22", "v23", "v24", "v25", "v26", "v27", "v28", "v29", "v30", "v31", "v32", "v33", "v34", "v35", "v36", "v37", "v38", "v39", "v40", "v41", "v42", "v43", "v44", "v45", "v46", "v47", "v48") and args.occ_w > 0
+    use_traj = args.model in ("v21", "v22", "v23", "v24", "v25", "v26", "v27", "v28", "v29", "v30", "v31", "v32", "v33", "v34", "v35", "v36", "v37", "v38", "v39", "v40", "v41", "v42", "v43", "v44", "v45", "v46", "v47", "v48") and args.traj_w > 0
+    use_temporal = args.model in ("v22", "v23", "v24", "v25", "v26", "v27", "v28", "v29", "v30", "v31", "v32", "v33", "v34", "v35", "v36", "v37", "v38", "v39", "v40", "v41", "v42", "v43", "v44", "v45", "v46", "v47", "v48")
+    use_tl = args.model in ("v27", "v28", "v29", "v30", "v31", "v32", "v33", "v34", "v35", "v36", "v37", "v38", "v39", "v40", "v41", "v42", "v43", "v44", "v45", "v46", "v47", "v48") and args.tl_w > 0
+    use_risk = args.model in ("v28", "v29", "v30", "v31", "v32", "v33", "v34", "v35", "v36", "v37", "v38", "v39", "v40", "v41", "v42", "v43", "v44", "v45", "v46", "v47", "v48") and args.risk_w > 0
+    use_lg = args.model in ("v29", "v30", "v31", "v32", "v33", "v34", "v35", "v36", "v37", "v38", "v39", "v40", "v41", "v42", "v43", "v44", "v45", "v46", "v47", "v48") and args.lanegraph_w > 0
+    use_unk = args.model in ("v30", "v31", "v32", "v33", "v34", "v35", "v36", "v37", "v38", "v39", "v40", "v41", "v42", "v43", "v44", "v45", "v46", "v47", "v48") and args.unk_w > 0
+    use_unk_v2 = args.model in ("v41", "v42", "v43", "v44", "v45", "v46", "v47", "v48") and args.unk_dense_w > 0
+    use_sdmap = args.model in ("v46", "v47", "v48") and args.use_sdmap
+    use_tlin = args.model in ("v47", "v48") and args.use_tl
+    use_pl = args.model == "v48" and args.pseudo_lidar_w > 0
     # v31 reuses the depth4 GT tensor as the (train-time) LiDAR input
-    use_lidar = args.model in ("v31", "v32", "v33", "v34", "v35", "v36", "v37", "v38", "v39", "v40", "v41", "v42", "v43", "v44", "v45", "v46", "v47")
+    use_lidar = args.model in ("v31", "v32", "v33", "v34", "v35", "v36", "v37", "v38", "v39", "v40", "v41", "v42", "v43", "v44", "v45", "v46", "v47", "v48")
     # v32 additionally takes the pillar BEV raster (extract_lidar_bev.py)
-    use_lidarbev = args.model in ("v32", "v33", "v34", "v35", "v36", "v37", "v38", "v39", "v40", "v41", "v42", "v43", "v44", "v45", "v46", "v47")
-    use_flow = args.model in ("v29", "v30", "v31", "v32", "v33", "v34", "v35", "v36", "v37", "v38", "v39", "v40", "v41", "v42", "v43", "v44", "v45", "v46", "v47") and args.flow_w > 0
-    hist_n = 3 if args.model in ("v29", "v30", "v31", "v32", "v33", "v34", "v35", "v36", "v37", "v38", "v39", "v40", "v41", "v42", "v43", "v44", "v45", "v46", "v47") else 0
+    use_lidarbev = args.model in ("v32", "v33", "v34", "v35", "v36", "v37", "v38", "v39", "v40", "v41", "v42", "v43", "v44", "v45", "v46", "v47", "v48")
+    use_flow = args.model in ("v29", "v30", "v31", "v32", "v33", "v34", "v35", "v36", "v37", "v38", "v39", "v40", "v41", "v42", "v43", "v44", "v45", "v46", "v47", "v48") and args.flow_w > 0
+    hist_n = 3 if args.model in ("v29", "v30", "v31", "v32", "v33", "v34", "v35", "v36", "v37", "v38", "v39", "v40", "v41", "v42", "v43", "v44", "v45", "v46", "v47", "v48") else 0
     if args.train_list:                       # restrict train to a scene list
         keep = set(open(args.train_list).read().split())
         train_s = [s for s in train_s if s in keep]
     # v13d depth GT is stride-4 of 768 (108x192); resize any mixed-res depth
-    depth_hw = (108, 192) if args.model in ("v13d", "v14d", "v15", "v16", "v17", "v18", "v19", "v20", "v21", "v22", "v23", "v24", "v25", "v26", "v27", "v28", "v29", "v30", "v31", "v32", "v33", "v34", "v35", "v36", "v37", "v38", "v39", "v40", "v41", "v42", "v43", "v44", "v45", "v46", "v47") else None
+    depth_hw = (108, 192) if args.model in ("v13d", "v14d", "v15", "v16", "v17", "v18", "v19", "v20", "v21", "v22", "v23", "v24", "v25", "v26", "v27", "v28", "v29", "v30", "v31", "v32", "v33", "v34", "v35", "v36", "v37", "v38", "v39", "v40", "v41", "v42", "v43", "v44", "v45", "v46", "v47", "v48") else None
     tr = BevLaneDataset(args.root, train_s, gt_key=args.gt_key,
                         dontcare_sidewalk=args.dontcare_sidewalk,
                         with_depth=use_depth, augment=args.aug,
@@ -1154,8 +1199,18 @@ def main():
                     drop_last=True, **dl_kw)
 
     mkw = {"n_seg": args.n_seg2d} \
-        if args.model in ("v13", "v13d", "v14d", "v15", "v16", "v17", "v18", "v19", "v20", "v21", "v22", "v23", "v24", "v25", "v26", "v27", "v28", "v29", "v30", "v31", "v32", "v33", "v34", "v35", "v36", "v37", "v38", "v39", "v40", "v41", "v42", "v43", "v44", "v45", "v46", "v47") else {}
+        if args.model in ("v13", "v13d", "v14d", "v15", "v16", "v17", "v18", "v19", "v20", "v21", "v22", "v23", "v24", "v25", "v26", "v27", "v28", "v29", "v30", "v31", "v32", "v33", "v34", "v35", "v36", "v37", "v38", "v39", "v40", "v41", "v42", "v43", "v44", "v45", "v46", "v47", "v48") else {}
     model = MODELS[args.model](**mkw).to(device)
+    if use_pl:
+        model.pl_feed = True
+        model.pl_feed_p = args.pl_feed_p
+        if is_main:
+            print(f"[pseudo-lidar] w={args.pseudo_lidar_w} "
+                  f"feed_p={args.pl_feed_p}", flush=True)
+    if args.bev_dropblock > 0:
+        model.bev_dropblock = args.bev_dropblock
+        if is_main:
+            print(f"[bev-dropblock] p={args.bev_dropblock}", flush=True)
     if args.quant_noise > 0:
         model.quant_noise = args.quant_noise
         if rank == 0:
@@ -1180,12 +1235,13 @@ def main():
         model = torch.nn.parallel.DistributedDataParallel(
             model, device_ids=[local],
             find_unused_parameters=(args.seg_w == 0 or
-                                    (args.model in ("v13", "v13d", "v14d", "v15", "v16", "v17", "v18", "v19", "v20", "v21", "v22", "v23", "v24", "v25", "v26", "v27", "v28", "v29", "v30", "v31", "v32", "v33", "v34", "v35", "v36", "v37", "v38", "v39", "v40", "v41", "v42", "v43", "v44", "v45", "v46", "v47") and not use_seg2d)))
+                                    (args.model in ("v13", "v13d", "v14d", "v15", "v16", "v17", "v18", "v19", "v20", "v21", "v22", "v23", "v24", "v25", "v26", "v27", "v28", "v29", "v30", "v31", "v32", "v33", "v34", "v35", "v36", "v37", "v38", "v39", "v40", "v41", "v42", "v43", "v44", "v45", "v46", "v47", "v48") and not use_seg2d)))
     opt = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-4)
     total_steps = len(dl) * args.epochs
     sched = torch.optim.lr_scheduler.OneCycleLR(opt, max_lr=lr,
                                                 total_steps=total_steps)
     scaler = torch.cuda.amp.GradScaler()
+    pl_acc = [0.0, 0.0, 0.0, 0.0]   # occ inter/union, z abs-err, n
     cw = CLASS_W.clone()
     ignore = 0
     if args.train_bg:
@@ -1292,9 +1348,9 @@ def main():
                 pb = pb.float()
                 theta = make_warp_theta(rel_pose)
             intent_oh = None
-            if args.model in ("v37", "v38", "v39", "v40", "v41", "v42", "v43", "v44", "v45", "v46", "v47") and ego_gt is not None:
+            if args.model in ("v37", "v38", "v39", "v40", "v41", "v42", "v43", "v44", "v45", "v46", "v47", "v48") and ego_gt is not None:
                 lat = ego_gt[:, 11]
-                if args.model in ("v43", "v44", "v45", "v46", "v47"):
+                if args.model in ("v43", "v44", "v45", "v46", "v47", "v48"):
                     # v43: earlier-firing command -- ANY waypoint (1.5-3 s)
                     # crossing +-2.0 m counts, so the command is active on
                     # the approach, not only mid-turn (matches the pseudo-nav
@@ -1310,6 +1366,7 @@ def main():
                 intent_oh = F.one_hot(idx.long(), 3).float()
                 intent_oh = intent_oh * (torch.rand(
                     imgs.shape[0], 1, device=device) >= 0.3).float()
+            pl_gt = lidbev            # before modality dropout
             lid = None
             if use_lidar and depth_gt is not None:
                 # modality dropout: whole-sample, so BN sees both modes
@@ -1341,9 +1398,9 @@ def main():
                                 **({"sdmap": sd_in} if use_sdmap else {}),
                                 **({"tl": tl_in} if use_tlin else {}),
                                 **({"kin": rel_pose}
-                                   if args.model in ("v36", "v37", "v38", "v39", "v40", "v41", "v42", "v43", "v44", "v45", "v46", "v47") else {}),
+                                   if args.model in ("v36", "v37", "v38", "v39", "v40", "v41", "v42", "v43", "v44", "v45", "v46", "v47", "v48") else {}),
                                 **({"intent": intent_oh}
-                                   if args.model in ("v37", "v38", "v39", "v40", "v41", "v42", "v43", "v44", "v45", "v46", "v47") else {}))
+                                   if args.model in ("v37", "v38", "v39", "v40", "v41", "v42", "v43", "v44", "v45", "v46", "v47", "v48") else {}))
                 elif use_ego:
                     out = model(imgs, K, Tc, ego_gt[:, 12])
                 else:
@@ -1383,13 +1440,15 @@ def main():
                 if hm is not None and use_boxdet:
                     loss = loss + args.box_w * net0.boxdet_loss(hm, rg, det_boxes,
                                                                 det_n)
-                if args.model in ("v38", "v39", "v40", "v41", "v42", "v43", "v44", "v45", "v46", "v47") and use_ego and ego_gt is not None:
+                if args.model in ("v38", "v39", "v40", "v41", "v42", "v43", "v44", "v45", "v46", "v47", "v48") and use_ego and ego_gt is not None:
                     loss = loss + 0.3 * net0.vprof_loss(ego_gt)
                 if traj_pred is not None and use_traj:
                     loss = loss + args.traj_w * net0.traj_loss(
                         traj_pred, det_boxes, det_n, traj_gt, tvalid_gt)
                     if len(out) >= 11:      # v26 stationary-flag head
-                        loss = loss + args.traj_w * net0.stat_loss(
+                        sw = (args.stat_w if args.stat_w is not None
+                              else args.traj_w)
+                        loss = loss + sw * net0.stat_loss(
                             out[10], det_boxes, det_n, traj_gt, tvalid_gt)
                 if use_tl and len(out) >= 12:   # v27 traffic-light state
                     loss = loss + args.tl_w * net0.tl_loss(out[11], tl_gt)
@@ -1409,11 +1468,28 @@ def main():
                 if use_unk_v2 and len(out) >= 18:
                     loss = loss + args.unk_dense_w * net0.unk_dense_loss(
                         out[17], unk_v2)
-                if (args.intent_w > 0 and args.model in ("v43", "v44", "v45", "v46", "v47")
+                if use_pl and len(out) >= 19:
+                    loss = loss + args.pseudo_lidar_w * \
+                        net0.pseudo_lidar_loss(out[18], pl_gt)
+                    if pl_gt is not None and step % 20 == 0:
+                        with torch.no_grad():
+                            g = pl_gt.to(device).float()
+                            v = (g.abs().sum((1, 2, 3)) > 0)
+                            if v.any():
+                                og = (g[v, 3] > 0.5)
+                                op = (out[18][v, 3].float() > 0)
+                                pl_acc[0] += float((op & og).sum())
+                                pl_acc[1] += float((op | og).sum())
+                                pa = net0.pl_activate(out[18][v].float())
+                                pl_acc[2] += float(
+                                    ((pa[:, 1] - g[v, 1]).abs()
+                                     * og.float()).sum())
+                                pl_acc[3] += float(og.sum())
+                if (args.intent_w > 0 and args.model in ("v43", "v44", "v45", "v46", "v47", "v48")
                         and intent_oh is not None and ego_pred is not None):
                     loss = loss + args.intent_w * net0.intent_loss(
                         ego_pred, intent_oh)
-                if (args.intent_mode_w > 0 and args.model in ("v44", "v45", "v46", "v47")
+                if (args.intent_mode_w > 0 and args.model in ("v44", "v45", "v46", "v47", "v48")
                         and intent_oh is not None and ego_pred is not None):
                     loss = loss + args.intent_mode_w * net0.intent_mode_loss(
                         ego_pred, intent_oh)
@@ -1474,6 +1550,10 @@ def main():
                                       use_lidar=True)
                         msg += (f" | +lidar mIoU="
                                 f"{float(np.nanmean(list(il.values()))):.3f}")
+                    if use_pl and pl_acc[1] > 0:
+                        msg += (f" | PL occIoU={pl_acc[0] / pl_acc[1]:.3f}"
+                                f" zMAE={pl_acc[2] / max(pl_acc[3], 1):.2f}m")
+                        pl_acc[:] = [0.0, 0.0, 0.0, 0.0]
                     if use_boxdet:
                         dq = evaluate_det3d(netq, dv, device,
                                             4 + int(use_seg2d), max_batches=8,
@@ -1569,6 +1649,11 @@ def main():
                       f"vru P={d3['vru'][0]:.2f} R={d3['vru'][1]:.2f} "
                       f"R50={d3['vru50']:.2f} Rn={d3['vrun']:.2f} "
                       f"err={d3['vru'][2]:.2f}m", flush=True)
+                if "stat" in d3 and d3["stat"][4] > 0:
+                    sp, sr, sa, sspec, sn = d3["stat"]
+                    print(f"[valStat ep{ep}] P={sp:.2f} R={sr:.2f} "
+                          f"acc={sa:.2f} movAcc={sspec:.2f} n={sn}",
+                          flush=True)
             if use_traj:
                 tj = evaluate_traj(net, dv, device, 4 + int(use_seg2d),
                                    tmp_idx=vtmp)
