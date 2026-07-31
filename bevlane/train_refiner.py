@@ -64,8 +64,11 @@ def _unpack(batch, device, a):
     unk_gt = None
     if a.do_unk:                          # dense unknown mask (+1)
         unk_gt = g(bi); bi += 1
+    lb_gt = None
+    if a.do_pl:            # LiDAR raster: dataset appends it AFTER unk_v2
+        lb_gt = g(bi); bi += 1
     return (imgs, K, Tc, gt, det_boxes, det_n, traj_gt, tvalid, ego_gt,
-            risk_gt, unk_gt)
+            risk_gt, unk_gt, lb_gt)
 
 
 @torch.no_grad()
@@ -76,11 +79,13 @@ def evaluate(frozen, ref0, loader, device, args, max_b=40):
     ade_r = ade_f = nseen = 0.0
     hm_r = hm_f = 0.0
     utp_r = ufp_r = ufn_r = utp_f = ufp_f = ufn_f = 0
+    s_cm = [[0, 0, 0], [0, 0, 0]]      # raw/refined tp,fp,fn
+    pl_cm = [[0.0, 0.0], [0.0, 0.0]]   # raw/refined inter,union
     for bi, batch in enumerate(loader):
         if bi >= max_b:
             break
         (imgs, K, Tc, gt, det_boxes, det_n, traj_gt, tvalid,
-         ego_gt, risk_gt, unk_gt) = _unpack(batch, device, args)
+         ego_gt, risk_gt, unk_gt, lb_gt) = _unpack(batch, device, args)
         v0 = ego_gt[:, 12] if args.do_e2e else None
         with torch.autocast("cuda", torch.float16):
             out = frozen(imgs, K, Tc, v0)
@@ -94,7 +99,41 @@ def evaluate(frozen, ref0, loader, device, args, max_b=40):
                      v0=v0, fused=fused, seg_ctx=ctx,
                      traj=out[9].float() if args.do_traj else None,
                      risk=out[12].float() if args.do_risk else None,
-                     unk=out[17].float() if args.do_unk else None)
+                     unk=out[17].float() if args.do_unk else None,
+                     stat=(out[10].float()
+                           if args.do_stat and len(out) > 10 else None),
+                     pl=(out[18].float()
+                         if args.do_pl and len(out) > 18 else None))
+        if args.do_stat and "stat" in r:
+            for tag, lg in (("r", out[10]), ("f", r["stat"])):
+                p = lg.float()[:, 0].sigmoid()
+                for b in range(det_boxes.shape[0]):
+                    for k in range(int(det_n[b])):
+                        if det_boxes[b, k, 3] <= 0 or tvalid[b, k, 5] < 0.5 \
+                                or det_boxes[b, k, 0] >= 1.5:
+                            continue
+                        d3 = float(traj_gt[b, k, 5].norm())
+                        if 0.35 < d3 < 0.8:
+                            continue
+                        ri = int((80.0 - float(det_boxes[b, k, 1])) / 0.4)
+                        ci = int((50.0 - float(det_boxes[b, k, 2])) / 0.4)
+                        if not (0 <= ri < p.shape[-2] and 0 <= ci < p.shape[-1]):
+                            continue
+                        ps = float(p[b, ri, ci]) > 0.5
+                        gs = d3 <= 0.35
+                        j = 0 if tag == "r" else 1
+                        s_cm[j][0] += int(ps and gs)
+                        s_cm[j][1] += int(ps and not gs)
+                        s_cm[j][2] += int((not ps) and gs)
+        if args.do_pl and "pl" in r and lb_gt is not None:
+            g4 = lb_gt.float()
+            v = g4.abs().sum((1, 2, 3)) > 0
+            if v.any():
+                og = g4[v, 3] > 0.5
+                for j, lg in enumerate((out[18], r["pl"])):
+                    op = lg.float()[v, 3] > 0
+                    pl_cm[j][0] += float((op & og).sum())
+                    pl_cm[j][1] += float((op | og).sum())
         if args.do_unk:
             pos = unk_gt > 0.5
             neg = (unk_gt > -0.5) & ~pos       # visible free cells only
@@ -141,6 +180,11 @@ def evaluate(frozen, ref0, loader, device, args, max_b=40):
                        utp_r / max(utp_r + ufn_r, 1)),
                       (utp_f / max(utp_f + ufp_f, 1),
                        utp_f / max(utp_f + ufn_f, 1)))
+    if args.do_stat and sum(s_cm[0]) > 0:
+        res["stat"] = tuple((c[0] / max(c[0] + c[1], 1),
+                             c[0] / max(c[0] + c[2], 1)) for c in s_cm)
+    if args.do_pl and pl_cm[0][1] > 0:
+        res["pl"] = tuple(c[0] / max(c[1], 1) for c in pl_cm)
     ref0.train()
     return res
 
@@ -161,6 +205,13 @@ def _report(res, ep, step, tag=""):
     if "ade" in res:
         print(f"[refE2E ep{ep} step{step}] {tag} ADE raw->refined "
               f"{res['ade'][0]:.3f}->{res['ade'][1]:.3f}", flush=True)
+    if "stat" in res:
+        (pr, rr_), (pf, rf) = res["stat"]
+        print(f"[refStat ep{ep} step{step}] {tag} stationary P/R raw "
+              f"{pr:.3f}/{rr_:.3f} -> refined {pf:.3f}/{rf:.3f}", flush=True)
+    if "pl" in res:
+        print(f"[refPL ep{ep} step{step}] {tag} pseudo-LiDAR occIoU raw "
+              f"{res['pl'][0]:.3f} -> refined {res['pl'][1]:.3f}", flush=True)
     if "unk" in res:
         (pr, rr_), (pf, rf) = res["unk"]
         print(f"[refUnk ep{ep} step{step}] {tag} pix P/R raw "
@@ -194,6 +245,12 @@ def main():
                     help="refine the dense unknown logit (out[17], v41+)")
     ap.add_argument("--unk-w", type=float, default=2.0)
     ap.add_argument("--unk-key", default="unknown_v3")
+    ap.add_argument("--do-stat", action="store_true",
+                    help="refine the stationary flag (out[10])")
+    ap.add_argument("--stat-w", type=float, default=1.0)
+    ap.add_argument("--do-pl", action="store_true",
+                    help="refine the pseudo-LiDAR raster (v48 out[18])")
+    ap.add_argument("--pl-w", type=float, default=1.0)
     ap.add_argument("--box-w", type=float, default=1.0)
     ap.add_argument("--e2e-w", type=float, default=1.0)
     ap.add_argument("--traj-w", type=float, default=0.5)
@@ -241,6 +298,7 @@ def main():
     ref = MultiTaskRefiner(do_seg=args.do_seg, do_box=args.do_box,
                            do_e2e=args.do_e2e, do_traj=args.do_traj,
                            do_risk=args.do_risk, do_unk=args.do_unk,
+                           do_stat=args.do_stat, do_pl=args.do_pl,
                            n_cls=N_CLASSES,
                            seg_width=args.width, seg_ctx=args.ctx,
                            ego_dim=EGO_DIM).to(device)
@@ -250,7 +308,8 @@ def main():
               flush=True)
         print(f"[refiner] heads: seg={args.do_seg} box={args.do_box} "
               f"e2e={args.do_e2e} traj={args.do_traj} risk={args.do_risk} "
-              f"unk={args.do_unk}({args.unk_key}) | "
+              f"unk={args.do_unk}({args.unk_key}) "
+              f"stat={args.do_stat} pl={args.do_pl} | "
               f"params={n_par:.2f}M (zero-init residual)", flush=True)
     # auto-resume: continue from a previous epoch save if present, replacing
     # any non-finite entries (poisoned BN stats) with safe defaults
@@ -274,7 +333,8 @@ def main():
     dkw = dict(with_depth=False, with_agenttraj=args.do_traj,
                with_boxdet=args.do_box and not args.do_traj,
                with_ego=args.do_e2e, with_risk=args.do_risk,
-               with_unknown_v2=args.do_unk, unk2_key=args.unk_key)
+               with_unknown_v2=args.do_unk, unk2_key=args.unk_key,
+               with_lidarbev=args.do_pl)
     tr = BevLaneDataset(args.root, train_s, gt_key=args.gt_key, **dkw)
     va = BevLaneDataset(args.root, val_s, max_per_scene=4, gt_key=args.gt_key,
                         **dkw)
@@ -305,7 +365,7 @@ def main():
             if args.limit_train and bidx >= args.limit_train:
                 break
             (imgs, K, Tc, gt, det_boxes, det_n, traj_gt, tvalid,
-             ego_gt, risk_gt, unk_gt) = _unpack(batch, device, args)
+             ego_gt, risk_gt, unk_gt, lb_gt) = _unpack(batch, device, args)
             v0 = ego_gt[:, 12] if args.do_e2e else None
             has_box = args.do_box or args.do_traj      # det_boxes available
             with torch.no_grad(), torch.autocast("cuda", torch.float16):
@@ -317,16 +377,24 @@ def main():
                 traj = out[9].float() if args.do_traj else None
                 risk = out[12].float() if args.do_risk else None
                 unk = out[17].float() if args.do_unk else None
+                stat_o = (out[10].float()
+                          if args.do_stat and len(out) > 10 else None)
+                pl_o = (out[18].float()
+                        if args.do_pl and len(out) > 18 else None)
                 ctx = frozen.lane_input().float() if args.ctx else None
                 fused = frozen._fused_bev.float() if args.do_e2e else None
             # snapshot refiner BN stats: one pathological batch poisons them
             # IN the forward pass, before any loss check can catch it
             bn_bak = {k: v.detach().clone() for k, v in ref0.named_buffers()
                       if "running_" in k}
-            with torch.autocast("cuda", torch.float16):
+            # refiner runs in fp32: it is tiny (~8M params) and its BN
+            # stats kept getting poisoned by fp16 overflow on outlier
+            # frozen-output batches (r45 incident; fp16 gave no real speedup)
+            with torch.autocast("cuda", enabled=False):
                 r = ref(seg=seg if args.do_seg else None, hm=hm, reg=reg,
                         ego=ego, v0=v0, fused=fused, seg_ctx=ctx,
-                        traj=traj, risk=risk, unk=unk)
+                        traj=traj, risk=risk, unk=unk,
+                        stat=stat_o, pl=pl_o)
                 loss = seg.new_zeros(())
                 if args.do_seg:
                     rs = r["seg"].float()
@@ -355,6 +423,12 @@ def main():
                     # v41+ alpha-focal w/ pos_weight; -1 = don't-care
                     loss = loss + args.unk_w * frozen.unk_dense_loss(
                         r["unk"].float(), unk_gt)
+                if args.do_stat and "stat" in r:
+                    loss = loss + args.stat_w * frozen.stat_loss(
+                        r["stat"].float(), det_boxes, det_n, traj_gt, tvalid)
+                if args.do_pl and "pl" in r:
+                    loss = loss + args.pl_w * frozen.pseudo_lidar_loss(
+                        r["pl"].float(), lb_gt)
             opt.zero_grad(set_to_none=True)
             # DDP-safe non-finite guard: ALL ranks must agree, else a rank that
             # skips backward() deadlocks the others on the grad all-reduce.

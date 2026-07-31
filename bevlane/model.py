@@ -2745,6 +2745,7 @@ class MultiTaskRefiner(nn.Module):
 
     def __init__(self, do_seg=True, do_box=True, do_e2e=True,
                  do_traj=False, do_risk=False, do_unk=False,
+                 do_stat=False, do_pl=False,
                  n_cls=N_CLASSES, seg_width=48, box_width=32, seg_ctx=0,
                  ego_dim=None, ego_k=EGO_K):
         super().__init__()
@@ -2758,9 +2759,14 @@ class MultiTaskRefiner(nn.Module):
         self.risk = BEVDenseRefiner(1, width=24) if do_risk else None
         # dense unknown-obstacle logit refiner (v41+ out[17], 1ch 400x250)
         self.unk = BEVDenseRefiner(1, width=32, bound=6.0) if do_unk else None
+        # r48: stationary flag (v26+ out[10], 1ch) and the pseudo-LiDAR
+        # raster (v48 out[18], 4ch) get their own residual refiners
+        self.stat = BEVDenseRefiner(1, width=24, bound=6.0) if do_stat else None
+        self.pl = BEVDenseRefiner(4, width=32, bound=8.0) if do_pl else None
 
     def forward(self, seg=None, hm=None, reg=None, ego=None, v0=None,
-                fused=None, seg_ctx=None, traj=None, risk=None, unk=None):
+                fused=None, seg_ctx=None, traj=None, risk=None, unk=None,
+                stat=None, pl=None):
         """Refine whichever frozen outputs are provided; returns a dict. Called
         through DDP so every enabled head's params are tracked each step."""
         out = {}
@@ -2777,6 +2783,10 @@ class MultiTaskRefiner(nn.Module):
             out["risk"] = self.risk(risk)
         if self.unk is not None and unk is not None:
             out["unk"] = self.unk(unk.clamp(-12.0, 12.0))
+        if self.stat is not None and stat is not None:
+            out["stat"] = self.stat(stat.clamp(-15.0, 15.0))
+        if self.pl is not None and pl is not None:
+            out["pl"] = self.pl(pl.clamp(-15.0, 15.0))
         return out
 
 
