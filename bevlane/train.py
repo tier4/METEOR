@@ -161,6 +161,30 @@ class EpochSubsetSampler(torch.utils.data.Sampler):
         return self.n_draw // self.world
 
 
+
+def sanitize_bn(model):
+    """Repair non-finite BN running statistics; returns the names fixed.
+
+    BN updates its running stats during the FORWARD pass, so one inf/nan
+    activation poisons them for good: training keeps working (it uses batch
+    statistics) while every eval-mode forward returns nan. r47 lost its E2E
+    metric this way. DDP broadcasts buffers from rank 0, so repairing them
+    here propagates to all ranks."""
+    bad = []
+    with torch.no_grad():
+        for n, b in model.named_buffers():
+            if b.dtype.is_floating_point and not torch.isfinite(b).all():
+                bad.append(n)
+                if "running_var" in n:
+                    b[~torch.isfinite(b)] = 1.0
+                else:
+                    b[~torch.isfinite(b)] = 0.0
+        for n, b in model.named_buffers():
+            if "running_var" in n:
+                b.clamp_(min=1e-5)
+    return bad
+
+
 def split_scenes(root):
     scenes = sorted(os.listdir(root))
     # indoor / GNSS-dead scenes (annotate_indoor.py): ego pose is a smooth
@@ -973,6 +997,12 @@ def main():
                     help="v45 INT8-robust feature noise (1.0 = 1 LSB)")
     ap.add_argument("--use-sdmap", action="store_true",
                     help="v46: feed the OSM SD-map raster (optional input)")
+    ap.add_argument("--val-batch", type=int, default=0,
+                    help="batch for the val loaders (default: max(train batch, 2)); evaluation is no-grad, so it should not shrink with the training batch -- at batch 1 the capped evals covered half the samples and the rare curve subset (ADEc) hit zero -> nan")
+    ap.add_argument("--sync-bn", action="store_true",
+                    help="SyncBatchNorm: needed when the batch per GPU drops to 1")
+    ap.add_argument("--grad-ckpt", action="store_true",
+                    help="checkpoint the image backbone: ~15%% slower, frees several GB of activations")
     ap.add_argument("--rl-w", type=float, default=0.0,
                     help="r48: weight of the GRPO-style reward "
                          "loss on the E2E mode logits (0 = off)")
@@ -1134,7 +1164,8 @@ def main():
               f"{args.epochs} ep = {seen} draws over {len(tr)} frames "
               f"({100 * min(seen, len(tr)) / max(len(tr), 1):.0f}% expected "
               f"coverage)", flush=True)
-        dv = DataLoader(va, batch_size=args.batch, shuffle=False,
+        vb = args.val_batch or max(args.batch, 2)
+        dv = DataLoader(va, batch_size=vb, shuffle=False,
                         num_workers=4 if is_main else 1, pin_memory=is_main)
         dv_lid = None
         if use_lidar:
@@ -1145,7 +1176,7 @@ def main():
                                     with_lidarbev=use_lidarbev,
                                     dontcare_sidewalk=args.dontcare_sidewalk,
                                     trim_start=3, trim_end=args.trim_end)
-            dv_lid = DataLoader(va_lid, batch_size=args.batch, shuffle=False,
+            dv_lid = DataLoader(va_lid, batch_size=vb, shuffle=False,
                                 num_workers=2, pin_memory=True)
 
     if args.limit_train and args.limit_train < len(tr):
@@ -1212,6 +1243,11 @@ def main():
     mkw = {"n_seg": args.n_seg2d} \
         if args.model in ("v13", "v13d", "v14d", "v15", "v16", "v17", "v18", "v19", "v20", "v21", "v22", "v23", "v24", "v25", "v26", "v27", "v28", "v29", "v30", "v31", "v32", "v33", "v34", "v35", "v36", "v37", "v38", "v39", "v40", "v41", "v42", "v43", "v44", "v45", "v46", "v47", "v48") else {}
     model = MODELS[args.model](**mkw).to(device)
+    if args.grad_ckpt:
+        model.grad_ckpt = True
+        if is_main:
+            print("[grad-ckpt] backbone activations recomputed in backward",
+                  flush=True)
     if use_rl and is_main:
         print(f"[rl] GRPO mode loss w={args.rl_w} ent={args.rl_ent} "
               f"imit={args.rl_imit_w} tl={args.rl_tl_w}", flush=True)
@@ -1242,9 +1278,17 @@ def main():
         sd = {k: v for k, v in sd.items()
               if k in cur and cur[k].shape == v.shape}
         missing, unexpected = model.load_state_dict(sd, strict=False)
+        _b0 = sanitize_bn(model)
+        if _b0 and is_main:
+            print(f"[init] sanitized {len(_b0)} non-finite BN buffers "
+                  "from the checkpoint", flush=True)
         if is_main:
             print(f"[init] {args.init_ckpt} missing={len(missing)} "
                   f"unexpected={len(unexpected)}", flush=True)
+    if args.sync_bn and ddp:
+        model = torch.nn.SyncBatchNorm.convert_sync_batchnorm(model)
+        if is_main:
+            print("[sync-bn] BN statistics pooled across ranks", flush=True)
     if ddp:
         model = torch.nn.parallel.DistributedDataParallel(
             model, device_ids=[local],
@@ -1402,6 +1446,10 @@ def main():
                 keep_sd = (torch.rand(imgs.shape[0], 1, 1, 1, device=device)
                            >= args.sdmap_drop).to(sdmap_t.dtype)
                 sd_in = sdmap_t * keep_sd
+            _bn_bak = {n: b.detach().clone()
+                       for n, b in (model.module if ddp else model
+                                    ).named_buffers()
+                       if "running_" in n}
             with torch.autocast("cuda", torch.float16):
                 # v18+ is conditioned on the current speed (ego_gt col 12)
                 if use_temporal:
@@ -1562,12 +1610,29 @@ def main():
                         logits.float(), gt, classes=LINE_CLASSES,
                         alpha=0.2, beta=0.8)
             opt.zero_grad(set_to_none=True)
+            if not torch.isfinite(loss):
+                # the forward already moved the BN running stats; put them
+                # back so one bad batch cannot poison eval-mode inference
+                with torch.no_grad():
+                    for _n, _b in (model.module if ddp else model
+                                   ).named_buffers():
+                        if _n in _bn_bak:
+                            _b.copy_(_bn_bak[_n])
+                opt.zero_grad(set_to_none=True)
+                sched.step(); step += 1
+                if is_main:
+                    print(f"ep{ep} step{step} SKIP non-finite loss "
+                          "(BN stats restored)", flush=True)
+                continue
             scaler.scale(loss).backward()
             scaler.step(opt)
             scaler.update()
             sched.step()
             step += 1
             if is_main and step % 50 == 0:
+                if os.environ.get("METEOR_MEM_PROBE"):
+                    print(f"PEAK {torch.cuda.max_memory_allocated()/2**30:.2f}"
+                          " GiB", flush=True)
                 print(f"ep{ep} step{step}/{total_steps} loss={loss.item():.4f} "
                       f"lr={sched.get_last_lr()[0]:.2e} "
                       f"({(time.time() - t0) / step:.2f}s/it)", flush=True)
@@ -1577,7 +1642,17 @@ def main():
             # other ranks block on the next all-reduce, then a barrier
             # re-syncs everyone.
             if args.val_every and step % args.val_every == 0:
+                # release this step's activations (18 output maps + graph
+                # refs) BEFORE the eval spike: v48's extra head left only
+                # tens of MB of headroom on 44 GB cards
+                out = ego_pred = loss = None
+                torch.cuda.empty_cache()
+                _bad = sanitize_bn(model.module if ddp else model)
+                if _bad and is_main:
+                    print(f"ep{ep} step{step} BN REPAIRED: {len(_bad)} "
+                          f"buffers, first={_bad[:3]}", flush=True)
                 if is_main:
+                  try:
                     torch.cuda.empty_cache()
                     netq = model.module if ddp else model
                     iq = evaluate(netq, dv, device, max_batches=10)
@@ -1618,6 +1693,14 @@ def main():
                                 f" vruRn={dq['vrun']:.2f}"
                                 f" yaw={dq['veh_yaw']:.1f}deg")
                     print(msg, flush=True)
+                  except torch.cuda.OutOfMemoryError:
+                    # a probe is diagnostics: never let it kill a
+                    # multi-day run (v48 raised the peak enough that
+                    # the eval spike on top of the training reservation
+                    # tipped over 44 GB and the watchdog looped)
+                    print(f"[probe ep{ep} step{step}] SKIPPED (OOM)",
+                          flush=True)
+                    torch.cuda.empty_cache()
                 # distributed ADE/ADEc probe: every rank evaluates its own
                 # shard of the val set (the other 7 GPUs used to idle here),
                 # sums are all-reduced, rank 0 prints -> 8x coverage at the
@@ -1650,6 +1733,7 @@ def main():
                 if ddp:
                     dist.barrier()
         if is_main:
+          try:
             torch.cuda.empty_cache()
             net = model.module if ddp else model
             ious = evaluate(net, dv, device)
@@ -1785,6 +1869,10 @@ def main():
                 best = score
                 torch.save({"model": net.state_dict(), "epoch": ep, "ious": ious},
                            os.path.join(args.out, "best.pt"))
+          except torch.cuda.OutOfMemoryError:
+            # never let the epoch-end evaluation kill the round
+            print(f'[val ep{ep}] SKIPPED (OOM)', flush=True)
+            torch.cuda.empty_cache()
         if ddp:
             dist.barrier()
     if is_main:
