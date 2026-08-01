@@ -427,12 +427,26 @@ class DepthSegIPMNet(nn.Module):
             ConvBlock(ctx_ch, 160), ConvBlock(160, 160), ConvBlock(160, 128),
             nn.Conv2d(128, N_CLASSES, 1))
 
+    grad_ckpt = False          # trade ~15% speed for backbone activations
+
     def image_feats(self, imgs):
         B, N, _, H, W = imgs.shape
-        x1 = self.layer1(self.stem(imgs.reshape(B * N, 3, H, W)))
-        x2 = self.layer2(x1)
-        x3 = self.layer3(x2)
-        x4 = self.layer4(x3)
+        x0 = self.stem(imgs.reshape(B * N, 3, H, W))
+        if self.grad_ckpt and self.training:
+            # 8 cameras of backbone activations dominate the peak; with the
+            # full multi-task loss set the run sat ~1 GB under the 44 GB
+            # ceiling and OOM'd on scene-dependent spikes. Recompute them in
+            # the backward pass instead of storing them.
+            from torch.utils.checkpoint import checkpoint as _ck
+            x1 = _ck(self.layer1, x0, use_reentrant=False)
+            x2 = _ck(self.layer2, x1, use_reentrant=False)
+            x3 = _ck(self.layer3, x2, use_reentrant=False)
+            x4 = _ck(self.layer4, x3, use_reentrant=False)
+        else:
+            x1 = self.layer1(x0)
+            x2 = self.layer2(x1)
+            x3 = self.layer3(x2)
+            x4 = self.layer4(x3)
         sz = x1.shape[-2:]
         up = lambda t: F.interpolate(t, size=sz, mode="bilinear", align_corners=False)
         f = self.lat1(x1) + up(self.lat2(x2)) + up(self.lat3(x3)) + up(self.lat4(x4))
@@ -1771,7 +1785,7 @@ class DepthSegIPMNetV29(DepthSegIPMNetV28):
     # losers alive with a small share of the loss so they can specialise.
     EPS_WTA = 0.1
 
-    def ego_loss(self, ego, gt):
+    def ego_loss(self, ego, gt, intent=None):
         valid = gt[:, 16:17]
         n = valid.sum().clamp(min=1)
         Kn = EGO_K
@@ -1783,10 +1797,30 @@ class DepthSegIPMNetV29(DepthSegIPMNetV28):
         lw = getattr(self, "EGO_LONG_W", 1.0)
         wp_ek = (lw * err[..., 0] + 4.0 * err[..., 1]).mean(2) / 2.5  # [B,K]
         best = wp_ek.detach().argmin(1)
+        # MODE BINDING. v44 adds MODE_BOOST to the commanded mode's logit and
+        # claimed the switch was "guaranteed by construction". It was not:
+        # `best` is the argmin of the WAYPOINT error, so the winner is
+        # whichever mode already happens to be closest and the command has no
+        # say at all. Measured on r45 (50 val turn frames): the three modes
+        # differ by 1.08 m and reverse the turn on 0 % of them -- commanding
+        # "left" on a right-turn frame still turns right. Routing the winner
+        # by the command is what makes mode j accumulate manoeuvre-j
+        # gradients. The command is derived from the GT future (build_intent),
+        # so command == manoeuvre and this never fights the waypoint target.
+        if intent is not None:
+            cmd = intent.sum(1) > 0.5                 # rows carrying a command
+            best = torch.where(cmd, intent.argmax(1), best)
         e = self.EPS_WTA
         wp_e = ((1.0 - e) * wp_ek.gather(1, best[:, None])
                 + e * wp_ek.mean(1, keepdim=True))
         mlog = ego[:, 12 * Kn:12 * Kn + Kn]
+        # Train the SELECTOR on the RAW logits. forward() already added
+        # MODE_BOOST to mlog, so a CE against `best` on the boosted logits
+        # teaches the network to cancel the very mechanism it must obey.
+        # intent_mode_loss already subtracts the boost; this did not.
+        mb = getattr(self, "MODE_BOOST", 0.0)
+        if intent is not None and mb:
+            mlog = mlog - mb * intent.to(mlog.dtype)
         ce = F.cross_entropy(mlog, best, reduction="none")[:, None]
         cw = 1.0 + gt[:, 11:12].abs().clamp(max=6.0) / 1.5
         nw = (cw * valid).sum().clamp(min=1)
@@ -2987,13 +3021,20 @@ class DepthSegIPMNetV44(DepthSegIPMNetV43):
     v43's context delta moved the path by only ~0.2 m: with GT-following
     losses, a residual correction is never forced to matter. v44 instead
     assigns SEMANTICS to the K=3 modes (0=straight, 1=left, 2=right) by
-    adding +MODE_BOOST to the commanded mode's logit inside forward. During
-    training (intent given on 70% of frames) every selection-dependent loss
-    (WTA waypoints, risk-integral selection) then routes turn-frame
-    gradients into the commanded mode -- the binding is learned by the
-    existing losses. At inference a command simply selects its mode: the
-    switch is guaranteed by construction, not by a learned bias.
-    intent_mode_loss additionally aligns the RAW logits with the maneuver
+    adding +MODE_BOOST to the commanded mode's logit inside forward, so a
+    command always SELECTS its mode.
+
+    Selection was never the problem; what the mode selected meant was. The
+    original claim here -- that routing the selection-dependent losses made
+    the binding emerge "by construction" -- was wrong for the WTA waypoint
+    loss, whose winner is the argmin of the waypoint error and never looks
+    at the logits. Measured on r45 over 50 val turn frames: the K=3 paths
+    differ by 1.08 m and reverse the turn on 0 % of them, i.e. commanding
+    "left" on a right-turn frame still turned right; the modes had learned
+    magnitude, not direction. ego_loss(intent=...) now routes the WTA winner
+    by the command (and de-boosts the logits before the selector CE), which
+    is what actually accumulates manoeuvre-j gradients in mode j.
+    intent_mode_loss additionally aligns the RAW logits with the manoeuvre
     so the no-command mode selection improves too."""
     MODE_BOOST = 8.0
     # J6 sensor-config fine-tune: indices of cameras to hard-zero at every

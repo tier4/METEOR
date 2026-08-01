@@ -6,6 +6,7 @@ Single GPU:  python3 bevlane/train.py
 """
 import argparse
 import os
+import subprocess
 import sys
 import time
 
@@ -160,6 +161,10 @@ class EpochSubsetSampler(torch.utils.data.Sampler):
     def __len__(self):
         return self.n_draw // self.world
 
+
+
+_GIT = subprocess.run(["git", "rev-parse", "HEAD"],
+                      capture_output=True, text=True).stdout.strip()
 
 
 def sanitize_bn(model):
@@ -1003,6 +1008,13 @@ def main():
                     help="SyncBatchNorm: needed when the batch per GPU drops to 1")
     ap.add_argument("--grad-ckpt", action="store_true",
                     help="checkpoint the image backbone: ~15%% slower, frees several GB of activations")
+    ap.add_argument("--intent-wrong", type=float, default=0.0,
+                    help="fraction of commanded rows given a "
+                         "DELIBERATELY wrong command; their "
+                         "waypoint supervision is dropped so only "
+                         "intent_loss shapes them (phase 2 of "
+                         "docs/FIX_COMMAND_BINDING.md, off by "
+                         "default)")
     ap.add_argument("--rl-w", type=float, default=0.0,
                     help="r48: weight of the GRPO-style reward "
                          "loss on the E2E mode logits (0 = off)")
@@ -1423,6 +1435,27 @@ def main():
                     idx = torch.where(lat > 2.5, 1,
                                       torch.where(lat < -2.5, 2, 0))
                 intent_oh = F.one_hot(idx.long(), 3).float()
+                # COUNTERFACTUAL COMMANDS (phase 2). The command is derived
+                # from the GT future, so "turn left" is only ever seen on
+                # frames that do turn left: mode 1 learns "the left turn this
+                # scene affords", not "go left". Feed a deliberately WRONG
+                # command on a fraction of rows and drop their waypoint
+                # supervision -- the GT no longer describes the commanded
+                # manoeuvre, so only the direction hinge may speak there.
+                if args.intent_wrong > 0:
+                    _B = intent_oh.shape[0]
+                    _has = intent_oh.sum(1) > 0.5
+                    _pick = (torch.rand(_B, device=intent_oh.device)
+                             < args.intent_wrong) & _has
+                    if _pick.any():
+                        _sh = torch.randint(1, 3, (_B,),
+                                            device=intent_oh.device)
+                        _new = (intent_oh.argmax(1) + _sh) % 3
+                        intent_oh = torch.where(
+                            _pick[:, None], F.one_hot(_new, 3).float(),
+                            intent_oh)
+                        ego_gt = ego_gt.clone()
+                        ego_gt[_pick, 16] = 0.0     # no waypoint target here
                 intent_oh = intent_oh * (torch.rand(
                     imgs.shape[0], 1, device=device) >= 0.3).float()
             pl_gt = lidbev            # before modality dropout
@@ -1492,8 +1525,10 @@ def main():
                     loss = loss + args.occ_w * net0.occ_loss(occ_pred.float(),
                                                              occ_gt)
                 if ego_pred is not None and use_ego:
-                    loss = loss + args.ego_w * net0.ego_loss(ego_pred.float(),
-                                                             ego_gt)
+                    loss = loss + args.ego_w * net0.ego_loss(
+                        ego_pred.float(), ego_gt,
+                        intent_oh if args.model in (
+                            "v43", "v44", "v45", "v46", "v47", "v48") else None)
                 if dlog is not None and use_depth:
                     loss = loss + args.depth_w * net0.depth_loss(dlog.float(), depth_gt)
                 if seg2d is not None and use_seg2d:
@@ -1858,7 +1893,8 @@ def main():
                           f"FDE={eg['fde']:.2f}m steer={eg['steer']:.3f}rad "
                           f"acc={eg['acc']:.2f}m/s2 brakeAcc={eg['brake']:.2f}",
                           flush=True)
-            torch.save({"model": net.state_dict(), "epoch": ep, "ious": ious},
+            torch.save({"model": net.state_dict(), "epoch": ep,
+                        "ious": ious, "args": vars(args), "git": _GIT},
                        os.path.join(args.out, "last.pt"))
             # composite best: BEV mIoU minus a small penalty for E2E curve
             # error, so "best" never selects a pre-curve-convergence epoch
@@ -1867,7 +1903,8 @@ def main():
                 score = miou - 0.01 * min(eg["ade_c"], 5.0)
             if score > best:
                 best = score
-                torch.save({"model": net.state_dict(), "epoch": ep, "ious": ious},
+                torch.save({"model": net.state_dict(), "epoch": ep,
+                            "ious": ious, "args": vars(args), "git": _GIT},
                            os.path.join(args.out, "best.pt"))
           except torch.cuda.OutOfMemoryError:
             # never let the epoch-end evaluation kill the round
