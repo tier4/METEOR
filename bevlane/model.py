@@ -2769,6 +2769,81 @@ class BEVDenseRefiner(nn.Module):
 TRAJ_CH = TRAJ_H * 2 * EGO_K + EGO_K      # 39: dense agent-forecast channels
 
 
+
+class ImgDenseRefiner(nn.Module):
+    """Residual refiner for per-camera image-space maps (depth logits, 2D
+    seg, 2D det heads). Input arrives as [B,N,C,h,w] or [B*N,C,h,w]; the
+    cameras are folded into the batch so one small module serves all of
+    them. Three convs, zero-init last -> identity at start, and a
+    tanh bound keeps fp16 safe like the BEV refiners."""
+
+    def __init__(self, cin, width=32, bound=6.0):
+        super().__init__()
+        self.bound = bound
+        self.body = nn.Sequential(
+            nn.Conv2d(cin, width, 3, padding=1, bias=False),
+            nn.BatchNorm2d(width), nn.ReLU(inplace=True),
+            nn.Conv2d(width, width, 3, padding=1, bias=False),
+            nn.BatchNorm2d(width), nn.ReLU(inplace=True),
+            nn.Conv2d(width, cin, 1))
+        nn.init.zeros_(self.body[-1].weight)
+        nn.init.zeros_(self.body[-1].bias)
+
+    def forward(self, x):
+        sh = x.shape
+        z = x.reshape(-1, *sh[-3:]) if x.dim() == 5 else x
+        res = self.body(z)
+        if self.bound:
+            res = self.bound * torch.tanh(res / self.bound)
+        return (z + res).reshape(sh)
+
+
+class VecRefiner(nn.Module):
+    """Residual refiner for vector/set outputs (traffic-light state, lane
+    graph points / meta / adjacency). Operates on the last dimension so
+    [B,D], [B,M,D] and [B,M,P,2] all work. Zero-init last layer."""
+
+    def __init__(self, dim, hidden=64, bound=None):
+        super().__init__()
+        self.bound = bound
+        self.mlp = nn.Sequential(nn.Linear(dim, hidden), nn.ReLU(inplace=True),
+                                 nn.Linear(hidden, dim))
+        nn.init.zeros_(self.mlp[-1].weight)
+        nn.init.zeros_(self.mlp[-1].bias)
+
+    def forward(self, x):
+        res = self.mlp(x.float())
+        if self.bound:
+            res = self.bound * torch.tanh(res / self.bound)
+        return x + res.to(x.dtype)
+
+
+class OccRefiner(nn.Module):
+    """Residual refiner for the 3D occupancy logits [B,cls,Z,H,W]: the z
+    slices are folded into the channel dim so a 2D U-Net-free conv stack
+    can correct them at 200x200 without a 3D kernel."""
+
+    def __init__(self, n_cls=10, z=16, width=64, bound=6.0):
+        super().__init__()
+        self.n_cls, self.z, self.bound = n_cls, z, bound
+        c = n_cls * z
+        self.body = nn.Sequential(
+            nn.Conv2d(c, width, 3, padding=1, bias=False),
+            nn.BatchNorm2d(width), nn.ReLU(inplace=True),
+            nn.Conv2d(width, width, 3, padding=1, bias=False),
+            nn.BatchNorm2d(width), nn.ReLU(inplace=True),
+            nn.Conv2d(width, c, 1))
+        nn.init.zeros_(self.body[-1].weight)
+        nn.init.zeros_(self.body[-1].bias)
+
+    def forward(self, x):
+        B, C, Z, H, W = x.shape
+        res = self.body(x.reshape(B, C * Z, H, W))
+        if self.bound:
+            res = self.bound * torch.tanh(res / self.bound)
+        return x + res.reshape(B, C, Z, H, W)
+
+
 class MultiTaskRefiner(nn.Module):
     """Post-hoc residual refiners for the three priority heads, sharing the
     single frozen-model forward. Each enabled head is an independent zero-init
@@ -2779,7 +2854,9 @@ class MultiTaskRefiner(nn.Module):
 
     def __init__(self, do_seg=True, do_box=True, do_e2e=True,
                  do_traj=False, do_risk=False, do_unk=False,
-                 do_stat=False, do_pl=False,
+                 do_stat=False, do_pl=False, do_depth=False,
+                 do_seg2d=False, do_det2d=False, do_occ=False, do_tl=False,
+                 do_flow=False, do_lg=False, n_seg2d=21, n_depth=64,
                  n_cls=N_CLASSES, seg_width=48, box_width=32, seg_ctx=0,
                  ego_dim=None, ego_k=EGO_K):
         super().__init__()
@@ -2797,10 +2874,31 @@ class MultiTaskRefiner(nn.Module):
         # raster (v48 out[18], 4ch) get their own residual refiners
         self.stat = BEVDenseRefiner(1, width=24, bound=6.0) if do_stat else None
         self.pl = BEVDenseRefiner(4, width=32, bound=8.0) if do_pl else None
+        # remaining heads, so every task the network emits can be refined:
+        # image-space maps fold the cameras into the batch, the occupancy
+        # logits fold z into channels, and the vector/set outputs get MLPs
+        self.depth = (ImgDenseRefiner(n_depth, width=48, bound=8.0)
+                      if do_depth else None)
+        self.seg2d = (ImgDenseRefiner(n_seg2d, width=48, bound=8.0)
+                      if do_seg2d else None)
+        self.det2d_hm = (nn.ModuleList([ImgDenseRefiner(10, width=24,
+                                                       bound=6.0)
+                                        for _ in range(3)])
+                         if do_det2d else None)
+        self.det2d_reg = (nn.ModuleList([ImgDenseRefiner(4, width=24, bound=6.0)
+                                         for _ in range(3)])
+                          if do_det2d else None)
+        self.occ = OccRefiner(width=64, bound=6.0) if do_occ else None
+        self.tl = VecRefiner(4, hidden=64, bound=6.0) if do_tl else None
+        self.flow = BEVDenseRefiner(2, width=24, bound=6.0) if do_flow else None
+        self.lg_pts = VecRefiner(2, hidden=64, bound=8.0) if do_lg else None
+        self.lg_meta = VecRefiner(4, hidden=64, bound=6.0) if do_lg else None
+        self.lg_adj = VecRefiner(24, hidden=64, bound=6.0) if do_lg else None
 
     def forward(self, seg=None, hm=None, reg=None, ego=None, v0=None,
                 fused=None, seg_ctx=None, traj=None, risk=None, unk=None,
-                stat=None, pl=None):
+                stat=None, pl=None, depth=None, seg2d=None, hm2d=None,
+                reg2d=None, occ=None, tl=None, flow=None, lg=None):
         """Refine whichever frozen outputs are provided; returns a dict. Called
         through DDP so every enabled head's params are tracked each step."""
         out = {}
@@ -2821,6 +2919,26 @@ class MultiTaskRefiner(nn.Module):
             out["stat"] = self.stat(stat.clamp(-15.0, 15.0))
         if self.pl is not None and pl is not None:
             out["pl"] = self.pl(pl.clamp(-15.0, 15.0))
+        if self.depth is not None and depth is not None:
+            out["depth"] = self.depth(depth.clamp(-20.0, 20.0))
+        if self.seg2d is not None and seg2d is not None:
+            out["seg2d"] = self.seg2d(seg2d.clamp(-20.0, 20.0))
+        if self.det2d_hm is not None and hm2d is not None:
+            out["hm2d"] = [r(h.clamp(-15.0, 15.0))
+                           for r, h in zip(self.det2d_hm, hm2d)]
+            out["reg2d"] = [r(g.clamp(-20.0, 20.0))
+                            for r, g in zip(self.det2d_reg, reg2d)]
+        if self.occ is not None and occ is not None:
+            out["occ"] = self.occ(occ.clamp(-15.0, 15.0))
+        if self.tl is not None and tl is not None:
+            out["tl"] = self.tl(tl.clamp(-15.0, 15.0))
+        if self.flow is not None and flow is not None:
+            out["flow"] = self.flow(flow.clamp(-30.0, 30.0))
+        if self.lg_pts is not None and lg is not None:
+            pts, meta, adj = lg
+            out["lg_pts"] = self.lg_pts(pts)
+            out["lg_meta"] = self.lg_meta(meta.clamp(-15.0, 15.0))
+            out["lg_adj"] = self.lg_adj(adj.clamp(-15.0, 15.0))
         return out
 
 

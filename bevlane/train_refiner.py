@@ -42,33 +42,53 @@ BANDS = [("40-80m", 0, 200), ("20-40m", 200, 300), ("0-20m", 300, 400)]
 
 
 def _unpack(batch, device, a):
-    """Batch layout (counter identical to train.py). with_agenttraj provides
-    boxes+traj (+4); else with_boxdet gives boxes (+2); then ego (+1), risk
-    (+1)."""
+    """Mirror of dataset.py's append order. Every optional tensor is pulled
+    in the SAME sequence the dataset writes it, and the running index is
+    asserted against len(batch) at the end -- silent off-by-one in this
+    function has cost us whole rounds before, so it is checked, not trusted.
+
+    dataset order: imgs, K, Tc, gt | depth | seg2d | boxdet(2) or
+    agenttraj(4) | bbox2d(2) | ego | occ | tl | risk | lanegraph(4) |
+    unknown_v2 | lidar_bev
+    """
     def g(i):
         return batch[i].to(device, non_blocking=True)
     imgs, K, Tc, gt = g(0), g(1), g(2), g(3)
     bi = 4
-    det_boxes = det_n = traj_gt = tvalid = ego_gt = risk_gt = None
+    d = {}
+    if a.do_depth:
+        d["depth"] = g(bi); bi += 1
+    if a.do_seg2d:
+        d["seg2d"] = g(bi); bi += 1
     if a.do_traj:                         # boxes + traj (+4)
-        det_boxes, det_n = g(bi), g(bi + 1)
-        traj_gt, tvalid = g(bi + 2), g(bi + 3)
+        d["boxes"], d["nbox"] = g(bi), g(bi + 1)
+        d["traj"], d["tvalid"] = g(bi + 2), g(bi + 3)
         bi += 4
     elif a.do_box:                        # boxes only (+2)
-        det_boxes, det_n = g(bi), g(bi + 1)
+        d["boxes"], d["nbox"] = g(bi), g(bi + 1)
         bi += 2
+    if a.do_det2d:
+        d["bb2d"], d["nb2d"] = g(bi), g(bi + 1); bi += 2
     if a.do_e2e:
-        ego_gt = g(bi); bi += 1
+        d["ego"] = g(bi); bi += 1
+    if a.do_occ:
+        d["occ"] = g(bi); bi += 1
+    if a.do_tl:
+        d["tl"] = g(bi); bi += 1
     if a.do_risk:
-        risk_gt = g(bi); bi += 1
-    unk_gt = None
-    if a.do_unk:                          # dense unknown mask (+1)
-        unk_gt = g(bi); bi += 1
-    lb_gt = None
-    if a.do_pl:            # LiDAR raster: dataset appends it AFTER unk_v2
-        lb_gt = g(bi); bi += 1
-    return (imgs, K, Tc, gt, det_boxes, det_n, traj_gt, tvalid, ego_gt,
-            risk_gt, unk_gt, lb_gt)
+        d["risk"] = g(bi); bi += 1
+    if a.do_lg:
+        d["lg_pts"], d["lg_cls"] = g(bi), g(bi + 1)
+        d["lg_n"], d["lg_adj"] = g(bi + 2), g(bi + 3)
+        bi += 4
+    if a.do_unk:
+        d["unk"] = g(bi); bi += 1
+    if a.do_pl:
+        d["lb"] = g(bi); bi += 1
+    assert bi == len(batch), (
+        f"batch layout mismatch: consumed {bi} of {len(batch)} tensors -- "
+        "the dataset append order and _unpack have diverged")
+    return imgs, K, Tc, gt, d
 
 
 @torch.no_grad()
@@ -84,8 +104,11 @@ def evaluate(frozen, ref0, loader, device, args, max_b=40):
     for bi, batch in enumerate(loader):
         if bi >= max_b:
             break
-        (imgs, K, Tc, gt, det_boxes, det_n, traj_gt, tvalid,
-         ego_gt, risk_gt, unk_gt, lb_gt) = _unpack(batch, device, args)
+        imgs, K, Tc, gt, _d = _unpack(batch, device, args)
+        det_boxes = _d.get("boxes"); det_n = _d.get("nbox")
+        traj_gt = _d.get("traj"); tvalid = _d.get("tvalid")
+        ego_gt = _d.get("ego"); risk_gt = _d.get("risk")
+        unk_gt = _d.get("unk"); lb_gt = _d.get("lb")
         v0 = ego_gt[:, 12] if args.do_e2e else None
         with torch.autocast("cuda", torch.float16):
             out = frozen(imgs, K, Tc, v0)
@@ -251,6 +274,23 @@ def main():
     ap.add_argument("--do-pl", action="store_true",
                     help="refine the pseudo-LiDAR raster (v48 out[18])")
     ap.add_argument("--pl-w", type=float, default=1.0)
+    ap.add_argument("--do-depth", action="store_true")
+    ap.add_argument("--depth-w", type=float, default=0.6)
+    ap.add_argument("--do-seg2d", action="store_true")
+    ap.add_argument("--seg2d-key", default="seg2d21")
+    ap.add_argument("--seg2d-w", type=float, default=0.35)
+    ap.add_argument("--do-det2d", action="store_true")
+    ap.add_argument("--bbox2d-w", type=float, default=0.25)
+    ap.add_argument("--do-occ", action="store_true")
+    ap.add_argument("--occ-w", type=float, default=0.4)
+    ap.add_argument("--do-tl", action="store_true")
+    ap.add_argument("--tl-w", type=float, default=0.6)
+    ap.add_argument("--do-flow", action="store_true")
+    ap.add_argument("--flow-w", type=float, default=0.3)
+    ap.add_argument("--do-lg", action="store_true")
+    ap.add_argument("--lanegraph-w", type=float, default=0.5)
+    ap.add_argument("--do-all", action="store_true",
+                    help="refine every head the network emits")
     ap.add_argument("--box-w", type=float, default=1.0)
     ap.add_argument("--e2e-w", type=float, default=1.0)
     ap.add_argument("--traj-w", type=float, default=0.5)
@@ -295,10 +335,19 @@ def main():
     for p in frozen.parameters():
         p.requires_grad_(False)
 
+    if args.do_all:
+        for _f in ("do_seg", "do_box", "do_e2e", "do_traj", "do_risk",
+                   "do_unk", "do_stat", "do_pl", "do_depth", "do_seg2d",
+                   "do_det2d", "do_occ", "do_tl", "do_flow", "do_lg"):
+            setattr(args, _f, True)
     ref = MultiTaskRefiner(do_seg=args.do_seg, do_box=args.do_box,
                            do_e2e=args.do_e2e, do_traj=args.do_traj,
                            do_risk=args.do_risk, do_unk=args.do_unk,
                            do_stat=args.do_stat, do_pl=args.do_pl,
+                           do_depth=args.do_depth, do_seg2d=args.do_seg2d,
+                           do_det2d=args.do_det2d, do_occ=args.do_occ,
+                           do_tl=args.do_tl, do_flow=args.do_flow,
+                           do_lg=args.do_lg, n_seg2d=args.n_seg2d,
                            n_cls=N_CLASSES,
                            seg_width=args.width, seg_ctx=args.ctx,
                            ego_dim=EGO_DIM).to(device)
@@ -309,7 +358,11 @@ def main():
         print(f"[refiner] heads: seg={args.do_seg} box={args.do_box} "
               f"e2e={args.do_e2e} traj={args.do_traj} risk={args.do_risk} "
               f"unk={args.do_unk}({args.unk_key}) "
-              f"stat={args.do_stat} pl={args.do_pl} | "
+              f"stat={args.do_stat} pl={args.do_pl} "
+              f"depth={args.do_depth} seg2d={args.do_seg2d} "
+              f"det2d={args.do_det2d} occ={args.do_occ} "
+              f"tl={args.do_tl} flow={args.do_flow} "
+              f"lg={args.do_lg} | "
               f"params={n_par:.2f}M (zero-init residual)", flush=True)
     # auto-resume: continue from a previous epoch save if present, replacing
     # any non-finite entries (poisoned BN stats) with safe defaults
@@ -330,7 +383,10 @@ def main():
     ref0 = ref.module if ddp else ref
 
     # with_agenttraj provides boxes+traj; else with_boxdet gives boxes.
-    dkw = dict(with_depth=False, with_agenttraj=args.do_traj,
+    dkw = dict(with_depth=args.do_depth, with_agenttraj=args.do_traj,
+               with_seg2d=args.do_seg2d, seg2d_key=args.seg2d_key,
+               with_bbox2d=args.do_det2d, with_occ=args.do_occ,
+               with_tl=args.do_tl, with_lanegraph=args.do_lg,
                with_boxdet=args.do_box and not args.do_traj,
                with_ego=args.do_e2e, with_risk=args.do_risk,
                with_unknown_v2=args.do_unk, unk2_key=args.unk_key,
@@ -364,8 +420,11 @@ def main():
         for bidx, batch in enumerate(dl):
             if args.limit_train and bidx >= args.limit_train:
                 break
-            (imgs, K, Tc, gt, det_boxes, det_n, traj_gt, tvalid,
-             ego_gt, risk_gt, unk_gt, lb_gt) = _unpack(batch, device, args)
+            imgs, K, Tc, gt, _d = _unpack(batch, device, args)
+            det_boxes = _d.get("boxes"); det_n = _d.get("nbox")
+            traj_gt = _d.get("traj"); tvalid = _d.get("tvalid")
+            ego_gt = _d.get("ego"); risk_gt = _d.get("risk")
+            unk_gt = _d.get("unk"); lb_gt = _d.get("lb")
             v0 = ego_gt[:, 12] if args.do_e2e else None
             has_box = args.do_box or args.do_traj      # det_boxes available
             with torch.no_grad(), torch.autocast("cuda", torch.float16):
@@ -394,7 +453,18 @@ def main():
                 r = ref(seg=seg if args.do_seg else None, hm=hm, reg=reg,
                         ego=ego, v0=v0, fused=fused, seg_ctx=ctx,
                         traj=traj, risk=risk, unk=unk,
-                        stat=stat_o, pl=pl_o)
+                        stat=stat_o, pl=pl_o,
+                        depth=out[1].float() if args.do_depth else None,
+                        seg2d=out[2].float() if args.do_seg2d else None,
+                        hm2d=([t.float() for t in out[5]]
+                              if args.do_det2d else None),
+                        reg2d=([t.float() for t in out[6]]
+                               if args.do_det2d else None),
+                        occ=out[8].float() if args.do_occ else None,
+                        tl=out[11].float() if args.do_tl else None,
+                        flow=out[13].float() if args.do_flow else None,
+                        lg=((out[14].float(), out[15].float(),
+                             out[16].float()) if args.do_lg else None))
                 loss = seg.new_zeros(())
                 if args.do_seg:
                     rs = r["seg"].float()
@@ -429,6 +499,29 @@ def main():
                 if args.do_pl and "pl" in r:
                     loss = loss + args.pl_w * frozen.pseudo_lidar_loss(
                         r["pl"].float(), lb_gt)
+                if args.do_depth and "depth" in r:
+                    loss = loss + args.depth_w * frozen.depth_loss(
+                        r["depth"].float(), _d["depth"])
+                if args.do_seg2d and "seg2d" in r:
+                    loss = loss + args.seg2d_w * frozen.seg2d_loss(
+                        r["seg2d"].float(), _d["seg2d"])
+                if args.do_det2d and "hm2d" in r:
+                    loss = loss + args.bbox2d_w * frozen.bbox2d_loss(
+                        r["hm2d"], r["reg2d"], _d["bb2d"], _d["nb2d"])
+                if args.do_occ and "occ" in r:
+                    loss = loss + args.occ_w * frozen.occ_loss(
+                        r["occ"].float(), _d["occ"])
+                if args.do_tl and "tl" in r:
+                    loss = loss + args.tl_w * frozen.tl_loss(
+                        r["tl"].float(), _d["tl"])
+                if args.do_flow and "flow" in r:
+                    loss = loss + args.flow_w * frozen.flow_loss(
+                        r["flow"].float(), det_boxes, det_n, traj_gt, tvalid)
+                if args.do_lg and "lg_pts" in r:
+                    loss = loss + args.lanegraph_w * frozen.lanegraph_loss(
+                        r["lg_pts"].float(), r["lg_meta"].float(),
+                        r["lg_adj"].float(), _d["lg_pts"], _d["lg_cls"],
+                        _d["lg_n"], _d["lg_adj"])
             opt.zero_grad(set_to_none=True)
             # DDP-safe non-finite guard: ALL ranks must agree, else a rank that
             # skips backward() deadlocks the others on the grad all-reduce.
