@@ -74,6 +74,10 @@ class BevLaneDataset(Dataset):
                                                   np.float32)) for c in CAMS])
             self.calib[s] = (K, Tc)
             frames = [f for f in m["frames"] if gt_key in f
+                      # one US scene ships a frame whose imgs dict lacks
+                      # CAM_BACK_NARROW: a KeyError deep in the dataloader
+                      # killed the whole 8-GPU round (r47, 2026-08-01)
+                      and not (set(CAMS) - set(f.get("imgs", {})))
                       and (not with_depth or "depth4" in f or "depth" in f)
 
                       and (not with_box or "bev_box" in f)
