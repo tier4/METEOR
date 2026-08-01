@@ -1,6 +1,6 @@
 # METEOR — candidate list for future rounds
 
-## Implementation ledger (updated 2026-07-27)
+## Implementation ledger (updated 2026-08-01)
 
 ### Shipped — model/training rounds
 (🔴 = measured, significant win; effect column = held-out val, before → after)
@@ -33,7 +33,15 @@
 | r37/r38 | 07-24..25 | v42 VRU 25-45 m band; 3014 corpus (+1.3k scenes); unknown_v3 **camera-visibility filter** (median 59% of accumulated GT is occluded → per-cell don't-care) | valUnkD recall first non-zero; pixel recall 0.83 |
 | r39 | 07-26 | 🔴 **v43 + intent losses; unknown_v3 live** | mIoU **0.334**, ADEc **0.39 m** (both records) |
 | r40 | 07-27 | v44 **command→mode binding** (+8 logit boost = structural switch) | ep2 mIoU 0.335; stopped early for J6 round |
-| r41 | 07-27 | **J6 7-camera fine-tune** (--zero-cams CAM_BACK_NARROW) | running — measures the 7-cam accuracy cost (ep2: mIoU −0.004, veh R −8pt, adapting) |
+| r41 | 07-27 | **J6 7-camera fine-tune** (--zero-cams CAM_BACK_NARROW) | measured 7-cam cost: mIoU −0.002, veh R −6 pt |
+| r42 | 07-28 | clean corpus (148 corrupt-GT scenes removed) + turning batch | round42/44 lists (7,707 / 7,795) |
+| r43 | 07-28..29 | 🔴 **v45 SE(2) lateral-recovery augmentation + INT8 quant-noise** | mIoU **0.336** probe / 0.333 final, ADEc **0.33 m** (records at the time) |
+| r43 refiner | 07-29 | 6-head refiner (unknown x2) | ADE **0.860→0.797**, far stopline **0.017→0.040** |
+| r44 | 07-29..30 | 🔴 **v46 optional SD-map (free OSM) BEV prior** | ep2 mIoU **0.345** — highest BEV mIoU to date |
+| r45 | 07-30 | **v47 per-camera box-level traffic-light input** + US corpus (420 scenes) | mIoU 0.335, **ADEc 0.31 m** (record); refiner (fp32) ADE 0.860→0.797 |
+| r46 | 07-31 | 🔴 **dense stationary supervision** (whole box footprint vs one centre cell) + **MAE-like BEV DropBlock** | stationary recall **0.61→0.85** at P 0.85 (new `[valStat]` metric) |
+| r47 | 08-01 | **v48 pseudo-LiDAR** — predict the LiDAR BEV raster from cameras, feed it back through the optional-LiDAR stem (inference ON/OFF, bit-equal when off) | running: PL occupancy IoU **0.29→0.40**, height MAE **1.67→1.14 m** |
+| r47 | 08-01 | 🔴 **E2E command binding fixed** (docs/FIX_COMMAND_BINDING.md phase 1): WTA winner routed by the command, selector CE de-boosted | baseline measured: K=3 spread 1.01 m, sign reversal 6% → acceptance is >=5 m / >60%, re-measure pending |
 
 Unresolved despite attempts: lane graph P/R 0.01 (B1 transformer decoder pending verdict), BEV lane mIoU (GT-noise-limited — see consensus GT), ADE absolute ≤0.5 (in progress, 0.67 now).
 
@@ -54,38 +62,50 @@ Unresolved despite attempts: lane graph P/R 0.01 (B1 transformer decoder pending
 | Refiner NaN hardening | 07-26..27 | tanh-bounded residuals + input clamps on every refiner head; consecutive-skip detector; periodic (1k-step) saves; poisoned-BN forensics |
 | unk2d BEV lift | 07-27 | 2D 'obstacle' detections lifted through predicted depth to BEV (instance-separated markers, cross-camera dedupe) |
 | Corrupt-GT audit | 07-27 | 148/7,846 train scenes with consensus road collapse (sparse high-speed accumulation → spaghetti vectors); cleaned round42 list (7,707) |
+| SD-map pipeline (offline OSM) | 07-30 | Geofabrik japan pbf -> 1,923 local Overpass-JSON tiles (public endpoints rate-limited us out); per-scene SE(2) alignment against GT road: class-3 crosswalk anchors, corridor score, analytic rotation seed, side-street openings, Theil-Sen drift model; scale pinned to 1 (fitting it on ~90 m-quantised GNSS shrank the map 8-23%); alignment gate (road-IoU<0.15 -> zeros = prior off). 5,109 scenes rasterised at 1,644 scenes/h |
+| Traffic-light label extraction | 07-31 | dataset lamp elements are separate `color_shape` categories (red_circle / green_arrow / ...) with row-level arrow `orientation` (0=up, +pi/2=right, verified on 512 real crops); 4,556 scenes, val coverage 273/273 |
+| TL + sign GT demos | 07-31 | camera lamp boxes with orientation glyphs + BEV signal/speed-limit/stop icons; circle lamps set the state, arrows are drawn as separate limited permissions (a green arrow is not a green light) |
+| US corpus ingest | 08-01 | idempotent `ingest_us.py`: symlink, consensus GT, quality gates (moth-eaten gt_cons, camera-incomplete frames), auto-repair when the provider re-converts and wipes our gt_cons; 734 scenes accepted (round48 = 8,528) |
+| BN-poisoning guard | 07-31 | BN running stats update in FORWARD, so one inf batch poisons eval permanently while training looks fine (r47 lost its E2E metric this way, and the next save would have shipped the poison): snapshot/restore on non-finite loss, periodic `sanitize_bn`, init-time repair |
+| OOM-tolerant diagnostics | 07-31 | probes and epoch-end val free the step's activations first and survive OOM instead of killing a multi-day round; val loaders keep batch>=2 independent of --batch (at batch 1 the capped evals halved coverage and ADEc went nan) |
+| Dataloader robustness | 08-01 | camera-incomplete frames filtered at index build; unreadable-sample fallback is a bounded loop (recursion hit Python's 1000-frame limit and took down the round) |
+| Throughput tuning | 08-01 | measured GPU utilisation 55.9% -> 62-79%: batch 2 (amortises the DDP allreduce, removes the need for SyncBN), workers 4 (validated against the historical shared-memory failure), probes every 1000 steps (they cost ~25% of wall time at 500) |
+| Checkpoint provenance | 08-01 | ckpts record `args` + git hash (r45's had neither, which is why "were the intent flags on?" was unanswerable) |
+| GPU sizing estimate | 07-31 | 1,000 h x 10 epochs: 8 GPUs 92 d / 32 GPUs 23 d / **64 GPUs ~12 d**; 48 GB-class cards required at batch 2 (out/GPU_estimate.pptx) |
 | Recovery-augmentation GT recipe (v45) | 07-27 | departed-viewpoint synthesis + pursuit/record recovery targets (auto fallback, curvature-aware extrapolation, 82% pursuit adoption) — GT demos verified |
 
 ### Planned
 | Item | Target | Detail |
 |---|---|---|
-| r42 = clean-list round | after r41 | round42_scenes.txt (corrupt-GT excluded); carry v44; vehicle-recall recovery gate (veh R ≥ 0.51) |
-| v45 recovery augmentation | r42/r43 | departed-viewpoint perturbation into T_cam_ego + pursuit/record recovery targets (GT recipe done); E2E-only loss on perturbed frames, lateral-accel caps |
-| Perf ablation matrix | GPU-idle windows | docs/perf_analysis_plan.md: 7-cam engine (r41 weights), embedded head-set, INT8 PTQ (E2E head fp16), asymmetric grid 80 m fwd / 40 m back, channel pruning 96→64 |
-| Unknown peak decode | no retrain | connected-components → local-maxima decode; object-level P/R re-measure; fuse with unk2d lift |
+| r48 = reinforcement stage | after r47 + refiner | `--rl-w`: rule-based rewards over the K=3 candidates (drivable area, time-resolved agent collision, comfort, speed-normalised progress, red-light compliance from the v47 TL input) + GRPO-style group-relative policy loss on the mode logits. No critic, no simulator, zero new params; the reward embeds the imitation error so a rule-compliant but absurd candidate cannot win. Scripts armed (chain_r48_start.sh) |
+| Command-binding acceptance | during r47 | `eval_command_binding.py`: B >= 5.0 m spread and > 60% sign reversal, with ADE/ADEc not regressing. If phase 1 falls short, enable phase 2 (`--intent-wrong 0.15`, counterfactual commands with the waypoint target dropped) |
+| Traffic-light input, measured | r48 | the A/B probe shows no seg/E2E effect yet, as expected: the TL input should move TL-state accuracy and red-light stopping behaviour. Needs a dedicated probe (TL accuracy ON vs OFF, E2E on signal-approach frames) and wider label coverage (currently 50% of training scenes) |
+| Pseudo-LiDAR value, measured | after r47 | three-arm A/B on one checkpoint: camera-only / +pseudo raster / +real sweep. Report the geometry gain (PL occupancy IoU is 0.40 and still climbing) against the tasks it is supposed to lift |
+| Perf ablation matrix | GPU-idle windows | docs/perf_analysis_plan.md: 7-cam engine (r41 weights), embedded head-set, INT8 PTQ (r43 quant-noise vs r42 baseline), asymmetric BEV grid (80 m fwd / 40 m back) |
+| Chunked depth-gated projection | perf round | measured: the projection intermediates, not the backbone, dominate the 25 GB peak (grad-ckpt on the backbone only bought 1 GB). Per-camera chunking would free enough for larger batches / higher resolution — touches an exported core function, so it needs its own round |
+| Unknown peak decode | no retrain | connected-components -> local-maxima decode; object-level P/R re-measure; fuse with the unk2d lift |
 | GT re-render for the 148 corrupt scenes | factory idle | hole-filled accumulation at high speed, re-vectorize, re-consensus |
-| Command-following verification | r41 done | forced left/right demos on v44; lateral gap target ≥ 1 m (v43 was 0.2 m) |
-| J6 deployment package | after r41 + matrix | 7-cam export + INT8 engine + guardrail; Orin target |
-
+| J6 deployment package | after matrix | 7-cam export + INT8 engine + guardrail; Orin target |
+| Source-data snapshotting | data ops | the US batch is rewritten in place while we train on symlinks: one re-conversion silently dropped 419 scenes from training and a mid-write read killed a round. Either snapshot on ingest or keep running the validating ingest before every round |
 
 Living list of what we could do next, why, and what it would cost. Nothing
 here is committed work; each entry is sized so it can be picked up
 independently. Ordered within each section by (expected value ÷ risk).
 
-**Baseline to beat** (r39 = v43, held-out recording day):
+**Baseline to beat** (best measured per metric, held-out recording day):
 
-| metric | value |
-|---|---|
-| BEV lane mIoU | 0.334 (record) |
-| 2D seg mIoU (21 cls) | 0.555 |
-| 3D det veh P / R / Rn / yaw / dir-flips | 0.78 / 0.49 / 0.71 / 3.7° / 6% (veh R record = 0.51 @ r36) |
-| 3D det VRU P / R50 / Rn | 0.75 / 0.34 / 0.46 |
-| E2E ADE / ADEc | 0.87 / 0.39 m (ADEc record) |
-| agent ADE / stationary acc | 1.65 m / 0.70 |
-| TL accuracy | 0.84 (red 0.50) |
-| unknown (dense, visibility-filtered GT) | pixel R 0.83; object-level decode pending peak rework |
-| TRT fp16 full graph | 108 ms / 9.3 FPS (L40S), NaN-free |
-| lane graph P / R | 0.01 (unchanged — B1 verdict still open) |
+| metric | value | where |
+|---|---|---|
+| BEV lane mIoU | **0.345** | r44 ep2 (v46, SD-map) |
+| 2D seg mIoU (21 cls) | 0.555 | r39 |
+| 3D det veh P / R / Rn / yaw / dir-flips | 0.78 / 0.51 / 0.71 / 3.7° / 6% | r36-r39 |
+| E2E ADE / **ADEc** / FDE | 0.89 m / **0.31 m** / 1.98 m | r45 (v47) |
+| Stationary flag P / R | **0.85 / 0.85** | r46 (dense supervision; was 0.93/0.61) |
+| TL state accuracy | 0.86 | r22+ |
+| Pseudo-LiDAR occupancy IoU / z MAE | 0.40 / 1.14 m | r47, in progress |
+| Refiner delta (E2E ADE, far stopline) | −4.4% / 0.017→0.040 | r43/r45 refiners |
+| SD-map prior gain (road IoU, intersections >20 m) | +1.0 pt, OFF bit-equal | r45 A/B probe |
+| Corpus | 8,528 scenes (7,795 JP + 734 US) | round48 list |
 
 **Rule of thumb**: every candidate must be checkable with `--val-every`
 (BEV mIoU + 3D det every N steps, ~90 s). A change that cannot be measured

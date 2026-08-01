@@ -21,7 +21,7 @@
 
 <img src="docs/media/inference.gif" width="880" alt="METEOR multi-task inference"/>
 
-*Live inference (v43, round 39) — 8 DRS cameras in, everything out: 2D segmentation,
+*Live inference — 8 DRS cameras in, everything out: 2D segmentation,
 2D & 3D detection with parked/stopped flags, metric depth, BEV lane map, 3D occupancy,
 the ego-relevant traffic-light state, a continuous near-range risk field, multimodal
 end-to-end driving (3 path hypotheses + confidences) under a deterministic guardrail,
@@ -76,6 +76,29 @@ forecasting, flow) read the FUSED temporal BEV — task-routed to keep static ge
 free of moving-object ghosts. The forecasting head additionally reads an explicit
 **motion residual** (current BEV minus the warped t−0.4 s slot) so oncoming traffic
 keeps its true heading.
+
+### Optional inputs — one set of weights, four sensor/prior configurations
+
+Everything optional follows the same contract: **a zero input is bit-identical to
+not having the input at all**, verified by test, so one checkpoint and one engine
+serve every configuration and training uses modality dropout so no mode decays.
+
+| Input | Since | What it is | Measured |
+|---|---|---|---|
+| **LiDAR** (points → sparse depth, and a BEV pillar raster) | v31 / v32 | sharpens the predicted depth where returns exist | +0.004..0.007 mIoU when fed |
+| **SD map** (free OpenStreetMap) | v46 | road area / centreline / intersections / crossings rasterised into the ego frame from per-pose GNSS | **+1.0 pt road IoU beyond 20 m near intersections**; OFF bit-equal |
+| **Traffic-light recognition** (external module) | v47 | per-camera **box-level** lamp states — colour, pedestrian/arrow flag, arrow orientation — painted into a per-camera raster and injected on the image feature via a bias-free zero-init stem | ON/OFF bit-equality proven even after training; task effect still to be measured |
+| **Pseudo-LiDAR** (predicted, not measured) | v48 | the network predicts the LiDAR BEV raster from cameras alone and feeds it back through the *same* optional-LiDAR stem; real sweep > pseudo raster > nothing, per sample | occupancy IoU 0.40, height MAE 1.14 m (r47, climbing) |
+
+The SD-map alignment deserves a warning for anyone reproducing it: the exported
+`geocoordinate` is rounded to ~6 significant digits (≈90 m longitude
+quantisation), so a similarity fit on it silently **shrinks the map by 8-23 %** —
+pin the scale to 1 and refine an SE(2) per scene against the GT road instead. Ours
+anchors on crosswalk blobs (class 3; matching class 7 "marking" pulls the map tens
+of metres backward, because Japanese guide arrows are painted *before* the
+intersection), scores a corridor around the driven path, seeds the rotation
+analytically, and models the residual drift with a robust line. Rasters that still
+fail the road-IoU gate are written as zeros, i.e. prior off.
 
 ### Optional LiDAR input — one set of weights, two sensor configs (v31)
 
@@ -195,6 +218,10 @@ break the camera-to-BEV correspondence. Each camera draws independently
 | Contrast scale | x U(0.8, 1.25) around the mean | weather / lens flare |
 | Pixel noise | Gaussian sigma = 0.012 | sensor noise |
 | LiDAR modality dropout (v31+) | whole-sample, 50 % | one set of weights serves camera-only AND LiDAR-assisted inference |
+| SE(2) lateral-recovery perturbation (v45) | ±1.5 m lateral, 25 % of samples | the ego is placed off-lane and the E2E target becomes a return-to-lane path — recovery behaviour with no real off-lane data |
+| INT8 quantisation noise (v45) | per-channel LSB (amax/127) on the BEV features | post-training-quantisation robustness by construction |
+| **MAE-like BEV DropBlock** (r46) | 2-4 rectangles of 16-40 m, 30 % of samples | GT stays complete, so every head must inpaint the hole from surrounding context and temporal memory |
+| SD-map / traffic-light / pseudo-LiDAR dropout | whole-sample, 50 % each | one checkpoint serves every combination of optional inputs |
 
 Independent per-camera draws double as cross-camera photometric
 inconsistency training. The temporal memory also sees naturally missing
@@ -207,26 +234,35 @@ the previous round was worst at (auto-mined, C2) are oversampled 2x.
 
 ## Results (validation, unseen recording)
 
-| Metric | Value |
-|---|---|
-| BEV lane mIoU | **0.334** |
-| 2D seg mIoU (21 cls) | **0.555** |
-| 3D det vehicles (precision / near-corridor recall) | **0.78 / 0.71** |
-| 3D det yaw (axis error / direction flips) | **3.7° / 6 %** |
-| 3D det VRU (precision / near-corridor recall) | **0.75 / 0.46** |
-| E2E trajectory ADE / ADEc / FDE (3 s) | **0.87 m / 0.39 m / 1.89 m** |
-| Traffic-light state accuracy | **0.84** |
-| Agent forecast ADE (3 s) | **1.65 m** |
+| Metric | Value | Round |
+|---|---|---|
+| BEV lane mIoU | **0.345** | r44 (v46 + SD-map) |
+| 2D seg mIoU (21 cls) | **0.555** | r39 |
+| 3D det vehicles (precision / near-corridor recall) | **0.78 / 0.71** | r39 |
+| 3D det yaw (axis error / direction flips) | **3.7° / 6 %** | r39 |
+| 3D det VRU (precision / near-corridor recall) | **0.75 / 0.46** | r39 |
+| E2E trajectory ADE / **ADEc** / FDE (3 s) | **0.89 m / 0.31 m / 1.98 m** | r45 (v47) |
+| Stationary ("is that car parked?") precision / recall | **0.85 / 0.85** | r46 (was 0.93 / 0.61) |
+| Traffic-light state accuracy | **0.86** | r22+ |
+| Agent forecast ADE (3 s) | **1.65 m** | r39 |
+| Pseudo-LiDAR raster: occupancy IoU / height MAE | **0.40 / 1.14 m** | r47, in progress |
 
-(r39/v43, held-out recording day.) Trained on **9,600+ scenes (~80 driving hours,
-1.25M keyframes) recorded nationwide across Japan**, the list growing continuously as
-the autolabel factory converts more recordings; ~40 rolling rounds so far lifted BEV
-mIoU 0.302→0.334 and curve ADE 0.72→0.39 m with zero human intervention. Trained on
-Japan-only data, the same engine runs **zero-shot on US recordings** (right-hand
-traffic, different vehicles) — the geometric projection does not break when the
-country does. A stock TensorRT fp16 build runs the full graph at **108 ms/frame on
+(Held-out recording day; best measured value per metric, with the round that set it.)
+Trained on **8,500+ scenes (~70 driving hours, 1.2M keyframes)** — nationwide Japan
+plus **734 US scenes** (right-hand traffic) now in the training corpus, the list
+growing as the autolabel factory converts more recordings. ~47 rolling rounds so far
+lifted BEV mIoU 0.302→0.345 and curve ADE 0.72→**0.31 m** with zero human
+intervention. A stock TensorRT fp16 build runs the full graph at **108 ms/frame on
 one L40S** with a device-resident temporal ring (fp16-safe by construction after two
 overflow fixes; see the white paper).
+
+Honest notes on what is *not* settled: the SD-map prior helps exactly where it
+should (**+1.0 pt road IoU beyond 20 m near intersections**) and nowhere else; the
+traffic-light input shows **no** effect on segmentation or planning yet, which is
+expected — its own probe (TL accuracy with the input on vs off) is still to be run;
+and the driving command only moved the planned path by ~1 m before
+[the binding fix](docs/FIX_COMMAND_BINDING.md), whose acceptance criteria
+(≥5 m spread, >60 % sign reversal) are being measured now.
 
 ## Quickstart
 
@@ -287,6 +323,20 @@ fastlabel_2510_instance.csv        # 2D det taxonomy (id, name, colour)
 docs/                  # architecture / data / training / demo docs
 ```
 
+
+Recent additions (optional inputs, evaluation, data ops):
+
+```
+bevlane/extract_sdmap.py        free OSM SD-map -> per-frame ego rasters + sign metadata
+bevlane/osm_pbf_to_tiles.py     Geofabrik .pbf -> local Overpass-JSON tile cache (offline)
+bevlane/extract_tl_boxes.py     dataset lamp annotations -> per-camera box-level TL input
+bevlane/e2e_reward.py           rule-based rewards over the K candidates + GRPO mode loss
+bevlane/eval_command_binding.py does a driving command actually move the path?
+bevlane/probe_optional_inputs.py A/B probe: camera-only vs +SD-map vs +SD-map+TL
+bevlane/ingest_us.py            idempotent ingest of the growing US corpus (with repair)
+bevlane/demo_tl_sign_gt.py      traffic-light state + road-sign GT demo renderer
+val.lst / test.lst              the exact validation (270) and held-out test (171) scenes
+```
 ## Deployment: raw t4dataset → TensorRT, in one command
 
 The whole 12-task network exports to a **single static ONNX graph** (18 outputs,
@@ -336,7 +386,9 @@ without Human Labels or Human-Written Code"** — Dan Umeda.
 | [TRAINING.md](docs/TRAINING.md) | losses, curricula, rolling rounds, operational notes |
 | [DEMO.md](docs/DEMO.md) | demo tooling and video layouts |
 | [DESIGN_v29.md](docs/DESIGN_v29.md) | the v29 design: multimodal K=3, memory queue, lane graph, occupancy flow |
-| [ROADMAP.md](docs/ROADMAP.md) | candidate list for future rounds: known defects, TRT-safe transformer options, capabilities |
+| [ROADMAP.md](docs/ROADMAP.md) | implementation ledger through r47, planned rounds, known defects, TRT-safe transformer options |
+| [FIX_COMMAND_BINDING.md](docs/FIX_COMMAND_BINDING.md) | why the driving command did not move the path, the measurement that proved it, and the fix |
+| [perf_analysis_plan.md](docs/perf_analysis_plan.md) | latency/throughput ablation matrix (7-cam, INT8 PTQ, asymmetric grid, channel pruning) |
 
 ---
 
