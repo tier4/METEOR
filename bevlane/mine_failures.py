@@ -22,9 +22,9 @@ from bevlane.dataset import BevLaneDataset  # noqa: E402
 from bevlane.model import MODELS, make_warp_theta  # noqa: E402
 
 
-def scene_score(m, scene, mode="combo"):
+def scene_score(m, scene, root="out/bevlane", mode="combo", vru_w=1.0):
     try:
-        ds = BevLaneDataset("out/bevlane", [scene], gt_key="gt_vec",
+        ds = BevLaneDataset(root, [scene], gt_key="gt_vec",
                             with_ego=True, with_agenttraj=True,
                             with_temporal=True, temporal_hist=3)
     except Exception:
@@ -64,7 +64,7 @@ def scene_score(m, scene, mode="combo"):
         boxes, nb = b[4], int(b[5])
         dets = m.decode_boxes(out[3].float(), out[4].float(),
                               thresh=0.3, topk=64)[0]
-        miss = hit = 0
+        miss = hit = 0.0
         for k in range(nb):
             cls, xe, ye = (float(boxes[k, 0]), float(boxes[k, 1]),
                            float(boxes[k, 2]))
@@ -72,8 +72,12 @@ def scene_score(m, scene, mode="combo"):
                 continue
             ok = any((d[2] - xe) ** 2 + (d[3] - ye) ** 2 < 4.0
                      for d in dets)
-            hit += ok
-            miss += not ok
+            # VRU misses can be up-weighted (--vru-w): the vru_diag showed the
+            # rear-40 line lost near-field VRU recall and mining is the
+            # training-side lever (decode-threshold calibration is the other)
+            w = vru_w if cls >= 1.5 else 1.0
+            hit += w * ok
+            miss += w * (not ok)
         if hit + miss:
             misses.append(miss / (hit + miss))
     if not ades and not misses:
@@ -88,9 +92,12 @@ def scene_score(m, scene, mode="combo"):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--ckpt", required=True)
+    ap.add_argument("--root", default="out/bevlane")
     ap.add_argument("--model", default="v33")
     ap.add_argument("--list", required=True)
     ap.add_argument("--sample", type=int, default=240)
+    ap.add_argument("--vru-w", type=float, default=1.0,
+                    help="weight on VRU misses in the mining score")
     ap.add_argument("--frac", type=float, default=0.15)
     ap.add_argument("--mode", default="combo", choices=["combo", "e2e"],
                     help="e2e: longitudinal-ADE + tail emphasis (P3)")
@@ -105,15 +112,19 @@ def main():
     sample = scenes[::step][:args.sample]
     scored = []
     for i, s in enumerate(sample):
-        sc = scene_score(m, s, args.mode)
+        sc = scene_score(m, s, root=args.root, mode=args.mode,
+                         vru_w=args.vru_w)
         if sc is not None:
             scored.append((sc, s))
         if i % 40 == 0:
             print(f"{i + 1}/{len(sample)}", flush=True)
     scored.sort(reverse=True)
     n = max(1, int(len(scored) * args.frac))
-    with open("out/mined_scenes.txt", "w") as f:
+    # 学習と並行で回すため、書きかけを読まれないよう原子的に置換する
+    with open("out/mined_scenes.txt.tmp", "w") as f:
         f.write("\n".join(s for _, s in scored[:n]))
+    import os as _os
+    _os.replace("out/mined_scenes.txt.tmp", "out/mined_scenes.txt")
     print(f"mined {n}/{len(scored)} scenes "
           f"(worst score {scored[0][0]:.2f}, cut {scored[n - 1][0]:.2f})",
           flush=True)

@@ -3,7 +3,7 @@
 
 Idempotent: run it again whenever more scenes finish converting and it only
 processes what is new. Steps per new scene:
-  1. symlink  /data1/dataset/bevlane/us_1/out/bevlane/<scene> -> out/bevlane/
+  1. symlink  data/us_1/out/bevlane/<scene> -> out/bevlane/
   2. gt_cons (consensus GT) -- rounds train with --gt-key gt_cons, so a scene
      without it contributes nothing
   3. quality gates, both learned the hard way:
@@ -26,7 +26,7 @@ import numpy as np
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from bevlane.dataset import CAMS                              # noqa: E402
 
-SRC = "/data1/dataset/bevlane/us_1/out"
+SRC = "data/us_1/out"
 OUT = "out/bevlane"
 
 
@@ -34,13 +34,36 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--src", default=SRC)
     ap.add_argument("--workers", type=int, default=24)
+    ap.add_argument("--use-done-list", action="store_true",
+                    help="trust the provider's us_done_scenes.txt "
+                         "instead of scanning the scenes")
     ap.add_argument("--base-list", default="out/round45_scenes.txt")
     ap.add_argument("--round-list", default="out/round48_scenes.txt")
     a = ap.parse_args()
 
-    done_f = os.path.join(a.src, "us_done_scenes.txt")
-    done = [l.strip() for l in open(done_f) if l.strip()]
     src_bev = os.path.join(a.src, "bevlane")
+    if a.use_done_list:
+        done = [l.strip() for l in
+                open(os.path.join(a.src, "us_done_scenes.txt")) if l.strip()]
+    else:
+        # the provider's done-list lags behind the actual conversion (433
+        # listed while 795 scene dirs existed), so judge completeness from
+        # the scene itself: a manifest with enough frames and a readable GT
+        done = []
+        for s_ in sorted(os.listdir(src_bev)):
+            mp = os.path.join(src_bev, s_, "manifest.json")
+            if not os.path.isfile(mp):
+                continue
+            try:
+                man = json.load(open(mp))
+            except Exception:
+                continue
+            fr = man.get("frames", [])
+            if len(fr) < 20:
+                continue
+            g = fr[len(fr) // 2].get("gt")
+            if g and os.path.exists(os.path.join(src_bev, s_, g)):
+                done.append(s_)
     bad_prev = set()
     if os.path.exists("out/us1_bad_scenes.txt"):
         bad_prev = {l.strip() for l in open("out/us1_bad_scenes.txt")
@@ -58,6 +81,34 @@ def main():
         os.symlink(os.path.abspath(sp), dp)
         new.append(s)
     print(f"done-list {len(done)} | newly symlinked {len(new)}", flush=True)
+
+    # ---- 1b. repair scenes the provider re-converted -----------------
+    # The source batch is still being rewritten: a re-conversion replaces
+    # manifest.json and wipes the gt_cons we generated, so previously good
+    # scenes silently drop out of training (419 of 420 did, unnoticed, until
+    # a transient read of a file being rewritten crashed the round).
+    repair = []
+    for s in done:
+        d = os.path.join(OUT, s)
+        if not os.path.isdir(d):
+            continue
+        try:
+            man = json.load(open(os.path.join(d, "manifest.json")))
+        except Exception:
+            continue
+        keys = [f for f in man["frames"] if "gt_cons" in f]
+        if not keys or any(
+                not os.path.exists(os.path.join(d, f["gt_cons"]))
+                for f in keys[:5]):
+            repair.append(s)
+    if repair:
+        print(f"gt_cons missing/stale on {len(repair)} scenes -> regenerating",
+              flush=True)
+        open("out/us_repair.txt", "w").write("\n".join(repair) + "\n")
+        subprocess.run([sys.executable, "bevlane/make_consensus_gt.py",
+                        "--scenes", "out/us_repair.txt",
+                        "--workers", str(a.workers)], check=False)
+    new = sorted(set(new) | set(repair))
 
     # ---- 2. consensus GT for the new ones ---------------------------
     if new:

@@ -83,7 +83,7 @@ def process_scene(args):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--raw-root",
-                    default="/data1/dataset/aisin/converted_valid_delay")
+                    default="data/t4dataset")
     ap.add_argument("--scenes", default=None, help="file or comma list")
     ap.add_argument("--index", default=None,
                     help="scene|rawdir index file (overrides --scenes)")

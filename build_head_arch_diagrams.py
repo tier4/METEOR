@@ -46,7 +46,7 @@ def new_fig(title):
 # ------------------------------------------------- fig 1: geometry heads
 fig, ax = new_fig("Head architectures I — geometry (all consume the RAW "
                   "single-frame BEV or image features)")
-pipeline(ax, 2, 26, "BEV lane decoder", [
+pipeline(ax, 2, 26, "BEV lane seg head", [
     ("RAW BEV 96×800×500", IN),
     ("enc: Conv s2 → 128 @400×250", None),
     ("enc: Conv s2 → 192 @200×125", None),
@@ -81,14 +81,7 @@ pipeline(ax, 126, 27, "Occupancy + flow", [
     ("occ 1×1 → 16z×10c", None),
     ("flow 1×1 → 2ch (from occ feat)", None),
     ("voxels + velocity field", OUT)])
-pipeline(ax, 158, 28, "Lane graph (B1)", [
-    ("RAW BEV detach, ROI crop", IN),
-    ("1×1 96→256 · pool 22×16\n= 352 tokens", None),
-    ("24 query embeddings", None),
-    ("TransformerDecoder ×2\n(self + cross, nhead 4)", None),
-    ("pts Linear→12×2 ·30 m\nmeta Linear→4", None),
-    ("adj pair-MLP 512→128→1", None),
-    ("vector chains + adjacency", OUT)])
+ax.set_xlim(0, 158)   # lane-graph column retired (2026-09-08)
 fig.savefig("docs/media/headarch_geometry.png", bbox_inches="tight",
             facecolor="white")
 

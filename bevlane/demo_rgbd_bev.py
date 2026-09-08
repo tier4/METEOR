@@ -25,7 +25,7 @@ from bevlane.extract_bbox2d import DET10_PAL  # noqa: E402
 from bevlane.demo_occ_gt import cube_render  # noqa: E402
 from bevlane.guardrail import check_path, risk_pick  # noqa: E402
 from bevlane.extract_occ import OCC_PAL  # noqa: E402
-from bevlane.model import make_warp_theta  # noqa: E402
+from bevlane.model import BEV_H, BEV_W, BEV_XR, make_warp_theta  # noqa: E402
 from bevlane.model import (DepthGatedIPMNet, DepthSegIPMNet,  # noqa: E402
                            DepthSegIPMNetS4, DepthSegIPMNetV14,
                            DepthSegIPMNetV15, DepthSegIPMNetV16,
@@ -47,20 +47,12 @@ from bevlane.model import (DepthGatedIPMNet, DepthSegIPMNet,  # noqa: E402
 DET10_ABBR = ["obs", "car", "trk", "bus", "bcy", "mcy", "ped", "pnt", "tl", "ts"]
 
 
-def draw_boxes2d(img, blist, cw, ch):
-    """Per-camera 10-class 2D boxes (cls,score,cx,cy,w,h in 768x432 px)."""
-    sx, sy = cw / 768.0, ch / 432.0
-    for cls, sc, cx, cy, w, h in blist:
-        c = tuple(int(v) for v in DET10_PAL[int(cls)][::-1])   # RGB -> BGR
-        x1, y1 = int((cx - w / 2) * sx), int((cy - h / 2) * sy)
-        x2, y2 = int((cx + w / 2) * sx), int((cy + h / 2) * sy)
-        cv2.rectangle(img, (x1, y1), (x2, y2), c, 2)
-        tag = f"{DET10_ABBR[int(cls)]}{int(sc * 100):d}"
-        (tw, th), _ = cv2.getTextSize(tag, cv2.FONT_HERSHEY_SIMPLEX, 0.38, 1)
-        ty = max(y1, th + 3)
-        cv2.rectangle(img, (x1, ty - th - 3), (x1 + tw + 2, ty + 1), c, -1)
-        cv2.putText(img, tag, (x1 + 1, ty - 2), cv2.FONT_HERSHEY_SIMPLEX,
-                    0.38, (0, 0, 0), 1, cv2.LINE_AA)
+# 描画の実体は deploy/viz_np.py に一本化 (2026-08-24)。かつてローカルと
+# Orin で同じ関数を二重に持っており、Orin 側だけカメラ順や BEV の
+# 前後範囲が食い違っても気づけなかった。出典を 1 つにして再発を断つ。
+from deploy.viz_np import (draw_boxes2d, draw_boxes_on_rgb,  # noqa: E402
+                          draw_path_ribbon)
+
 from bevlane.postproc import crop_bev, draw_ego_and_grid, thin_road_edge  # noqa: E402
 
 # surround order for the 2x3 grids (front row / back row)
@@ -95,57 +87,6 @@ BOX_EDGES = [(0, 1), (1, 2), (2, 3), (3, 0), (4, 5), (5, 6), (6, 7), (7, 4),
              (0, 4), (1, 5), (2, 6), (3, 7)]
 
 
-def draw_boxes_on_rgb(img, det_boxes, K, Tce, cw, ch, W0=768, H0=432):
-    """Project decoded BEV boxes (ego frame) into a camera and draw 3D
-    wireframes with distance labels. Edges are CLIPPED at the camera near
-    plane so nearby vehicles on side cameras are still drawn (partial box)."""
-    sx, sy = cw / W0, ch / H0
-    EPS = 0.25
-
-    def proj(p):
-        return (int((K[0, 0] * p[0] / p[2] + K[0, 2]) * sx),
-                int((K[1, 1] * p[1] / p[2] + K[1, 2]) * sy))
-
-    for cls, sc, xe, ye, l, w, yaw in det_boxes:
-        hgt = 1.6 if cls == 0 else 1.7
-        cb, sb = np.cos(yaw), np.sin(yaw)
-        bot = []
-        for lx, wy in ((l/2, w/2), (l/2, -w/2), (-l/2, -w/2), (-l/2, w/2)):
-            bot.append([xe + lx*cb - wy*sb, ye + lx*sb + wy*cb, 0.0])
-        cors = np.array(bot + [[b[0], b[1], hgt] for b in bot])
-        pc = cors @ Tce[:3, :3].T + Tce[:3, 3]
-        z = pc[:, 2]
-        if (z > EPS).sum() == 0:          # entirely behind the camera
-            continue
-        col = (0, 215, 255) if cls == 0 else (255, 0, 255)
-        vis_pts = []
-        for a, b in BOX_EDGES:
-            pa, pb = pc[a].copy(), pc[b].copy()
-            za, zb = pa[2], pb[2]
-            if za < EPS and zb < EPS:
-                continue
-            if za < EPS or zb < EPS:      # clip the edge at the near plane
-                t = (EPS - za) / (zb - za)
-                pclip = pa + t * (pb - pa)
-                if za < EPS:
-                    pa = pclip
-                else:
-                    pb = pclip
-            A, B = proj(pa), proj(pb)
-            if abs(A[0]) > cw * 8 or abs(B[0]) > cw * 8                     or abs(A[1]) > ch * 8 or abs(B[1]) > ch * 8:
-                continue
-            cv2.line(img, A, B, col, 1, cv2.LINE_AA)
-            vis_pts += [A, B]
-        if vis_pts:
-            us = [p[0] for p in vis_pts]
-            vs = [p[1] for p in vis_pts]
-            if max(us) >= 0 and min(us) < cw and max(vs) >= 0 and min(vs) < ch:
-                dist = float(np.hypot(xe, ye))
-                cv2.putText(img, f"{dist:.0f}m",
-                            (max(0, min(us)), max(12, min(vs) - 4)),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.45, col, 1, cv2.LINE_AA)
-
-
 def pseudo_intent(pose, fi, lo=5, hi=25, lat_th=3.0):
     """Navigation-style pseudo Driving Command from the recorded route.
 
@@ -175,73 +116,129 @@ def pseudo_intent(pose, fi, lo=5, hi=25, lat_th=3.0):
 _RIBBON_STATE = {"wps": None}
 
 
-def draw_path_ribbon(img, ego_pred, K, Tce, cw, ch, W0=768, H0=432,
-                     half_w=0.9, color=(60, 255, 120), alpha=0.38,
-                     reset=False):
-    """Project the predicted trajectory as a vehicle-width ground ribbon
-    (filled, semi-transparent) into a camera image.
+def pl_render(pl, W=420, H=720, half_x=50.0, half_y=25.0,
+              rgb=None, K=None, T=None, z_above=2.2):
+    """Pseudo-LiDAR raster -> an ISOMETRIC 3-D point cloud, painted with the
+    camera colours the points project into.
 
-    Near a stop the ribbon FADES OUT with the predicted travel distance
-    (no hard pop-off), and waypoints are EMA-smoothed across frames."""
-    wps = np.concatenate([[[0.0, 0.0]], ego_pred[:12].reshape(6, 2)], 0)
-    if not np.all(np.isfinite(wps)):
-        # NaN frame (bad odometry upstream): draw nothing but DO NOT touch
-        # the EMA state -- one bad frame must not poison every later frame
-        return
-    if (reset or _RIBBON_STATE["wps"] is None
-            or not np.all(np.isfinite(_RIBBON_STATE["wps"]))):
-        _RIBBON_STATE["wps"] = wps
-    else:
-        _RIBBON_STATE["wps"] = 0.55 * _RIBBON_STATE["wps"] + 0.45 * wps
-    wps = _RIBBON_STATE["wps"].copy()
-    trav = float(np.hypot(*(wps[-1] - wps[0])))
-    # RETRACT instead of fade: the displayed ribbon length shrinks smoothly
-    # with the predicted travel; the tip slides down toward the hood and
-    # finally disappears under it (constant opacity throughout)
-    s = min(max(trav / 3.0, 0.0), 1.0)
-    disp_len = max(trav, 8.0 * s * s * (3 - 2 * s))
-    if disp_len < 0.6:
-        return
-    # densify along the polyline
-    seg = np.linalg.norm(np.diff(wps, axis=0), axis=1)
-    t = np.concatenate([[0], np.cumsum(seg)])
-    if t[-1] < disp_len:                 # extend along the last heading
-        d = wps[-1] - wps[-3]
-        d = d / max(np.linalg.norm(d), 1e-3)
-        wps = np.concatenate([wps, [wps[-1] + d * (disp_len - t[-1])]], 0)
-        seg = np.linalg.norm(np.diff(wps, axis=0), axis=1)
-        t = np.concatenate([[0], np.cumsum(seg)])
-    tt = np.linspace(0, min(t[-1], disp_len), 48)
-    px = np.interp(tt, t, wps[:, 0])
-    py = np.interp(tt, t, wps[:, 1])
-    th = np.arctan2(np.gradient(py), np.gradient(px))
-    lx, ly = px - half_w * np.sin(th), py + half_w * np.cos(th)
-    rx, ry = px + half_w * np.sin(th), py - half_w * np.cos(th)
-    sx, sy = cw / W0, ch / H0
+    A top-down tile hides the very thing a predicted sweep is for (height
+    structure), so the cloud is drawn in the isometric projection the
+    occupancy cube uses. The view auto-fits the tile from the projected
+    extent, so the cloud fills the cell whatever the scene looks like.
+    Cells no camera sees keep a height colour, so nothing disappears."""
+    img = np.zeros((H, W, 3), np.uint8)
+    occ = pl[3] > 0.5
+    rr, cc = np.nonzero(occ)
+    if not len(rr):
+        return img
+    xm = 80.0 - rr * 0.4                        # forward (m)
+    ym = 50.0 - cc * 0.4                        # left (m)
+    k = (np.abs(xm) < half_x) & (np.abs(ym) < half_y)
+    xm, ym, rr, cc = xm[k], ym[k], rr[k], cc[k]
+    if not len(xm):
+        return img
+    zm = np.clip(pl[1][rr, cc], -1.0, 4.0)
+    # Cut at roughly vehicle height. Buildings span the whole 5 m range and,
+    # once the height axis is exaggerated, they lean over the road and hide it.
+    # The ground is found per frame (10th percentile of the occupied cells'
+    # height) so the cut follows slopes instead of assuming z=0.
+    if len(zm) > 20:
+        ground = float(np.percentile(zm, 10))
+        keep_z = zm <= ground + z_above
+        if keep_z.sum() > 20:
+            xm, ym, rr, cc, zm = (xm[keep_z], ym[keep_z], rr[keep_z],
+                                  cc[keep_z], zm[keep_z])
 
-    def proj(xs, ys):
-        pts = np.stack([xs, ys, np.zeros_like(xs)], 1)
-        pc = pts @ Tce[:3, :3].T + Tce[:3, 3]
-        ok = pc[:, 2] > 0.3
-        u = (K[0, 0] * pc[:, 0] / np.maximum(pc[:, 2], 0.3) + K[0, 2]) * sx
-        v = (K[1, 1] * pc[:, 1] / np.maximum(pc[:, 2], 0.3) + K[1, 2]) * sy
-        return np.stack([u, v], 1), ok
+    # ---- colours: camera image where visible, height elsewhere ----
+    # normalise over the KEPT height range: after the vehicle-height cut the
+    # fixed [-1, 4] mapping compresses everything into one shade of blue
+    zlo, zhi = float(zm.min()), float(zm.max())
+    z01 = np.clip((zm - zlo) / max(zhi - zlo, 0.5), 0, 1)
+    hcol = cv2.applyColorMap((z01 * 255).astype(np.uint8),
+                             cv2.COLORMAP_JET).reshape(-1, 3).astype(np.int32)
+    col = hcol.copy()
+    if rgb is not None and K is not None and T is not None:
+        pts = np.stack([xm, ym, zm, np.ones_like(xm)], 1)
+        painted = np.zeros(len(xm), bool)
+        for ci, im_c in enumerate(rgb):
+            if im_c is None or painted.all():
+                continue
+            pc = (T[ci] @ pts.T).T
+            zc = pc[:, 2]
+            good = (~painted) & (zc > 0.5)
+            if not good.any():
+                continue
+            u = K[ci][0, 0] * pc[:, 0] / np.maximum(zc, 1e-3) + K[ci][0, 2]
+            v = K[ci][1, 1] * pc[:, 1] / np.maximum(zc, 1e-3) + K[ci][1, 2]
+            hI, wI = im_c.shape[:2]
+            uu = (u / 768.0 * wI).astype(np.int32)
+            vv = (v / 432.0 * hI).astype(np.int32)
+            good &= (uu >= 0) & (uu < wI) & (vv >= 0) & (vv < hI)
+            if not good.any():
+                continue
+            col[good] = im_c[vv[good], uu[good]].astype(np.int32)
+            painted |= good
+        # Pure image colour washed the cloud out to grey at this size, so keep
+        # a quarter of the height colour as a depth cue and lift a little.
+        col[painted] = np.clip(col[painted] * 0.9 + hcol[painted] * 0.25 + 12,
+                               0, 255)
 
-    L, okl = proj(lx, ly)
-    R, okr = proj(rx, ry)
-    ok = okl & okr
-    if ok.sum() < 3:
-        return
-    L, R = L[ok], R[ok]
-    poly = np.concatenate([L, R[::-1]], 0).astype(np.int32)
-    poly[:, 0] = np.clip(poly[:, 0], -cw, 2 * cw)
-    poly[:, 1] = np.clip(poly[:, 1], -ch, 2 * ch)
-    ov = img.copy()
-    cv2.fillPoly(ov, [poly.reshape(-1, 1, 2)], color)
-    cv2.polylines(ov, [L.astype(np.int32).reshape(-1, 1, 2)], False, color, 2)
-    cv2.polylines(ov, [R[::-1].astype(np.int32).reshape(-1, 1, 2)], False,
-                  color, 2)
-    img[:] = cv2.addWeighted(img, 1 - alpha, ov, alpha, 0)
+    # ---- isometric coordinates, SAME viewpoint as the OCC cube render ----
+    # cube_render() uses u ~ (col - row), v ~ (col + row) - z, and with
+    # row ~ -x, col ~ -y that is u ~ +x - y, v ~ -(x + y) - z. This renderer
+    # had u ~ y - x and v ~ +(x + y): inverted on BOTH axes, so the cloud faced
+    # the opposite way from the voxels next to it. Its height exaggeration was
+    # also 7.1 per metre against OCC's 2.09; matched here.
+    HEX = 0.28 * 2.09
+
+    def iso(x, y, z):
+        return (x - y) * 0.5, -(y + x) * 0.28 - (z + 1.0) * HEX
+
+    iu, iv = iso(xm, ym, zm)
+    gx = np.arange(-half_x, half_x + 0.1, 10.0)
+    gy = np.arange(-half_y, half_y + 0.1, 10.0)
+    # Fit the CLOUD, not the grid: a predicted sweep reaches far less far than
+    # the +-50 m grid, and fitting the grid shrank it to a third of the cell.
+    # The grid is simply clipped by cv2.line where it leaves the tile.
+    u0, u1 = iu.min(), iu.max()
+    v0_, v1 = iv.min(), iv.max()
+    sc = min(W * 0.92 / max(u1 - u0, 8.0), H * 0.92 / max(v1 - v0_, 8.0))
+    ox = W * 0.5 - 0.5 * (u0 + u1) * sc
+    oy = H * 0.5 - 0.5 * (v0_ + v1) * sc
+
+    def to_px(u, v):
+        return (u * sc + ox).astype(np.int32), (v * sc + oy).astype(np.int32)
+
+    # ---- ground grid every 10 m ----
+    for x_ in gx:
+        a_u, a_v = iso(np.array([x_, x_]), np.array([-half_y, half_y]),
+                       np.array([-1.0, -1.0]))
+        p = to_px(a_u, a_v)
+        cv2.line(img, (int(p[0][0]), int(p[1][0])),
+                 (int(p[0][1]), int(p[1][1])), (55, 55, 55), 1, cv2.LINE_AA)
+    for y_ in gy:
+        a_u, a_v = iso(np.array([-half_x, half_x]), np.array([y_, y_]),
+                       np.array([-1.0, -1.0]))
+        p = to_px(a_u, a_v)
+        cv2.line(img, (int(p[0][0]), int(p[1][0])),
+                 (int(p[0][1]), int(p[1][1])), (55, 55, 55), 1, cv2.LINE_AA)
+
+    # ---- points, painter's order far -> near ----
+    px, py = to_px(iu, iv)
+    inb = (px >= 0) & (px < W) & (py >= 0) & (py < H)
+    order = np.argsort(-(xm + ym))          # far (large x+y) drawn first
+    rad = np.where(xm < 15, 2, 1)
+    if sc > 6.0:                              # zoomed in: fatter points
+        rad = rad + 1
+    for i in order:
+        if inb[i]:
+            cv2.circle(img, (int(px[i]), int(py[i])), int(rad[i]),
+                       tuple(int(t) for t in col[i]), -1)
+    eu, ev = iso(np.zeros(1), np.zeros(1), np.zeros(1))
+    ep = to_px(eu, ev)
+    cv2.drawMarker(img, (int(ep[0][0]), int(ep[1][0])), (255, 255, 255),
+                   cv2.MARKER_TRIANGLE_UP, 14, 2)
+    return img
 
 
 def label(img, txt, color=(255, 255, 255)):
@@ -255,11 +252,13 @@ _SEGACC = {}
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--ckpt", default="out/bevlane_ckpt_v12/best.pt")
-    ap.add_argument("--scenes", nargs="+", required=True)
+    ap.add_argument("--scenes", nargs="+", default=[])
     ap.add_argument("--out", default="out/demo_rgbd_bev.mp4")
     ap.add_argument("--fps", type=int, default=15)
     ap.add_argument("--zero-cams", default="",
                     help="comma-separated cameras to disable (J6 7-cam demo)")
+    ap.add_argument("--show-pl", action="store_true",
+                    help="v48: draw the PREDICTED (pseudo) LiDAR raster into the BEV panel, height-coloured like a real sweep")
     ap.add_argument("--pseudo-lidar", action="store_true",
                     help="v48: feed the predicted (pseudo) LiDAR "
                          "raster back in (inference ON/OFF switch)")
@@ -274,16 +273,47 @@ def main():
                     help="pseudo Driving Command into the v37+ intent input: "
                          "auto = navigation-style, derived from the RECORDED "
                          "route 1-5 s ahead (command fires BEFORE the turn)")
+    ap.add_argument("--int8-sim", action="store_true",
+                    help="PyTorch 内で INT8 相当 (重み per-channel + 活性 "
+                         "静的較正) を再現して推論する。TensorRT の INT8 で"
+                         "ego が凍結する件の切り分け用 (2026-08-22)")
+    ap.add_argument("--int8-pct", type=float, default=99.9,
+                    help="int8-sim の活性 scale パーセンタイル")
     ap.add_argument("--no-thin", action="store_true")
     ap.add_argument("--seg-fuse", action="store_true",
                     help="ego-warped log-odds fusion of BEV seg over time "
                          "(<=45 m; measured: stability .83->.93, "
                          "crosswalk 20-40m +.06)")
+    ap.add_argument("--trt-engine", default=None,
+                    help="run inference with a TensorRT engine instead of "
+                         "PyTorch. The engine must expose raw_bev so the "
+                         "temporal queue can be maintained from its output")
+    ap.add_argument("--frustum-lift", action="store_true",
+                    help="gather BEV cells per camera before sampling: the "
+                         "same computation (fp32-exact) with 77%% of the work "
+                         "removed. Inference only, no retraining")
+    ap.add_argument("--root", default="out/bevlane",
+                    help="dataset root: <root>/<scene>/{manifest.json,img,...}")
+    ap.add_argument("--frame-stride", type=int, default=1,
+                    help="render every Nth frame (the temporal queue still "
+                         "sees every frame, only writing is thinned)")
+    ap.add_argument("--scenes-file", default=None,
+                    help="newline-separated scene list, appended to --scenes")
+    ap.add_argument("--shard", default=None,
+                    help="i/n: render only shard i of n scenes (parallel GPUs)")
+    ap.add_argument("--refine-heads", default=None,
+                    help="comma list of refiner heads to APPLY, overriding the "
+                         "acceptance gate stored in the ckpt "
+                         "(e.g. e2e,stat,pl,box)")
     ap.add_argument("--refiner-ckpt", default=None,
                     help="apply a trained BEVSegRefiner to the BEV-seg logits "
                          "(far-range completion; measured road 40-80m +.14)")
-    ap.add_argument("--model", default="v8", choices=["v8", "v13", "v13d", "v14d", "v15", "v16", "v17", "v18", "v19", "v20", "v21", "v22", "v23", "v24", "v25", "v26", "v27", "v28", "v29", "v30", "v31", "v32", "v33", "v34", "v35", "v36", "v37", "v38", "v39", "v40", "v41", "v42", "v43", "v44", "v45", "v46", "v47", "v48"],
+    ap.add_argument("--model", default="v8", choices=["v8", "v13", "v13d", "v14d", "v15", "v16", "v17", "v18", "v19", "v20", "v21", "v22", "v23", "v24", "v25", "v26", "v27", "v28", "v29", "v30", "v31", "v32", "v33", "v34", "v35", "v36", "v37", "v38", "v39", "v40", "v41", "v42", "v43", "v44", "v45", "v46", "v47", "v48", "v49", "v50", "v51", "v52", "v53", "v54", "v55", "v56", "v63b"],
                     help="v8=DepthGatedIPMNet(512) / v13=DepthSegIPMNet(768) / v13d=stride-4 depth")
+    ap.add_argument("--thin-bias", type=float, default=0.5,
+                    help="subtract this from the laneline/stopline/road_edge "
+                         "logits before the argmax. 0 restores the raw "
+                         "(over-thick) output; 0.5 is the measured optimum")
     ap.add_argument("--show-seg2d", action="store_true",
                     help="alpha-blend predicted 2D seg over RGB panels")
     ap.add_argument("--thresh2d", type=float, default=0.25,
@@ -294,6 +324,11 @@ def main():
     ap.add_argument("--guard", action="store_true",
                     help="L1 safety guardrails: spacetime collision / red "
                     "light / feasibility / drivable checks on the E2E path")
+    ap.add_argument("--lidar-bev", action="store_true",
+                    help="feed the per-frame LiDAR pillar raster "
+                         "(v32+ optional input)")
+    ap.add_argument("--sdmap", action="store_true",
+                    help="feed the OSM SD-map prior (v46+ optional input)")
     ap.add_argument("--lidar", action="store_true",
                     help="v31: feed the per-frame LiDAR sparse depth "
                     "(depth_gt4) as the optional input; omit = camera-only")
@@ -301,6 +336,15 @@ def main():
                     help="resize images to HxW for the model. default: 288x512 for "
                          "v8, none (native 768) for v13. 'none' = use cache res")
     args = ap.parse_args()
+    if args.scenes_file:
+        args.scenes = list(args.scenes) + [l.strip() for l in
+                                           open(args.scenes_file) if l.strip()]
+    if args.shard:
+        _i, _n = (int(x) for x in args.shard.split("/"))
+        args.scenes = args.scenes[_i::_n]
+        print(f"[shard] {_i}/{_n}: {len(args.scenes)} scenes", flush=True)
+    if not args.scenes:
+        ap.error("no scenes: pass --scenes and/or --scenes-file")
 
     mcls = {"v13": DepthSegIPMNet, "v13d": DepthSegIPMNetS4,
             "v14d": DepthSegIPMNetV14, "v15": DepthSegIPMNetV15,
@@ -329,7 +373,7 @@ def main():
             "v39": DepthSegIPMNetV39,
             "v40": DepthSegIPMNetV40, "v41": DepthSegIPMNetV41, "v42": DepthSegIPMNetV42, "v43": DepthSegIPMNetV43, "v44": DepthSegIPMNetV44}.get(args.model) or __import__("bevlane.model", fromlist=["MODELS"]).MODELS[args.model]
     mkw = {"n_seg": args.n_seg2d} if args.model in (
-        "v13", "v13d", "v14d", "v15", "v16", "v17", "v18", "v19", "v20", "v21", "v22", "v23", "v25", "v26", "v27", "v28", "v29", "v30", "v31", "v32", "v33", "v34", "v35", "v36", "v37", "v38", "v39", "v40", "v41", "v42", "v43", "v44", "v45", "v46", "v47", "v48") else {}
+        "v13", "v13d", "v14d", "v15", "v16", "v17", "v18", "v19", "v20", "v21", "v22", "v23", "v25", "v26", "v27", "v28", "v29", "v30", "v31", "v32", "v33", "v34", "v35", "v36", "v37", "v38", "v39", "v40", "v41", "v42", "v43", "v44", "v45", "v46", "v47", "v48", "v49", "v51", "v52", "v53", "v54", "v55", "v56", "v63b") else {}
     m = mcls(**mkw).cuda().eval()
     if args.pseudo_lidar:
         m.pl_feed = True
@@ -341,7 +385,86 @@ def main():
         from bevlane.extract_seg2d import SEG21_PAL
         SEG2D_PAL[:] = 0
         SEG2D_PAL[:21] = SEG21_PAL[:, ::-1]
-    m.load_state_dict(torch.load(args.ckpt, map_location="cpu")["model"])
+    _sd = {k.replace("module.", ""): v for k, v in
+           torch.load(args.ckpt, map_location="cpu")["model"].items()}
+    if any(k.startswith("lane_branch.") for k in _sd):
+        from bevlane.model import enable_lane_branch
+        enable_lane_branch(m)
+    if any(k.startswith("paint_proj.") for k in _sd):
+        # PointPainting ckpt: 射影を有効化してから読み込む
+        _ck_args = torch.load(args.ckpt, map_location="cpu").get("args") or {}
+        _pc = _ck_args.get("paint_seg") or "2,3,4,5,6,7"
+        m.enable_paint_seg([int(x) for x in str(_pc).split(",")])
+        print(f"[paint-seg] classes={_pc}", flush=True)
+    if any(k.startswith("delta_stat.") for k in _sd):
+        from bevlane.model import enable_delta_stat
+        enable_delta_stat(m)
+        print("[delta-stat] 時間差分 stat ヘッドを有効化", flush=True)
+    if "depth_head.0.0.weight" in _sd and hasattr(m, "depth_head"):
+        _wck = tuple(_sd[f"depth_head.{i}.0.weight"].shape[0]
+                     for i in range(4)
+                     if f"depth_head.{i}.0.weight" in _sd)
+        _wcur = tuple(m[0].out_channels for m in m.depth_head[:-1])
+        if len(_wck) == 4 and _wck != _wcur:
+            from bevlane.model import enable_depth_slim
+            enable_depth_slim(m, widths=_wck)
+            print(f"[depth-slim] 幅 {_wck} を検出", flush=True)
+    if any(k.startswith("sem_ego.") for k in _sd):
+        from bevlane.model import enable_semantic_ego
+        enable_semantic_ego(m)
+        print("[semantic-ego] 意味読み ego 残差を有効化", flush=True)
+    if any(k.startswith("lane_sdf.") for k in _sd):
+        # v120c 系: レーン符号付き距離の補助ヘッド (推論では未使用の学習補助)
+        from bevlane.model import enable_lane_sdf
+        enable_lane_sdf(m)
+        print("[lane-sdf] 補助ヘッドを有効化", flush=True)
+    if any(k.startswith("stat_head2.proj.") for k in _sd):
+        # v119/v120 系: 停止判定ヘッドが学習時から有界形 (INT8 対策)
+        from bevlane.model import enable_quant_stat_head
+        enable_quant_stat_head(m, 8.0)
+        print("[stat] 有界 stat ヘッド (学習済み) を有効化", flush=True)
+    m.load_state_dict(_sd)
+    if args.int8_sim:
+        # TensorRT の INT8 と同じ方式 (重み per-channel + 活性静的較正) を
+        # PyTorch 上で再現する。probe_int8_sim.py と同一の実装。
+        _QMAX = 127
+        _SC = {}
+        _COL = {"on": True}
+        with torch.no_grad():
+            for _n, _mod in m.named_modules():
+                if isinstance(_mod, (torch.nn.Conv2d, torch.nn.Linear)):
+                    _w = _mod.weight.data
+                    _d = tuple(range(1, _w.dim()))
+                    _s = (_w.abs().amax(dim=_d, keepdim=True)
+                          / _QMAX).clamp_min(1e-12)
+                    _mod.weight.data = torch.round(_w / _s).clamp(
+                        -_QMAX, _QMAX) * _s
+
+        def _fq(mod, inp, out):
+            if not torch.is_tensor(out) or not out.is_floating_point():
+                return out
+            k = id(mod)
+            if _COL["on"]:
+                v = out.detach().abs().flatten().float()
+                if args.int8_pct >= 100.0:
+                    mx = float(v.amax())
+                else:
+                    kk = max(1, int(v.numel() * args.int8_pct / 100.0))
+                    mx = float(v.kthvalue(kk).values)
+                _SC[k] = max(_SC.get(k, 0.0), mx)
+                return out
+            mx = _SC.get(k, 0.0)
+            if mx <= 0:
+                return out
+            sc = mx / _QMAX
+            return torch.round(out / sc).clamp(-_QMAX, _QMAX) * sc
+
+        for _n, _mod in m.named_modules():
+            if isinstance(_mod, (torch.nn.Conv2d, torch.nn.Linear)):
+                _mod.register_forward_hook(_fq)
+        m._int8_collect = _COL
+        print(f"[int8-sim] 重み per-channel INT8 + 活性 pct={args.int8_pct} "
+              f"(最初の数フレームで較正)", flush=True)
     refiner = None
     if args.refiner_ckpt:
         from bevlane.model import (BEVSegRefiner, MultiTaskRefiner,  # noqa
@@ -355,6 +478,11 @@ def main():
                 do_seg="seg" in heads, do_box="box" in heads,
                 do_e2e="e2e" in heads, do_traj="traj" in heads,
                 do_risk="risk" in heads, do_unk="unk" in heads,
+                do_stat="stat" in heads, do_pl="pl" in heads,
+                do_depth="depth" in heads, do_seg2d="seg2d" in heads,
+                do_det2d="det2d_hm" in heads, do_occ="occ" in heads,
+                do_tl="tl" in heads, do_flow="flow" in heads,
+                do_lg="lg_pts" in heads, n_seg2d=args.n_seg2d,
                 n_cls=N_CLASSES,
                 seg_width=ra.get("width", 48), seg_ctx=ra.get("ctx", 0),
                 ego_dim=12 * EGO_K + EGO_K + 3).cuda().eval()
@@ -366,10 +494,95 @@ def main():
             refiner.load_state_dict(sd)
             refiner._multi = False
         refiner._ctx = ra.get("ctx", 0)
+        # Per-head acceptance gate. The refiner improves E2E/stationary/PL but
+        # MEASURABLY hurts val BEV seg (r47: road 40-80m 0.474->0.420,
+        # stopline 0-20m 0.251->0.208; r45's 6-head refiner did the same), and
+        # BEV seg must never regress. train_refiner now stores which heads
+        # actually won; anything listed False is loaded but not applied.
+        acc = dict(ck.get("accept") or {})
+        if args.refine_heads:
+            want = set(args.refine_heads.split(","))
+            acc = {k: (k in want) for k in
+                   ("seg", "box", "e2e", "stat", "pl", "unk")}
+        # NO per-class logit mixing. It was tried and is measurably WRONG:
+        # the refiner learns `refined = raw + residual` across ALL channels at
+        # once, so swapping a single channel into an otherwise-raw logit field
+        # leaves that class systematically below its untouched competitors and
+        # the argmax stops choosing it. Measured on 60 val frames with r48's
+        # laneline-only gate: laneline IoU 0.125 -> 0.0045 and predicted
+        # laneline pixels 0.134 % -> 0.0013 %, while road and road_edge were
+        # untouched -- exactly the "road is clean, lanes are gone" report.
+        # The seg head is therefore applied whole or not at all; `seg_classes`
+        # stays in the ckpt as diagnostics only.
+        refiner._segc = None
+        refiner._acc = acc
+        off = sorted(k for k, v in acc.items() if not v)
         print(f"[refiner] loaded {args.refiner_ckpt} multi={refiner._multi} "
-              f"heads={sorted(heads)} epoch={ck.get('epoch')}", flush=True)
+              f"heads={sorted(heads)} epoch={ck.get('epoch')}"
+              + (f" NOT-APPLIED={off} (measured worse)" if off else ""),
+              flush=True)
+    if args.frustum_lift:
+        m.frustum_lift = True
+        print("[lift] frustum-restricted projection ON", flush=True)
+    trt_run = None
+    if args.trt_engine:
+        # The PyTorch model stays loaded: the demo uses its decode helpers
+        # (decode_boxes, pl_activate, D/D_STEP) which hold no weights, while
+        # every forward comes from the engine.
+        import tensorrt as trt_mod
+        _rt = trt_mod.Runtime(trt_mod.Logger(trt_mod.Logger.ERROR))
+        _rt.engine_host_code_allowed = True
+        _eng = _rt.deserialize_cuda_engine(open(args.trt_engine, "rb").read())
+        _ctx = _eng.create_execution_context()
+        _buf, _order = {}, []
+        for _i in range(_eng.num_io_tensors):
+            _n = _eng.get_tensor_name(_i)
+            _shp = tuple(_eng.get_tensor_shape(_n))
+            _dt = {"DataType.FLOAT": torch.float32,
+                   "DataType.HALF": torch.float16,
+                   "DataType.INT32": torch.int32,
+                   "DataType.INT8": torch.int8}[str(_eng.get_tensor_dtype(_n))]
+            _t = torch.zeros(*_shp, dtype=_dt, device="cuda")
+            _buf[_n] = _t
+            _ctx.set_tensor_address(_n, int(_t.data_ptr()))
+            if _eng.get_tensor_mode(_n) == trt_mod.TensorIOMode.OUTPUT:
+                _order.append(_n)
+        _stream = torch.cuda.Stream()
+        _zlg = (torch.zeros(1, 24, 12, 2, device="cuda"),
+                torch.zeros(1, 24, 4, device="cuda"),
+                torch.full((1, 24, 24), -20.0, device="cuda"))
+        if "lg_pts" not in _buf:
+            print("[trt] engine has no lane-graph outputs (pruned)",
+                  flush=True)
+        print(f"[trt] {args.trt_engine} loaded, {len(_order)} outputs",
+              flush=True)
+
+        def trt_run(imgs_, K_, T_, v0_, pb_, th_):
+            for k, nm in (("imgs", "imgs"), ("K", "K"), ("T", "T_cam_ego"),
+                          ("v0", "v0"), ("hist_bev", "hist_bev"),
+                          ("hist_theta", "hist_theta")):
+                src = {"imgs": imgs_, "K": K_, "T": T_, "v0": v0_,
+                       "hist_bev": pb_, "hist_theta": th_}[k]
+                if nm in _buf and src is not None:
+                    _buf[nm].copy_(src.to(_buf[nm].dtype))
+            _ctx.execute_async_v3(_stream.cuda_stream)
+            _stream.synchronize()
+            g = _buf
+            # rebuild the tuple the renderer expects (multi-scale 2D heads are
+            # three separate engine outputs)
+            return (g["lane"], g["depth"], g["seg2d"], g["hm"], g["reg"],
+                    (g["hm2d_s0"], g["hm2d_s1"], g["hm2d_s2"]),
+                    (g["reg2d_s0"], g["reg2d_s1"], g["reg2d_s2"]),
+                    g["ego"], g["occ"], g["traj"], g["stationary"], g["tl"],
+                    g["risk"], g["flow"],
+                    # a lane-graph-free engine still has to fill the slots the
+                    # renderer indexes; zeros decode to nothing drawn
+                    g.get("lg_pts", _zlg[0]), g.get("lg_meta", _zlg[1]),
+                    g.get("lg_adj", _zlg[2]),
+                    g["unk"], g["pl"], g["raw_bev"])
+
     dbins = torch.arange(m.D) * m.D_STEP + m.D_MIN
-    infer_hw = args.infer_hw or ("none" if args.model in ("v13", "v13d", "v14d", "v15", "v16", "v17", "v18", "v19", "v20", "v21", "v22", "v23", "v25", "v26", "v27", "v28", "v29", "v30", "v31", "v32", "v33", "v34", "v35", "v36", "v37", "v38", "v39", "v40", "v41", "v42", "v43", "v44", "v45", "v46", "v47", "v48") else "288x512")
+    infer_hw = args.infer_hw or ("none" if args.model in ("v13", "v13d", "v14d", "v15", "v16", "v17", "v18", "v19", "v20", "v21", "v22", "v23", "v25", "v26", "v27", "v28", "v29", "v30", "v31", "v32", "v33", "v34", "v35", "v36", "v37", "v38", "v39", "v40", "v41", "v42", "v43", "v44", "v45", "v46", "v47", "v48", "v49", "v51", "v52", "v53", "v54", "v55", "v56", "v63b") else "288x512")
     ih, iw = (None, None) if infer_hw == "none" else \
         (int(infer_hw.split("x")[0]), int(infer_hw.split("x")[1]))
 
@@ -386,9 +599,17 @@ def main():
     vw = cv2.VideoWriter(raw, cv2.VideoWriter_fourcc(*"mp4v"), args.fps, (VW, VH))
     n = 0
     for scene in args.scenes:
-        if not os.path.exists(f"out/bevlane/{scene}/manifest.json"):
+        if not os.path.exists(f"{args.root}/{scene}/manifest.json"):
             continue
-        ds = BevLaneDataset("out/bevlane", [scene], gt_key="gt_vec", with_depth=False)
+        ds = BevLaneDataset(args.root, [scene], gt_key="gt_vec", with_depth=False)
+        # A camera the RECORDING does not have is treated exactly like one
+        # zeroed by --zero-cams: blank tile, and the freed depth cell taken
+        # over by the OCC render. x2gen2 is a 7-camera rig (no
+        # CAM_BACK_NARROW) and the dataset already feeds zeros there.
+        blank = set(args.zero_cams.split(",")) if args.zero_cams else set()
+        blank |= {CAMS[i] for i in ds.absent.get(scene, ())}
+        if blank:
+            print(f"[cams] blank: {sorted(blank)}", flush=True)
         for i in range(len(ds)):
             imgs, K, T, _ = ds[i]
             # run the model at its training resolution (avoid OOD instability
@@ -404,20 +625,20 @@ def main():
                 imgs_m = imgs
             s_pre, f_pre = ds.items[i]
             v0_t = None
-            if args.model in ("v18", "v19", "v20", "v21", "v22", "v23", "v25", "v26", "v27", "v28", "v29", "v30", "v31", "v32", "v33", "v34", "v35", "v36", "v37", "v38", "v39", "v40", "v41", "v42", "v43", "v44", "v45", "v46", "v47", "v48"):  # v0
+            if args.model in ("v18", "v19", "v20", "v21", "v22", "v23", "v25", "v26", "v27", "v28", "v29", "v30", "v31", "v32", "v33", "v34", "v35", "v36", "v37", "v38", "v39", "v40", "v41", "v42", "v43", "v44", "v45", "v46", "v47", "v48", "v49", "v51", "v52", "v53", "v54", "v55", "v56", "v63b"):  # v0
                 try:
-                    z = np.load(os.path.join("out/bevlane", s_pre,
+                    z = np.load(os.path.join(args.root, s_pre,
                                              "ego_motion.npz"))
                     v0_t = torch.tensor([float(z["v0"][f_pre["frame"]])])
                 except Exception:
                     v0_t = torch.zeros(1)
             pb = th = None
-            if args.model in ("v22", "v23", "v25", "v26", "v27", "v28", "v29", "v30", "v31", "v32", "v33", "v34", "v35", "v36", "v37", "v38", "v39", "v40", "v41", "v42", "v43", "v44", "v45", "v46", "v47", "v48"):
+            if args.model in ("v22", "v23", "v25", "v26", "v27", "v28", "v29", "v30", "v31", "v32", "v33", "v34", "v35", "v36", "v37", "v38", "v39", "v40", "v41", "v42", "v43", "v44", "v45", "v46", "v47", "v48", "v49", "v51", "v52", "v53", "v54", "v55", "v56", "v63b"):
                 fi_cur = f_pre["frame"]
                 if _BEVQ.get("scene") != s_pre:
                     _BEVQ.clear(); _BEVQ["scene"] = s_pre
                 try:
-                    zp = np.load(os.path.join("out/bevlane", s_pre,
+                    zp = np.load(os.path.join(args.root, s_pre,
                                               "ego_motion.npz"))["pose"]
                     pc_ = zp[fi_cur]
 
@@ -432,7 +653,7 @@ def main():
                                               -sp * (pc_[0] - pp_[0])
                                               + cp * (pc_[1] - pp_[1]), dy]],
                                             dtype=torch.float32).cuda()
-                    if args.model in ("v29", "v30", "v31", "v32", "v33", "v34", "v35", "v36", "v37", "v38", "v39", "v40", "v41", "v42", "v43", "v44", "v45", "v46", "v47", "v48"):  # 3-slot queue
+                    if args.model in ("v29", "v30", "v31", "v32", "v33", "v34", "v35", "v36", "v37", "v38", "v39", "v40", "v41", "v42", "v43", "v44", "v45", "v46", "v47", "v48", "v49", "v51", "v52", "v53", "v54", "v55", "v56", "v63b"):  # 3-slot queue
                         pbs, ths = [], []
                         for off in (2, 6, 14):
                             hb = _BEVQ.get(fi_cur - off)
@@ -440,7 +661,7 @@ def main():
                                 else None
                             if hb is None or rl is None:
                                 pbs.append(torch.zeros(
-                                    1, 96, 800, 500, device="cuda"))
+                                    1, 96, BEV_H, BEV_W, device="cuda"))
                                 ths.append(make_warp_theta(torch.zeros(
                                     1, 3, device="cuda")))
                             else:
@@ -456,9 +677,30 @@ def main():
                 except Exception:
                     pass
             lid_kw = {}
+            # v32+ take the LiDAR pillar raster and the OSM SD-map prior as
+            # OPTIONAL inputs: feeding zeros is bit-identical to not having
+            # them, which is how the camera-only path stays honest. The demo
+            # never passed either, so every video so far has been camera-only
+            # even on scenes that have both on disk.
+            if args.lidar_bev and f_pre.get("lidar_bev"):
+                try:
+                    lb = np.load(os.path.join(args.root, s_pre,
+                                              f_pre["lidar_bev"]))["lb"]
+                    lid_kw["lidar_bev"] = torch.from_numpy(
+                        lb.astype(np.float32))[None].cuda()
+                except Exception as e:
+                    print(f"[lidar_bev] {type(e).__name__}", flush=True)
+            if args.sdmap and f_pre.get("sdmap"):
+                try:
+                    sd = np.load(os.path.join(args.root, s_pre,
+                                              f_pre["sdmap"]))["sd"]
+                    lid_kw["sdmap"] = torch.from_numpy(
+                        sd.astype(np.float32))[None].cuda()
+                except Exception as e:
+                    print(f"[sdmap] {type(e).__name__}", flush=True)
             if args.lidar and args.model == "v31" and f_pre.get("depth4"):
                 try:
-                    dz = np.load(os.path.join("out/bevlane", s_pre,
+                    dz = np.load(os.path.join(args.root, s_pre,
                                               f_pre["depth4"])
                                  )["depth"].astype(np.float32)
                     lt = torch.zeros(1, len(CAMS), dz.shape[1], dz.shape[2])
@@ -469,10 +711,10 @@ def main():
             # pseudo Driving Command (v37+ intent input)
             intent_lab = None
             if args.intent != "none" and args.model in (
-                    "v37", "v38", "v39", "v40", "v41", "v42", "v43", "v44", "v45", "v46", "v47", "v48"):
+                    "v37", "v38", "v39", "v40", "v41", "v42", "v43", "v44", "v45", "v46", "v47", "v48", "v49", "v51", "v52", "v53", "v54", "v55", "v56", "v63b"):
                 if args.intent == "auto":
                     try:
-                        pz = np.load(os.path.join("out/bevlane", s_pre,
+                        pz = np.load(os.path.join(args.root, s_pre,
                                                   "ego_motion.npz"))["pose"]
                         oh, intent_lab = pseudo_intent(pz, f_pre["frame"])
                     except Exception:
@@ -482,14 +724,33 @@ def main():
                     oh = np.zeros(3, np.float32); oh[idx] = 1.0
                     intent_lab = args.intent.upper()
                 lid_kw["intent"] = torch.from_numpy(oh)[None].cuda()
+            if getattr(m, "_int8_collect", None) is not None \
+                    and m._int8_collect["on"]:
+                # 較正フェーズ: 最初の 8 フレームで活性 scale を集め、
+                # その後は固定 scale で量子化する (TensorRT と同じ流れ)
+                m._int8_collect.setdefault("n", 0)
+                m._int8_collect["n"] += 1
+                if m._int8_collect["n"] > 8:
+                    m._int8_collect["on"] = False
+                    print("[int8-sim] 較正完了 -> 量子化推論を開始", flush=True)
             with torch.no_grad(), torch.autocast("cuda", torch.float16):
-                if args.model in ("v22", "v23", "v25", "v26", "v27", "v28", "v29", "v30", "v31", "v32", "v33", "v34", "v35", "v36", "v37", "v38", "v39", "v40", "v41", "v42", "v43", "v44", "v45", "v46", "v47", "v48"):
-                    out = m(imgs_m[None].cuda(), K[None].cuda(),
-                            T[None].cuda(),
-                            v0_t.cuda() if v0_t is not None else None, pb, th,
-                            **lid_kw)
-                    _BEVQ[f_pre["frame"]] = m._last_bev.detach().float()
-                    keep = 14 if args.model in ("v29", "v30", "v31", "v32", "v33", "v34", "v35", "v36", "v37", "v38", "v39", "v40", "v41", "v42", "v43", "v44", "v45", "v46", "v47", "v48") else 2
+                if args.model in ("v22", "v23", "v25", "v26", "v27", "v28", "v29", "v30", "v31", "v32", "v33", "v34", "v35", "v36", "v37", "v38", "v39", "v40", "v41", "v42", "v43", "v44", "v45", "v46", "v47", "v48", "v49", "v51", "v52", "v53", "v54", "v55", "v56", "v63b"):
+                    if trt_run is not None:
+                        # engine path: the temporal queue is filled from the
+                        # engine's raw_bev output, so the memory keeps working
+                        # exactly as in the PyTorch path
+                        _o = trt_run(imgs_m[None], K[None], T[None],
+                                     v0_t if v0_t is not None
+                                     else torch.zeros(1), pb, th)
+                        out = _o[:-1]
+                        _BEVQ[f_pre["frame"]] = _o[-1].detach().float()
+                    else:
+                        out = m(imgs_m[None].cuda(), K[None].cuda(),
+                                T[None].cuda(),
+                                v0_t.cuda() if v0_t is not None else None,
+                                pb, th, **lid_kw)
+                        _BEVQ[f_pre["frame"]] = m._last_bev.detach().float()
+                    keep = 14 if args.model in ("v29", "v30", "v31", "v32", "v33", "v34", "v35", "v36", "v37", "v38", "v39", "v40", "v41", "v42", "v43", "v44", "v45", "v46", "v47", "v48", "v49", "v51", "v52", "v53", "v54", "v55", "v56", "v63b") else 2
                     for kk in [k for k in _BEVQ
                                if isinstance(k, int)
                                and k < f_pre["frame"] - keep]:
@@ -509,13 +770,17 @@ def main():
                 with torch.no_grad(), torch.autocast("cuda", torch.float16):
                     ctx = m.lane_input().float() if refiner._ctx else None
                     if getattr(refiner, "_multi", False):
-                        rb = refiner.box is not None
-                        re = refiner.e2e is not None
+                        ga = getattr(refiner, "_acc", {})
+                        def _on(k):
+                            return ga.get(k, True)
+                        rb = refiner.box is not None and _on("box")
+                        re = refiner.e2e is not None and _on("e2e")
                         v0r = (v0_t.cuda() if v0_t is not None
                                else torch.zeros(1, device="cuda")) if re else None
                         fused = m._fused_bev.float() if re else None
                         r = refiner(
-                            seg=out[0].float() if refiner.seg is not None else None,
+                            seg=out[0].float() if (refiner.seg is not None
+                                                  and _on("seg")) else None,
                             hm=out[3].float() if rb else None,
                             reg=out[4].float() if rb else None,
                             ego=out[7].float() if re else None,
@@ -526,9 +791,42 @@ def main():
                             out[3] = r["hm"].detach(); out[4] = r["reg"].detach()
                         if "ego" in r:
                             out[7] = r["ego"].detach()
-                    else:
+                        if getattr(refiner, "pl", None) is not None \
+                                and _on("pl") \
+                                and len(out) >= 19 and out[18] is not None:
+                            out[18] = refiner.pl(
+                                out[18].float().clamp(-15, 15)).detach()
+                        if getattr(refiner, "stat", None) is not None \
+                                and _on("stat") and len(out) >= 11:
+                            out[10] = refiner.stat(
+                                out[10].float().clamp(-15, 15)).detach()
+                    elif getattr(refiner, "_acc", {}).get("seg", True):
                         out[0] = refiner(out[0].float(), ctx).detach()
             seg, dlog = out[0], out[1]        # v13 returns (seg, depth, seg2d)
+            if args.thin_bias:
+                # The thin classes come out far too fat: measured on val with
+                # r54, laneline covers 2.79x the GT area, stopline 2.40x,
+                # road_edge 1.94x. The cause is the training objective, not the
+                # features -- Tversky runs at beta 0.8, so a miss is punished
+                # four times as hard as a false positive and the network learns
+                # to paint wide. IoU hides it (a fatter line grows the union
+                # about as fast as the intersection), which is how r54 set a
+                # best-ever mIoU while getting visibly worse.
+                #
+                # Since it is a decision-boundary bias and not a localisation
+                # error, subtracting a constant from those logits before the
+                # argmax fixes it at no cost: at 0.5 the laneline area ratio
+                # goes 2.79 -> 1.17 and road_edge 1.94 -> 0.91, for -0.4 % of
+                # laneline IoU and -0.0002 mIoU.
+                seg = seg.clone()
+                for _c in (4, 5, 6):          # laneline, stopline, road_edge
+                    # 個別較正 (2026-08-18, Orin と統一): probe_seg_bias の
+                    # 実測最適 lane 0.75 / stop 1.0 / edge 0.5。--thin-bias が
+                    # 既定 (0.5) のときだけ適用し、明示指定時は従来動作。
+                    _bmap = {4: 0.75, 5: 1.0, 6: 0.5}
+                    seg[:, _c] -= (_bmap.get(_c, args.thin_bias)
+                                   if abs(args.thin_bias - 0.5) < 1e-9
+                                   else args.thin_bias)
             pred = seg.argmax(1)[0].cpu().numpy().astype(np.uint8)
             if args.seg_fuse:
                 # temporal log-odds fusion in the ego frame (static classes):
@@ -570,16 +868,51 @@ def main():
             if args.show_seg2d and isinstance(out, tuple) and len(out) > 2:
                 seg2d_pred = out[2].argmax(2)[0].cpu().numpy().astype(np.uint8)
             det_boxes = None
-            if args.model in ("v16", "v17", "v18", "v19", "v20", "v21", "v22", "v23", "v25", "v26", "v27", "v28", "v29", "v30", "v31", "v32", "v33", "v34", "v35", "v36", "v37", "v38", "v39", "v40", "v41", "v42", "v43", "v44", "v45", "v46", "v47", "v48") and len(out) > 4:
+            if args.model in ("v16", "v17", "v18", "v19", "v20", "v21", "v22", "v23", "v25", "v26", "v27", "v28", "v29", "v30", "v31", "v32", "v33", "v34", "v35", "v36", "v37", "v38", "v39", "v40", "v41", "v42", "v43", "v44", "v45", "v46", "v47", "v48", "v49", "v51", "v52", "v53", "v54", "v55", "v56", "v63b") and len(out) > 4:
                 if args.model == "v30" and len(out) >= 18:
                     unk_boxes = m.decode_unknown(out[17].float())[0]
                 else:
                     unk_boxes = []
                 det_boxes = [d for d in m.decode_boxes(
-                    out[3].float(), out[4].float(), thresh=0.25, topk=64)[0]
-                    if d[1] > (0.45 if d[0] == 0 else 0.25)] + unk_boxes
+                    out[3].float(), out[4].float(), thresh=0.25, topk=128)[0]
+                    if d[1] > (0.35 if d[0] == 0 else 0.15)] + unk_boxes
+                # --- 表示側の安定化 (2026-08-13) --------------------------
+                # 1) 表示クリップ (2026-08-18 修正): 前50/後28 の固定窓は
+                #    軽量版 (det 監督 前50/後28) の対策で、本線の全域グリッド
+                #    では教師が全域にあるのに後方 28m 超・前方 50m 超の枠を
+                #    消してしまっていた。格子の実範囲 (±マージン 2m) に追従。
+                import bevlane.model as _M
+                _xr = _M.BEV_H * 0.2 - 80.0
+                det_boxes = [d for d in det_boxes
+                             if -(_xr - 2.0) <= d[2] <= 78.0]
+                # 2) 時系列 yaw 平滑化: 前フレームの箱と中心 2.5m でマッチし、
+                #    180°フリップを抑止した上で EMA (a=0.6)。真横/真後ろの
+                #    特徴が薄い箱のフレーム毎回転 (クルクル) を直接抑える。
+                _tr = getattr(main, "_yaw_tracks", None)
+                if _tr is None or getattr(main, "_yaw_scene", None) != scene:
+                    _tr = []
+                    main._yaw_scene = scene
+                _sm = []
+                for d in det_boxes:
+                    d = list(d)
+                    best = None
+                    for (px, py, pyaw) in _tr:
+                        dd = (d[2] - px) ** 2 + (d[3] - py) ** 2
+                        if dd < 6.25 and (best is None or dd < best[0]):
+                            best = (dd, pyaw)
+                    if best is not None and len(d) > 6:
+                        py_ = best[1]
+                        dy_ = (d[6] - py_ + np.pi) % (2 * np.pi) - np.pi
+                        if abs(dy_) > np.pi / 2:      # フリップ抑止
+                            d[6] = d[6] + (np.pi if dy_ < 0 else -np.pi)
+                            dy_ = (d[6] - py_ + np.pi) % (2 * np.pi) - np.pi
+                        d[6] = py_ + 0.4 * dy_        # EMA a=0.6
+                    _sm.append(tuple(d))
+                det_boxes = _sm
+                main._yaw_tracks = [(d[2], d[3], d[6]) for d in det_boxes
+                                    if len(d) > 6]
             ego_modes = None
-            if args.model in ("v29", "v30", "v31", "v32", "v33", "v34", "v35", "v36", "v37", "v38", "v39", "v40", "v41", "v42", "v43", "v44", "v45", "v46", "v47", "v48") and len(out) >= 8:
+            if args.model in ("v29", "v30", "v31", "v32", "v33", "v34", "v35", "v36", "v37", "v38", "v39", "v40", "v41", "v42", "v43", "v44", "v45", "v46", "v47", "v48", "v49", "v51", "v52", "v53", "v54", "v55", "v56", "v63b") and len(out) >= 8:
                 _e = out[7][0].float().cpu().numpy()
                 _pr = np.exp(_e[36:39]) / np.exp(_e[36:39]).sum()
                 _k = int(_pr.argmax())
@@ -587,24 +920,41 @@ def main():
                     _rm = out[12][0, 0].float().sigmoid().cpu().numpy()
                     _k, _, _rk = risk_pick(
                         [_e[j * 12:(j + 1) * 12] for j in range(3)], _pr, _rm)
+                # 描画の統一 (2026-08-18): Orin レンダラと同じ選択規則を
+                # risk_pick の後段に適用する。(1) 前フレームのモードに +0.35
+                # (ちらつき抑制)、(2) 旋回モードは直進を 1.0 上回らない限り
+                # 直進を維持 (コマンド無しデモでの飛び出し抑制)。
+                _lg = np.log(np.maximum(_pr, 1e-9))
+                _prev = getattr(main, "_prev_mode", None)
+                if getattr(main, "_mode_scene", None) != scene:
+                    _prev = None
+                    main._mode_scene = scene
+                if _prev is not None:
+                    _lg[_prev] += 0.35
+                _k2 = int(_lg.argmax())
+                if _k2 != 0 and (_lg[_k2] - _lg[0]) < 1.0:
+                    _k2 = 0
+                if _k2 != _k:
+                    _k = _k2
+                main._prev_mode = _k
                 ego_modes = [(_e[j * 12:(j + 1) * 12], float(_pr[j]), j == _k)
                              for j in range(3)]
                 out = out[:7] + [torch.from_numpy(np.concatenate(
                     [_e[_k * 12:(_k + 1) * 12], _e[39:42]]))[None]] + out[8:]
             ego_pred = out[7][0].float().cpu().numpy() \
-                if args.model in ("v18", "v19", "v20", "v21", "v22", "v23", "v25", "v26", "v27", "v28", "v29", "v30", "v31", "v32", "v33", "v34", "v35", "v36", "v37", "v38", "v39", "v40", "v41", "v42", "v43", "v44", "v45", "v46", "v47", "v48") and len(out) >= 8 else None
+                if args.model in ("v18", "v19", "v20", "v21", "v22", "v23", "v25", "v26", "v27", "v28", "v29", "v30", "v31", "v32", "v33", "v34", "v35", "v36", "v37", "v38", "v39", "v40", "v41", "v42", "v43", "v44", "v45", "v46", "v47", "v48", "v49", "v51", "v52", "v53", "v54", "v55", "v56", "v63b") and len(out) >= 8 else None
             traj_map = out[9][0].float().cpu() \
-                if args.model in ("v21", "v22", "v23", "v25", "v26", "v27", "v28", "v29", "v30", "v31", "v32", "v33", "v34", "v35", "v36", "v37", "v38", "v39", "v40", "v41", "v42", "v43", "v44", "v45", "v46", "v47", "v48") and len(out) >= 10 else None
+                if args.model in ("v21", "v22", "v23", "v25", "v26", "v27", "v28", "v29", "v30", "v31", "v32", "v33", "v34", "v35", "v36", "v37", "v38", "v39", "v40", "v41", "v42", "v43", "v44", "v45", "v46", "v47", "v48", "v49", "v51", "v52", "v53", "v54", "v55", "v56", "v63b") and len(out) >= 10 else None
             stat_map = out[10][0, 0].float().cpu() \
-                if args.model in ("v26", "v27", "v28", "v29", "v30", "v31", "v32", "v33", "v34", "v35", "v36", "v37", "v38", "v39", "v40", "v41", "v42", "v43", "v44", "v45", "v46", "v47", "v48") and len(out) >= 11 else None
+                if args.model in ("v26", "v27", "v28", "v29", "v30", "v31", "v32", "v33", "v34", "v35", "v36", "v37", "v38", "v39", "v40", "v41", "v42", "v43", "v44", "v45", "v46", "v47", "v48", "v49", "v51", "v52", "v53", "v54", "v55", "v56", "v63b") and len(out) >= 11 else None
             risk_map = out[12][0, 0].float().sigmoid().cpu().numpy() \
-                if args.model in ("v28", "v29", "v30", "v31", "v32", "v33", "v34", "v35", "v36", "v37", "v38", "v39", "v40", "v41", "v42", "v43", "v44", "v45", "v46", "v47", "v48") and len(out) >= 13 else None
+                if args.model in ("v28", "v29", "v30", "v31", "v32", "v33", "v34", "v35", "v36", "v37", "v38", "v39", "v40", "v41", "v42", "v43", "v44", "v45", "v46", "v47", "v48", "v49", "v51", "v52", "v53", "v54", "v55", "v56", "v63b") and len(out) >= 13 else None
             tl_state = None
-            if args.model in ("v27", "v28", "v29", "v30", "v31", "v32", "v33", "v34", "v35", "v36", "v37", "v38", "v39", "v40", "v41", "v42", "v43", "v44", "v45", "v46", "v47", "v48") and len(out) >= 12:
+            if args.model in ("v27", "v28", "v29", "v30", "v31", "v32", "v33", "v34", "v35", "v36", "v37", "v38", "v39", "v40", "v41", "v42", "v43", "v44", "v45", "v46", "v47", "v48", "v49", "v51", "v52", "v53", "v54", "v55", "v56", "v63b") and len(out) >= 12:
                 p_tl = out[11][0].float().softmax(0)
                 tl_state = (int(p_tl.argmax()), float(p_tl.max()))
             occ_pred = None
-            if args.model in ("v20", "v21", "v22", "v23", "v25", "v26", "v27", "v28", "v29", "v30", "v31", "v32", "v33", "v34", "v35", "v36", "v37", "v38", "v39", "v40", "v41", "v42", "v43", "v44", "v45", "v46", "v47", "v48") and len(out) >= 9:
+            if args.model in ("v20", "v21", "v22", "v23", "v25", "v26", "v27", "v28", "v29", "v30", "v31", "v32", "v33", "v34", "v35", "v36", "v37", "v38", "v39", "v40", "v41", "v42", "v43", "v44", "v45", "v46", "v47", "v48", "v49", "v51", "v52", "v53", "v54", "v55", "v56", "v63b") and len(out) >= 9:
                 op = out[8][0].float().softmax(0)      # [C,Z,H,W]
                 conf = 1.0 - op[0]                      # P(occupied)
                 cls = (op[1:].argmax(0) + 1).to(torch.uint8)
@@ -617,7 +967,7 @@ def main():
                                        torch.zeros_like(cls)) \
                     .cpu().numpy().astype(np.uint8)
             boxes2d = None
-            if args.model in ("v17", "v18", "v19", "v20", "v21", "v22", "v23", "v25", "v26", "v27", "v28", "v29", "v30", "v31", "v32", "v33", "v34", "v35", "v36", "v37", "v38", "v39", "v40", "v41", "v42", "v43", "v44", "v45", "v46", "v47", "v48") and len(out) >= 7:
+            if args.model in ("v17", "v18", "v19", "v20", "v21", "v22", "v23", "v25", "v26", "v27", "v28", "v29", "v30", "v31", "v32", "v33", "v34", "v35", "v36", "v37", "v38", "v39", "v40", "v41", "v42", "v43", "v44", "v45", "v46", "v47", "v48", "v49", "v51", "v52", "v53", "v54", "v55", "v56", "v63b") and len(out) >= 7:
                 if isinstance(out[5], (list, tuple)):   # v19 multi-scale
                     boxes2d = m.decode_boxes2d_ms(
                         [t[0].float() for t in out[5]],
@@ -628,16 +978,21 @@ def main():
                                                thresh=args.thresh2d)
             if 'det_boxes' not in dir():
                 det_boxes = None
-            dprob = dlog.float().softmax(2)[0]
-            # top-mode expectation (argmax bin +-2, renormalised): the full
-            # expectation mixes foreground/background modes at object
-            # boundaries into phantom mid-range depths -> soft edges
-            pk = dprob.argmax(1, keepdim=True)
-            ar = torch.arange(dprob.shape[1], device=dprob.device
-                              ).view(1, -1, 1, 1)
-            pw = dprob * ((ar - pk).abs() <= 2)
-            depth = ((pw.cpu() * dbins.view(1, -1, 1, 1)).sum(1)
-                     / pw.sum(1).clamp(min=1e-6).cpu())     # [N,fh,fw]
+            if dlog.shape[2] == 1:
+                # v50: the regression head already emits metres per pixel,
+                # so there is no distribution to take an expectation over
+                depth = dlog.float()[0, :, 0].cpu()
+            else:
+              dprob = dlog.float().softmax(2)[0]
+              # top-mode expectation (argmax bin +-2, renormalised): the full
+              # expectation mixes foreground/background modes at object
+              # boundaries into phantom mid-range depths -> soft edges
+              pk = dprob.argmax(1, keepdim=True)
+              ar = torch.arange(dprob.shape[1], device=dprob.device
+                                ).view(1, -1, 1, 1)
+              pw = dprob * ((ar - pk).abs() <= 2)
+              depth = ((pw.cpu() * dbins.view(1, -1, 1, 1)).sum(1)
+                       / pw.sum(1).clamp(min=1e-6).cpu())   # [N,fh,fw]
             # --- 2D 'obs' unknown -> BEV via predicted depth (--unk2d) ---
             unk2d = []
             if args.unk2d and boxes2d is not None and depth is not None:
@@ -678,19 +1033,32 @@ def main():
             frame = np.zeros((VH, VW, 3), np.uint8)
 
             # --- RGB block (top, 2x4) and Depth block (below, same grid) ---
+            pl_rgb = None
+            if args.show_pl:
+                pl_rgb = []
+                for chn_ in CAMS:
+                    p_ = f["imgs"].get(chn_)
+                    pl_rgb.append(cv2.imread(os.path.join(args.root, s, p_))
+                                  if p_ else None)
+            pl_ras = None
+            if args.show_pl and len(out) >= 19 and out[18] is not None:
+                # raw pseudo-LiDAR logits -> the real raster's units
+                # (log-count, max z, mean z, occupancy), occupancy-gated
+                pl_ras = m.pl_activate(out[18][:1].float(),
+                                       hard=True)[0].cpu().numpy()
             for k, chn in enumerate(CAM8):
                 r, c = divmod(k, 4)
                 x = c * cw
                 p = f["imgs"].get(chn)
                 if p:
-                    img = cv2.resize(cv2.imread(os.path.join("out/bevlane", s, p)),
+                    img = cv2.resize(cv2.imread(os.path.join(args.root, s, p)),
                                      (cw, ch))
                     if seg2d_pred is not None:
                         sc = SEG2D_PAL[seg2d_pred[CAMS.index(chn)]]
                         sc = cv2.resize(sc, (cw, ch),
                                         interpolation=cv2.INTER_NEAREST)
                         img = cv2.addWeighted(img, 0.62, sc, 0.38, 0)
-                    if args.zero_cams and chn in args.zero_cams.split(","):
+                    if chn in blank:
                         img = np.zeros((ch, cw, 3), np.uint8)   # blank tile
                     if "NARROW" in chn:
                         label(img, "NARROW", (0, 255, 0))
@@ -708,13 +1076,15 @@ def main():
                     frame[rgb_y0 + r * ch:rgb_y0 + (r + 1) * ch, x:x + cw] = img
                 # depth directly under the same camera cell
                 ci = CAMS.index(chn)
-                if args.zero_cams and chn in args.zero_cams.split(","):
+                if chn in blank:
                     if occ_pred is not None:      # OCC takes the free cell
                         dc = cv2.resize(cube_render(occ_pred, W=900, H=760),
                                         (cw, ch))
                         label(dc, "pred OCC voxel +-24m", (220, 220, 220))
                     else:
                         dc = np.zeros((ch, cw, 3), np.uint8)
+                elif args.show_pl and chn in NARROW:
+                    dc = None            # the tall PL view covers both cells
                 else:
                     d = depth[ci].numpy()
                     dc = cv2.applyColorMap(
@@ -723,7 +1093,17 @@ def main():
                     dc = cv2.resize(dc, (cw, ch),
                                     interpolation=cv2.INTER_NEAREST)
                     label(dc, chn.split("CAM_")[-1], (255, 255, 255))
-                frame[dep_y0 + r * ch:dep_y0 + (r + 1) * ch, x:x + cw] = dc
+                if dc is not None:
+                    frame[dep_y0 + r * ch:dep_y0 + (r + 1) * ch,
+                          x:x + cw] = dc
+            if args.show_pl and pl_ras is not None:
+                # column 3 of the depth grid = FRONT_NARROW + BACK_NARROW,
+                # used as one tall cell so the 3-D cloud is actually legible
+                px0 = 3 * cw
+                pv = pl_render(pl_ras, W=cw, H=2 * ch, rgb=pl_rgb,
+                               K=K.numpy(), T=T.numpy())
+                label(pv, "pseudo-LiDAR 3D (image-coloured)", (200, 230, 255))
+                frame[dep_y0:dep_y0 + 2 * ch, px0:px0 + cw] = pv
             cv2.putText(frame, "RGB + predicted 2D Seg overlay" if args.show_seg2d
                         else "RGB input (surround + tele NARROW)", (10, 32),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.6, (220, 220, 220), 1, cv2.LINE_AA)
@@ -763,13 +1143,20 @@ def main():
             pc = crop_bev(pred, xh_m=60.0, yh_m=25.0)      # 600 x 250 (long x lat)
             BH2 = VH - 90                                    # fill height
             BW2 = int(BH2 * pc.shape[1] / pc.shape[0])       # keep aspect
+            draw_ego_and_grid.xr_m = min(60.0, BEV_XR)
             bev = draw_ego_and_grid(DEMO_PALETTE[pc][:, :, ::-1], BH2, BW2,
                                     xh_m=60.0, yh_m=25.0)
+            # The BEV panel spans +60 m ahead to -min(60, BEV_XR) behind.
+            # Every metre->pixel conversion below used the literal 120 m span
+            # of the symmetric grid; on a rear-truncated grid that drew the
+            # E2E path (and every overlay) shifted toward the panel centre.
+            _XB = min(60.0, BEV_XR)
+            _SPAN = 60.0 + _XB
             if risk_map is not None:
                 # overlay predicted risk (+-40 x +-25 m) on the BEV panel
-                rm = cv2.resize(risk_map, (BW2, int(BH2 * 80.0 / 120.0)),
+                rm = cv2.resize(risk_map, (BW2, int(BH2 * (40.0 + _XB) / _SPAN)),
                                 interpolation=cv2.INTER_LINEAR)
-                y0r = int(BH2 * (60.0 - 40.0) / 120.0)
+                y0r = int(BH2 * (60.0 - 40.0) / _SPAN)
                 sub = bev[y0r:y0r + rm.shape[0]]
                 heat = cv2.applyColorMap((np.clip(rm, 0, 1) * 255
                                           ).astype(np.uint8),
@@ -778,7 +1165,7 @@ def main():
                 bev[y0r:y0r + rm.shape[0]] = (sub * (1 - a) + heat * a
                                               ).astype(np.uint8)
             if det_boxes:
-                sy2 = BH2 / 120.0            # px per metre (2*60m vertical)
+                sy2 = BH2 / _SPAN            # px per metre (2*60m vertical)
                 sx2 = BW2 / 50.0             # px per metre (2*25m lateral)
                 for cls, sc, xe, ye, l, w, yaw in det_boxes:
                     if abs(xe) > 60 or abs(ye) > 25:
@@ -847,7 +1234,7 @@ def main():
                                     False, col, 1, cv2.LINE_AA)
                                 cv2.circle(bev, pts[-1], 3, col, -1)
             if args.unk2d and unk2d:
-                sy2 = BH2 / 120.0
+                sy2 = BH2 / _SPAN
                 sx2 = BW2 / 50.0
                 sp = max(3, int(0.6 * sx2))       # fixed 1.2 m marker
                 for xe_, ye_, sc_ in unk2d:
@@ -859,7 +1246,7 @@ def main():
                     cv2.polylines(bev, [dia.reshape(-1, 1, 2)], True,
                                   (255, 255, 255), 2, cv2.LINE_AA)
             if ego_pred is not None and ego_modes is not None:
-                sy2 = BH2 / 120.0
+                sy2 = BH2 / _SPAN
                 sx2 = BW2 / 50.0
                 for wp_m, pr_m, is_best in ego_modes:
                     if is_best:
@@ -879,7 +1266,7 @@ def main():
                                     cv2.FONT_HERSHEY_SIMPLEX, 0.38,
                                     (255, 200, 60), 1, cv2.LINE_AA)
             if ego_pred is not None:            # E2E: trajectory + controls
-                sy2 = BH2 / 120.0
+                sy2 = BH2 / _SPAN
                 sx2 = BW2 / 50.0
                 pts = [(int(25.0 * sx2), int(60.0 * sy2))]      # ego origin
                 for k in range(6):
@@ -900,7 +1287,7 @@ def main():
                     for p in pts[1:]:
                         cv2.circle(bev, p, 3, (0, 255, 0), -1)
                 if guard is not None:
-                    sy2 = BH2 / 120.0
+                    sy2 = BH2 / _SPAN
                     sx2 = BW2 / 50.0
                     if guard["verdict"] == "OK":
                         cv2.putText(bev, "GUARD OK", (6, BH2 - 118),
@@ -964,7 +1351,7 @@ def main():
                             (BW2 - 136, 46), cv2.FONT_HERSHEY_SIMPLEX,
                             0.5, tcl[ti], 2 if ti else 1, cv2.LINE_AA)
             cv2.putText(bev, "pred BEV+bbox+E2E +-25x+-60m"
-                        if args.model in ("v18", "v19", "v20", "v21", "v22", "v23", "v25", "v26", "v27", "v28", "v29", "v30", "v31", "v32", "v33", "v34", "v35", "v36", "v37", "v38", "v39", "v40", "v41", "v42", "v43", "v44", "v45", "v46", "v47", "v48") else
+                        if args.model in ("v18", "v19", "v20", "v21", "v22", "v23", "v25", "v26", "v27", "v28", "v29", "v30", "v31", "v32", "v33", "v34", "v35", "v36", "v37", "v38", "v39", "v40", "v41", "v42", "v43", "v44", "v45", "v46", "v47", "v48", "v49", "v51", "v52", "v53", "v54", "v55", "v56", "v63b") else
                         ("pred BEV+bbox +-25x+-60m" if args.model in ("v15", "v16", "v17")
                          else "pred BEV +-25x+-60m"), (6, 24),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 255), 2, cv2.LINE_AA)
@@ -977,7 +1364,7 @@ def main():
             bx = min(bx0, VW - BW2)                          # flush to right edge
             frame[40:40 + BH2, bx:bx + BW2] = bev
 
-            if occ_pred is not None and not args.zero_cams:
+            if occ_pred is not None and not blank:
                 iso = cube_render(occ_pred, W=900, H=760)
                 iso = cv2.resize(iso, (426, 360))
                 oy0 = VH - 368
@@ -986,19 +1373,38 @@ def main():
                             (8, oy0 - 6),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.5, (220, 220, 220), 1,
                             cv2.LINE_AA)
-            mode_tag = "LIDAR ON" if args.lidar else "camera-only"
+            _mods = ([] + (["LIDAR"] if args.lidar_bev else [])
+                     + (["SDMAP"] if args.sdmap else []))
+            mode_tag = ("+".join(_mods) + " ON") if _mods \
+                else ("LIDAR ON" if args.lidar else "camera-only")
             if args.seg_fuse:
                 mode_tag += "  |  seg-EMA<=45m"
             cv2.putText(frame, f"{scene.split('+0900_')[-1]}  f{f['frame']:03d}  |  "
-                        f"6/8-cam -> Depth + BEV (+-25x+-60m)  |  no GT  |  "
+                        f"{len(CAMS) - len(blank)}/{len(CAMS)}-cam -> Depth "
+                        f"+ BEV (+-25x+-60m)  |  no GT  |  "
                         f"{mode_tag}",
                         (10, VH - 18), cv2.FONT_HERSHEY_SIMPLEX, 0.62,
                         (0, 255, 255) if args.lidar else (0, 255, 0), 2,
                         cv2.LINE_AA)
-            vw.write(frame)
-            n += 1
+            # The temporal queue must still see every frame, so thinning
+            # happens at WRITE time, not by skipping the forward pass.
+            if args.frame_stride <= 1 or i % args.frame_stride == 0:
+                vw.write(frame)
+                n += 1
         print("scene", scene, n, flush=True)
     vw.release()
+    if torch.cuda.is_available():
+        print(f"[mem] peak GPU allocated {torch.cuda.max_memory_allocated() / 2**20:.0f} MiB "
+              f"(reserved {torch.cuda.max_memory_reserved() / 2**20:.0f} MiB)",
+              flush=True)
+    if n == 0:
+        # a shard can legitimately be empty: 22 of the 279 test scenes ship an
+        # empty manifest (unconverted). ffmpeg on a 0-frame file exits 234 and
+        # took the whole parallel render down with it.
+        print(f"[demo] no frames rendered -> not encoding {args.out}",
+              flush=True)
+        os.remove(raw) if os.path.exists(raw) else None
+        return
     subprocess.run(["ffmpeg", "-y", "-i", raw, "-c:v", "libx264", "-crf", "23",
                     "-pix_fmt", "yuv420p", args.out], check=True, capture_output=True)
     os.remove(raw)

@@ -11,7 +11,7 @@ from concurrent.futures import ProcessPoolExecutor
 
 import numpy as np
 
-ROOT = "/data1/dataset/aisin/converted_valid_delay"
+ROOT = "data/t4dataset"
 CHUNK = 10 * 1024 * 1024
 
 

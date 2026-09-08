@@ -32,7 +32,7 @@ from autolabel_bev import Transform  # noqa: E402
 from bevlane.extract_gt import CAMS, ROOT, load_scene_light  # noqa: E402
 
 cv2.setNumThreads(1)
-OUT = "out/bevlane"
+OUT = os.environ.get("METEOR_BEVLANE_OUT", "out/bevlane")
 DH, DW = 108, 192          # stride-4 grid for 768x432 input
 MAX_DEPTH = 79.0
 SKY_D, EGO_D = 79.5, 2.0

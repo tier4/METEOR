@@ -68,7 +68,15 @@ def candidate_rewards(wp, gt=None, boxes=None, nbox=None, traj=None,
         ap = bx[:, :, 1:3].unsqueeze(2) + traj.float()[:, :, :T]     # [B,N,T,2]
         live = (bx[:, :, 3] > 0).unsqueeze(-1) & (tvalid[:, :, :T] > 0.5)
         d = (wp.unsqueeze(1) - ap.unsqueeze(2)).norm(dim=-1)          # B,N,K,T
-        pen = (1.0 - d / COLL_R).clamp(min=0) ** 2
+        # Two ranges. The hard term is the original 3 m footprint penalty; the
+        # soft one keeps a gradient out to 9 m. Measured: with the hard term
+        # alone, 60 % of frames gave all K candidates the SAME collision score
+        # and the term contributed 1 % of what separated them -- the candidates
+        # are only 0.82 m apart, so they all sit inside or outside the 3 m
+        # circle together. The heaviest-weighted term in the reward (1.5) was
+        # deciding almost nothing.
+        pen = ((1.0 - d / COLL_R).clamp(min=0) ** 2
+               + 0.15 * (1.0 - d / (3.0 * COLL_R)).clamp(min=0) ** 2)
         pen = pen * live.unsqueeze(2).float()
         coll = pen.amax(dim=1).mean(-1)                               # [B,K]
     else:
@@ -78,7 +86,17 @@ def candidate_rewards(wp, gt=None, boxes=None, nbox=None, traj=None,
     # --- comfort: second difference (accel/jerk proxy) -----------------
     if T >= 3:
         d2 = wp[:, :, 2:] - 2 * wp[:, :, 1:-1] + wp[:, :, :-2]
-        comfort = d2.norm(dim=-1).mean(-1) / 0.5
+        # Clamped. Unbounded, this term decided the ranking on its own:
+        # measured over 200 val frames, the spread between the K candidates was
+        # 4.35 for comfort against 1.25 for imit, 0.38 for progress, 0.21 for
+        # drive and 0.016 for collision, so 68 % of what separates candidates
+        # was jerk. The selector it produced loses to "always take candidate 0"
+        # on ADE (1.042 vs 1.012 m), which is what picking the smoothest path
+        # rather than the right one looks like. 1.0 here is already a harsh
+        # second difference (0.5 m per 0.5 s step); past that a candidate is
+        # simply unacceptable and there is nothing to gain by ranking degrees
+        # of unacceptable.
+        comfort = (d2.norm(dim=-1).mean(-1) / 0.5).clamp(max=1.0)
     else:
         comfort = torch.zeros(B, K, device=dev)
     parts["comfort"] = float(comfort.mean())

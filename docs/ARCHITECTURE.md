@@ -50,7 +50,7 @@ The fused stride-4 feature `f [B·8, 160, 108, 192]` feeds four image-space head
 |---|---|---|---|
 | Backbone + FPN (8 cams) | 21.66 M | 475 | 15 % |
 | Depth decoder | 3.29 M | 1093 | 35 % |
-| BEV lane decoder | 1.16 M | 933 | 30 % |
+| BEV lane seg head | 1.16 M | 933 | 30 % |
 | 2D seg head | 4.18 M | 219 | 7 % |
 | 2D det head | 2.85 M | 219 | 7 % |
 | 3D det head (s4 tower) | 2.06 M | 121 | 4 % |
@@ -61,7 +61,7 @@ The fused stride-4 feature `f [B·8, 160, 108, 192]` feeds four image-space head
 | Context + IPM | 0.02 M | 6 | <1 % |
 | **Total (v26)** | **43.50 M** | **~3100** | |
 
-*(BEV lane decoder is now the encoder–decoder `LaneDecED`: 4.10 M params at
+*(the BEV lane seg head is now the encoder–decoder `LaneDecED`: 4.10 M params at
 ~0.8× the FLOPs of the flat stack it replaced — same design rule below.)*
 
 Two design rules fall out of this table:
