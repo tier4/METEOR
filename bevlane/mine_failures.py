@@ -120,7 +120,7 @@ def main():
             print(f"{i + 1}/{len(sample)}", flush=True)
     scored.sort(reverse=True)
     n = max(1, int(len(scored) * args.frac))
-    # 学習と並行で回すため、書きかけを読まれないよう原子的に置換する
+    # runs alongside training, so replace atomically to avoid readers seeing a partial file
     with open("out/mined_scenes.txt.tmp", "w") as f:
         f.write("\n".join(s for _, s in scored[:n]))
     import os as _os

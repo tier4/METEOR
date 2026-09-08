@@ -10,14 +10,14 @@ import cv2
 import os
 import numpy as np
 
-# 配色は autolabel_bev が唯一の出典。ここにコピーを持つと、ローカルと
-# Orin で色が食い違っても気づけない (2026-08-24 に重複を解消)。
+# autolabel_bev is the single source of the palette. Keeping a copy here would hide
+# color mismatches between local and Orin (duplicate removed 2026-08-24).
 try:
     import sys as _sys, os as _os
     _sys.path.insert(0, _os.path.dirname(_os.path.dirname(
         _os.path.abspath(__file__))))
     from autolabel_bev import PALETTE          # noqa: E402
-except Exception:      # Orin には autolabel_bev を置いていない
+except Exception:      # autolabel_bev is not shipped on Orin
     PALETTE = np.array([[0, 0, 0], [90, 90, 90], [140, 90, 160], [0, 200, 200], [255, 255, 255], [255, 40, 40], [255, 140, 0], [240, 220, 60], [40, 60, 140]], np.uint8)
 
 DET10_PAL = [[255, 255, 255], [0, 0, 255], [0, 160, 165], [100, 0, 200], [128, 255, 0], [255, 255, 0], [255, 0, 32], [128, 255, 0], [250, 0, 255], [0, 255, 0]]
@@ -28,8 +28,8 @@ _HIDE2D = {int(x) for x in os.environ.get("METEOR_2D_HIDE", "").split(",") if x.
 
 
 def draw_boxes2d(img, blist, cw, ch):
-    # METEOR_2D_HIDE="7" などで描かないクラスを指定 (2026-09-06: 7=路面ペイント
-    # (矢印・文字) の大きな緑枠が「誤検出」に見えるため既定で非表示に)
+    # METEOR_2D_HIDE="7" etc. selects classes not to draw (2026-09-06: 7=road paint
+    # (arrows/text); its big green boxes look like false positives, so hidden by default)
     if _HIDE2D:
         blist = [b for b in blist if int(b[0]) not in _HIDE2D]
     """Per-camera 10-class 2D boxes (cls,score,cx,cy,w,h in 768x432 px)."""

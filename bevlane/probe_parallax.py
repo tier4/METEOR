@@ -1,14 +1,14 @@
 #!/usr/bin/env python3
-"""運動視差で 20-60m の深度がどこまで当たるか (実装前の前提検証)。
+"""How well does motion parallax recover depth at 20-60 m (premise check before implementing).
 
-いまの律速は深度の鋭さではなく **中心の正確さ** (20-40m で誤差 5.26m、
-3D 箱のマッチ半径 3m を超える)。単眼 1 枚の情報だけでは頭打ちなので、
-バックボーンが原理的に計算できない量 = 時間方向の視差を使えるかを測る。
+The bottleneck now is not depth sharpness but **center accuracy** (5.26 m error at
+20-40 m, beyond the 3 m 3D-box match radius). A single monocular frame has plateaued,
+so test a quantity the backbone cannot compute in principle: temporal parallax.
 
-方法: 現フレームの物体中心画素について、深度 Z を 5-80m で掃引し、
-その 3D 点を 0.4 秒前のフレームへ投影して画素パッチの正規化相互相関 (NCC)
-を取る。相関最大の Z が視差による深度。これを LiDAR 深度 GT および
-モデルの深度期待値と比べる。ここで負けるなら実装しても無駄。
+Method: for the object-center pixel in the current frame, sweep depth Z over 5-80 m,
+project the 3D point into the frame 0.4 s earlier and take the normalized cross-
+correlation (NCC) of the pixel patches. The Z with max correlation is the parallax depth.
+Compare it with LiDAR depth GT and the model's depth expectation. If it loses here, do not implement.
 """
 import argparse
 import os
@@ -50,7 +50,7 @@ def main():
                         gt_key="gt_cons", max_per_scene=a.per_scene, n_cams=8,
                         with_depth=True, with_bbox2d=True, with_temporal=True)
     x0 = ds[0]
-    print("[ds] 要素:", ", ".join(str(tuple(t.shape)) for t in x0
+    print("[ds] elements:", ", ".join(str(tuple(t.shape)) for t in x0
                                   if torch.is_tensor(t)))
 
     ZS = np.arange(5.0, 80.0, 1.0)
@@ -64,7 +64,7 @@ def main():
             continue
         img, K, T = x[0], x[1], x[2]
         dgt, b2, c2 = x[4], None, None
-        # 末尾から: pimgs, rel, pv (with_temporal), その前に bbox2d
+        # from the end: pimgs, rel, pv (with_temporal), preceded by bbox2d
         pimgs, rel, pv = x[-3], x[-2], x[-1]
         for t in x:
             if torch.is_tensor(t) and t.dim() == 3 and t.shape[-1] == 5:
@@ -83,11 +83,11 @@ def main():
         Rz = rotz(dyaw)
         tvec = np.array([dx, dy, 0.0])
         nC, dh, dw = dgt.shape
-        for ci in range(min(nC, img.shape[0], 3)):     # 前方 3 台
+        for ci in range(min(nC, img.shape[0], 3)):     # 3 front cameras
             Kc = K[ci].numpy().astype(np.float64)
             Tce = T[ci].numpy().astype(np.float64)     # ego -> cam
             Tec = np.linalg.inv(Tce)
-            # 画像を uint8 グレーに戻す (正規化を外す)
+            # back to uint8 grayscale (undo normalization)
             def gray(t):
                 im = t.numpy().transpose(1, 2, 0) * STD + MEAN
                 return cv2.cvtColor((np.clip(im, 0, 1) * 255).astype(np.uint8),
@@ -119,9 +119,9 @@ def main():
                 ray = np.linalg.inv(Kc) @ np.array([u, v, 1.0])
                 best, bz = -2.0, np.nan
                 for Z in ZS:
-                    Xc = ray * (Z / ray[2])              # cam 座標 (z=Z)
-                    Xe = (Tec @ np.append(Xc, 1.0))[:3]  # 現 ego
-                    Xp = Rz @ Xe + tvec                  # 前 ego
+                    Xc = ray * (Z / ray[2])              # cam coords (z=Z)
+                    Xe = (Tec @ np.append(Xc, 1.0))[:3]  # current ego
+                    Xp = Rz @ Xe + tvec                  # previous ego
                     Xpc = (Tce @ np.append(Xp, 1.0))[:3]
                     if Xpc[2] <= 0.5:
                         continue
@@ -141,17 +141,17 @@ def main():
                 err[band]["pred"].append(
                     abs(float(zp[ci, max(0, gy-1):gy+2, max(0, gx-1):gx+2].mean()) - z_gt))
 
-    print(f"\n基線長 (0.4 秒前との並進) 中央値 {np.median(base):.2f} m "
+    print(f"\nbaseline (translation over 0.4 s) median {np.median(base):.2f} m "
           f"(n={len(base)})")
-    print("車両中心での深度誤差の中央値 [m]")
-    print("   帯域      n    視差 NCC   深度ヘッド   勝者")
+    print("median depth error at vehicle centers [m]")
+    print("   band      n    parallax NCC   depth head   winner")
     for b in BANDS:
         p_, q_ = err[b]["par"], err[b]["pred"]
         if len(p_) < 5:
             continue
         mp, mq = float(np.median(p_)), float(np.median(q_))
         print(f"  {b[0]:>2}-{b[1]:<2}m  {len(p_):>4}   {mp:>7.2f}   {mq:>7.2f}"
-              f"     {'視差' if mp < mq else '深度ヘッド'}")
+              f"     {'parallax' if mp < mq else 'depth head'}")
 
 
 if __name__ == "__main__":

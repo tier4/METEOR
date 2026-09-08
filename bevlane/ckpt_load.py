@@ -1,27 +1,27 @@
 #!/usr/bin/env python3
-"""チェックポイントを「取りこぼしなく」読むための共通ローダ。
+"""Shared loader that reads a checkpoint without silently dropping anything.
 
-背景 (2026-08-22 発覚): probe 群の多くが
+Background (found 2026-08-22): many probes did
     m = MODELS["v52"](...); m.load_state_dict(..., strict=False)
-と書いており、paint-seg / paint-det のように **enable_* を呼ばないと存在しない**
-枝の重み (paint_proj.*, paint_det_proj.*) が黙って捨てられていた。
-strict=False なので警告も出ず、フックも登録されないので、その枝を持つモデルを
-「枝なしの別モデル」として測っていたことになる。静かな故障そのもの。
+so weights of branches that **only exist after enable_* is called** (paint-seg /
+paint-det: paint_proj.*, paint_det_proj.*) were silently discarded.
+With strict=False there was no warning and no hook registered, so a model with
+that branch was being measured as a different, branch-less model. A silent failure.
 
-このローダは ckpt のキーから必要な enable_* を呼び、読めなかったキーを必ず
-表示する。新しい枝を足したときは _ENABLERS に 1 行足すだけでよい。
+This loader calls the needed enable_* based on the ckpt keys and always reports
+keys it could not load. Adding a new branch is one more line in _ENABLERS.
 """
 import torch
 
-# ckpt キーの接頭辞 -> (有効化メソッド名, 既定クラス)
-# 既定クラスは学習側の launch と揃えること。
+# ckpt key prefix -> (enable method name, default class count)
+# Default class counts must match the training launch.
 _ENABLERS = (
     ("paint_proj.", "enable_paint_seg", [2, 3, 4, 5, 6, 7, 8, 13]),
     ("paint_det_proj.", "enable_paint_det", [1, 2, 3, 4, 5, 6]),
 )
 
-# stat_head2.proj.* は「有界 stat ヘッド」(QuantRobustStatHead)。関数ではなく
-# net 全体を要するので _ENABLERS とは別扱い (load_net 内で処理)。
+# stat_head2.proj.* is the bounded stat head (QuantRobustStatHead). It needs the
+# whole net, not a method, so it is handled separately (inside load_net).
 
 
 def strip(sd):
@@ -30,9 +30,9 @@ def strip(sd):
 
 
 def load_net(net, ckpt, verbose=True, quiet_ok=()):
-    """sd を net に読み込む。必要な枝を先に生やしてから読む。
+    """Load sd into net, growing the required branches first.
 
-    返り値: (読み込めなかった ckpt キー, 形が合わず捨てたキー)
+    Returns: (ckpt keys that could not be loaded, keys dropped for shape mismatch)
     """
     if isinstance(ckpt, str):
         try:
@@ -53,55 +53,55 @@ def load_net(net, ckpt, verbose=True, quiet_ok=()):
         if len(_wck) == 4 and _wck != _wcur:
             from bevlane.model import enable_depth_slim
             enable_depth_slim(net, widths=_wck)
-            print(f"[load] depth-slim 幅 {_wck} を検出", flush=True)
+            print(f"[load] depth-slim width {_wck} detected", flush=True)
     if any(k.startswith("sem_ego.") for k in sd):
         from bevlane.model import enable_semantic_ego
         enable_semantic_ego(net)
         if verbose:
-            print("[load] semantic-ego 残差を有効化", flush=True)
+            print("[load] semantic-ego residual enabled", flush=True)
     if saved_args.get("depth_log_bins"):
         from bevlane.model import enable_depth_logbins
         enable_depth_logbins(net)
         if verbose:
-            print("[load] 深度対数ビンを有効化 (保存 args より)", flush=True)
+            print("[load] log depth bins enabled (from saved args)", flush=True)
     if any(k.startswith("mode_scorer.") for k in sd):
         from bevlane.model import enable_mode_scorer
         enable_mode_scorer(net)
         if verbose:
-            print("[load] モード選択スコアラを有効化", flush=True)
+            print("[load] mode-selection scorer enabled", flush=True)
     if any(k.startswith("det_tmp.") for k in sd):
         from bevlane.model import enable_det_temporal
         enable_det_temporal(net)
         if verbose:
-            print("[load] det 時間特徴残差を有効化", flush=True)
+            print("[load] det temporal-feature residual enabled", flush=True)
     if any(k.startswith("traj_vel.") for k in sd):
         from bevlane.model import enable_traj_cv
         enable_traj_cv(net)
         if verbose:
-            print("[load] traj CV 再パラメータ化を有効化", flush=True)
+            print("[load] traj CV reparameterization enabled", flush=True)
     if any(k.startswith("traj_flow.") for k in sd):
         from bevlane.model import enable_traj_flow
         enable_traj_flow(net)
         if verbose:
-            print("[load] flow→traj 残差を有効化", flush=True)
+            print("[load] flow->traj residual enabled", flush=True)
     if any(k.startswith("delta_stat.") for k in sd):
         from bevlane.model import enable_delta_stat
         enable_delta_stat(net)
         if verbose:
-            print("[load] 時間差分 stat ヘッドを有効化", flush=True)
+            print("[load] temporal-delta stat head enabled", flush=True)
     if any(k.startswith("lane_sdf.") for k in sd):
         from bevlane.model import enable_lane_sdf
         enable_lane_sdf(net)
         if verbose:
-            print("[load] lane_sdf 補助ヘッドを有効化", flush=True)
+            print("[load] lane_sdf aux head enabled", flush=True)
     if any(k.startswith("stat_head2.proj.") for k in sd):
         from bevlane.model import enable_quant_stat_head
         enable_quant_stat_head(net, 8.0)
         if verbose:
-            print("[load] 有界 stat ヘッド (学習済み) を有効化", flush=True)
+            print("[load] bounded stat head (trained) enabled", flush=True)
     for pre, meth, dflt in _ENABLERS:
         if any(k.startswith(pre) for k in sd) and hasattr(net, meth):
-            # 注入クラス数は重みの入力チャネル数から復元する (既定に頼らない)
+            # recover the injected class count from the weight's input channels (not the default)
             w = sd.get(pre + "weight")
             n = int(w.shape[1]) if w is not None and w.dim() == 4 else len(dflt)
             arg_name = "paint_seg" if meth == "enable_paint_seg" else "paint_det"
@@ -116,18 +116,18 @@ def load_net(net, ckpt, verbose=True, quiet_ok=()):
                                  f"checkpoint input channels {n}")
             getattr(net, meth)(cls)
             if verbose:
-                print(f"[load] {meth}({cls}) を有効化", flush=True)
+                print(f"[load] {meth}({cls}) enabled", flush=True)
     if any(k.startswith("lane_branch.") for k in sd) \
             and getattr(net, "lane_branch", None) is None:
         from bevlane.model import enable_lane_branch
         enable_lane_branch(net)
         if verbose:
-            print("[load] lane_branch を checkpoint 形状で有効化", flush=True)
+            print("[load] lane_branch enabled with checkpoint shape", flush=True)
     if any(k.startswith("stat_head2.proj.") for k in sd):
         from bevlane.model import enable_quant_stat_head
         enable_quant_stat_head(net, 8.0)
         if verbose:
-            print("[load] quant-robust stationary head を有効化", flush=True)
+            print("[load] quant-robust stationary head enabled", flush=True)
     cur = net.state_dict()
     ok = {k: v for k, v in sd.items() if k in cur and cur[k].shape == v.shape}
     bad_shape = [k for k, v in sd.items()
@@ -135,9 +135,9 @@ def load_net(net, ckpt, verbose=True, quiet_ok=()):
     unused = [k for k in sd if k not in cur and not k.startswith(quiet_ok)]
     net.load_state_dict(ok, strict=False)
     if verbose and (unused or bad_shape):
-        print(f"[load] 警告: 未使用 {len(unused)} / 形不一致 {len(bad_shape)}"
-              f"  例 {(unused + bad_shape)[:4]}", flush=True)
+        print(f"[load] warning: unused {len(unused)} / shape mismatch {len(bad_shape)}"
+              f"  e.g. {(unused + bad_shape)[:4]}", flush=True)
     elif verbose:
-        print(f"[load] 全 {len(ok)} テンソルを読み込み (取りこぼしなし)",
+        print(f"[load] all {len(ok)} tensors loaded (nothing dropped)",
               flush=True)
     return unused, bad_shape

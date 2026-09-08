@@ -1,10 +1,10 @@
-"""遠方車両リッチシーンの走査 (D2' レバー用, 2026-08-27)。
+"""Scan for scenes rich in far vehicles (for the D2' lever, 2026-08-27).
 
-val3D-zone の実測で 40-80m recall (0.19-0.28) が近傍 (0.46-0.53) の半分。
-GT-paste (D2) の安価な代替として、遠方車両 (class=1, 40<|x|<=80) が多い
-シーンをオーバーサンプルするためのシーンリストを作る。
-出力: out/farveh_scene_scores.tsv (scene\tfrac\tmean_far)。
-リスト化 (しきい値) は分布を見て別途。
+val3D-zone shows 40-80 m recall (0.19-0.28) at half the near-range value (0.46-0.53).
+As a cheap alternative to GT-paste (D2), build a scene list for oversampling scenes
+with many far vehicles (class=1, 40<|x|<=80).
+Output: out/farveh_scene_scores.tsv (scene\tfrac\tmean_far).
+Thresholding into a list is done separately after inspecting the distribution.
 """
 import glob
 import os

@@ -1,9 +1,9 @@
-"""2D BBox (カメラ面) の INT8 vs fp16 ペア比較 (Orin 実機, 2026-08-27)。
+"""Paired INT8 vs fp16 comparison of 2D BBoxes (camera plane) (on-device Orin, 2026-08-27).
 
-det_ab_probe.py の 2D 版。同一フレームを 2 エンジンに流し、カメラ別・
-クラス別に IoU>=0.3 で greedy マッチ。fp16 基準で
-  b_only 多 → INT8 の precision 低下疑い / a_only 多 → recall 低下疑い。
-使い方: python3 det2d_ab_probe.py <fp16.engine> <int8.engine> [root] [stride]
+2D version of det_ab_probe.py. Runs the same frames through both engines and
+greedy-matches per camera and class at IoU>=0.3. With fp16 as reference:
+  many b_only -> suspected INT8 precision drop / many a_only -> suspected recall drop.
+Usage: python3 det2d_ab_probe.py <fp16.engine> <int8.engine> [root] [stride]
 """
 import json
 import os
@@ -22,7 +22,7 @@ ORD = ["CAM_FRONT_WIDE", "CAM_FRONT_LEFT", "CAM_FRONT_RIGHT", "CAM_BACK_WIDE",
 ENG_A, ENG_B = sys.argv[1], sys.argv[2]
 ROOT = sys.argv[3] if len(sys.argv) > 3 else "calib"
 STRIDE = int(sys.argv[4]) if len(sys.argv) > 4 else 4
-TH = 0.50            # demo (orin_render) と同じ閾値
+TH = 0.50            # same threshold as the demo (orin_render)
 IOU_TH = 0.3
 
 
@@ -109,7 +109,7 @@ for sc in sorted(os.listdir(ROOT)):
                 A["ao_sc"] += [x[1] for x in ao]
                 A["bo_sc"] += [x[1] for x in bo]
 
-print(f"2D-BB  A={os.path.basename(ENG_A)} (基準) "
+print(f"2D-BB  A={os.path.basename(ENG_A)} (reference) "
       f"B={os.path.basename(ENG_B)}  root={ROOT} frames={nfr} "
       f"th={TH} IoU>={IOU_TH}")
 for cls in sorted(acc):
@@ -117,8 +117,8 @@ for cls in sorted(acc):
     if A["a"] + A["b"] == 0:
         continue
     agree = A["m"] / max(A["a"], 1)
-    print(f"  cls{cls} A={A['a']:5d} B={A['b']:5d} 一致={A['m']:5d} "
-          f"(A基準一致率 {agree:.2f})  A_only={A['ao']:4d} B_only={A['bo']:4d}")
+    print(f"  cls{cls} A={A['a']:5d} B={A['b']:5d} matched={A['m']:5d} "
+          f"(agreement vs A {agree:.2f})  A_only={A['ao']:4d} B_only={A['bo']:4d}")
     for tag in ("ao", "bo"):
         s = A[tag + "_sc"]
         if s:

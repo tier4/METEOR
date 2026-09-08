@@ -662,7 +662,7 @@ cv::Mat compose_frame(const std::vector<cv::Mat>& raw,
                                           (DBINS > 1 ? (double)q / (DBINS - 1) : 0));
     struct P { double x, y, sc, d; };
     std::vector<P> cand;
-    // 期待値深度 (depth_mean, fp16 [1,N,h,w]) があれば優先 (2026-09-07)
+    // Prefer the expected-value depth (depth_mean, fp16 [1,N,h,w]) when available (2026-09-07)
     const TensorView* dmv = out.count("depth_mean") ? &out.at("depth_mean") : nullptr;
     int dmH = depH, dmW = depW;
     if (dmv) {
@@ -688,7 +688,7 @@ cv::Mat compose_frame(const std::vector<cv::Mat>& raw,
         double gx, gy;
         if (groundPoint(b.cx, b.cy + 0.5 * b.h, Kc, T, GROUND_Z, gx, gy) &&
             std::hypot(gx, gy) > 1.5 && std::hypot(gx, gy) < 60.0) {
-          pe[0] = gx; pe[1] = gy; d = std::hypot(gx, gy);   // 主: 接地点の幾何 (2026-09-08)
+          pe[0] = gx; pe[1] = gy; d = std::hypot(gx, gy);   // primary: ground-contact geometry (2026-09-08)
         } else {
           int u = std::clamp((int)(b.cx / 768.0 * dmW), 0, dmW - 1);
           int v = std::clamp((int)((b.cy + 0.35 * b.h) / 432.0 * dmH), 0, dmH - 1);
@@ -723,7 +723,7 @@ cv::Mat compose_frame(const std::vector<cv::Mat>& raw,
     for (const auto& c : kept) {
       if (c.x > VIEW_F || c.x < -VIEW_R || std::fabs(c.y) > YH) continue;
       cv::Point q((int)((YH - c.y) * sx2), (int)((VIEW_F - c.x) * sy2));
-      cv::circle(bev, q, 4, {255, 255, 255}, -1);      // 白の小さな丸のみ — 名前・距離は描かない (2026-09-07 指示)
+      cv::circle(bev, q, 4, {255, 255, 255}, -1);      // small white dot only -- no label or distance (2026-09-07 request)
       cv::circle(bev, q, 5, {40, 40, 40}, 1);
     }
   }

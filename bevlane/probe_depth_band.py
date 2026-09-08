@@ -1,8 +1,8 @@
-"""深度の距離帯別誤差と分布の鋭さを測る (2026-08-21)。
+"""Measure depth error and distribution sharpness per range band (2026-08-21).
 
-LiDAR とカメラの遠方検出差 (recall 0.50 vs 0.89) の根本原因が
-「深度の距離劣化」なら、遠方帯で誤差と分布のボケが急増するはず。
-改善余地を定量化してから対策 (遠方重み付け / ビン再設計) を決める。
+If the root cause of the LiDAR-vs-camera far detection gap (recall 0.50 vs 0.89) is
+depth degrading with range, error and distribution blur should jump in the far bands.
+Quantify the headroom before choosing a fix (far-range weighting / bin redesign).
 """
 import argparse, os, sys
 import numpy as np, torch
@@ -46,8 +46,8 @@ for i in range(0, len(ds), step):
     n = min(dlog.shape[0], dgt.shape[0])
     p = dlog[:n].softmax(1)
     bins = (torch.arange(D, device=p.device) * D_STEP + D_MIN).view(1, -1, 1, 1)
-    exp_d = (p * bins).sum(1)                      # [n,h,w] 期待距離
-    e = -(p.clamp_min(1e-6) * p.clamp_min(1e-6).log()).sum(1)   # エントロピー
+    exp_d = (p * bins).sum(1)                      # [n,h,w] expected range
+    e = -(p.clamp_min(1e-6) * p.clamp_min(1e-6).log()).sum(1)   # entropy
     t1 = p.max(1).values
     g = dgt[:n]
     if g.shape[-2:] != exp_d.shape[-2:]:
@@ -62,8 +62,8 @@ for i in range(0, len(ds), step):
         top1[(lo, hi)].append(float(t1[m_].mean()))
     done += 1
     if done >= a.frames: break
-print(f"\n=== {a.tag} 深度の距離帯別 ({done} 枚, {D} ビン x {D_STEP} m) ===")
-print("帯        平均絶対誤差   相対誤差   分布エントロピー  最大確率")
+print(f"\n=== {a.tag} depth per range band ({done} frames, {D} bins x {D_STEP} m) ===")
+print("band      MAE            rel err    entropy           max prob")
 for lo, hi in BANDS:
     if not err[(lo, hi)]: continue
     ae = np.mean(err[(lo, hi)])

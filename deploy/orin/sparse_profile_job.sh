@@ -1,5 +1,5 @@
 #!/bin/bash
-# 密 vs 事後2:4 INT8 の層別プロファイル差分 (2026-09-06)。CPPBENCH_DONE を待って GPU 単独で。
+# Per-layer profile diff, dense vs post-hoc 2:4 INT8 (2026-09-06). Waits for CPPBENCH_DONE, then runs with the GPU to itself.
 cd ~/meteor; T=/usr/src/tensorrt/bin/trtexec; SO=/home/nvidia/meteor/liftbench/plugin/build/libmeteor_lift.so
 L=out/sparse_profile.log; : > $L
 while ! grep -q CPPBENCH_DONE out/cpp_vs_py_bench.log 2>/dev/null; do sleep 60; done

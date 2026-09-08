@@ -31,7 +31,7 @@ import sys
 import torch
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-import bevlane  # noqa: F401,E402  torch>=2.6 の weights_only 互換シムを有効化
+import bevlane  # noqa: F401,E402  enables the torch>=2.6 weights_only compatibility shim
 
 
 def pairs(sd):
@@ -91,10 +91,10 @@ def main():
               f"{float(plain[f'{bn}.running_var'].max()):8.4g}  (s={s:.4g})")
         n += 1
     if n == 0:
-        print(f"running_var が {a.min_var} を超える conv->BN 対はありません")
+        print(f"no conv->BN pair has running_var above {a.min_var}")
     ck["model"] = {f"{pfx}{k}": v for k, v in plain.items()} if pfx else plain
     torch.save(ck, a.out)
-    print(f"\n{n} 対を再スケール -> {a.out}")
+    print(f"\n{n} pairs rescaled -> {a.out}")
 
 
 if __name__ == "__main__":

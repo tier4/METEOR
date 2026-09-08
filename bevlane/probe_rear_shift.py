@@ -1,8 +1,8 @@
-"""後方 20-40m の GT 箱に対し「最近傍の予測」までの距離と方向を測る。
+"""For rear GT boxes at 20-40 m, measure distance and direction to the nearest prediction.
 
-深度バイアス説の検証: 検出自体はされているが縦方向に系統的にずれている
-なら、リコール低下 (2m マッチで外れる) と、マッチ集合の誤差が 0.7m で
-頭打ち (生存者バイアス) の両方が一度に説明される。
+Tests the depth-bias hypothesis: if boxes are detected but systematically shifted
+longitudinally, that explains both the recall drop (missing the 2 m match) and the
+matched-set error plateau at 0.7 m (survivor bias) at once.
 """
 import argparse, os, sys
 import numpy as np, torch
@@ -23,14 +23,14 @@ sd = {k.replace("module.", ""): v for k, v in sd.get("model", sd).items()}
 cur = m.state_dict()
 m.load_state_dict({k: v for k, v in sd.items() if k in cur and cur[k].shape == v.shape}, strict=False)
 
-rows = {"前": [], "後": []}
+rows = {"front": [], "rear": []}
 step = max(1, len(ds)//a.frames); done = 0
 for i in range(0, len(ds), step):
     b = ds[i]
     if b is None: continue
     with torch.no_grad(), torch.autocast("cuda", torch.float16):
         out = m(b[0][None].cuda(), b[1][None].cuda(), b[2][None].cuda())
-    # 弱い検出も含める (変位か不在かを見分けるため threshold を 0.10 まで下げる)
+    # include weak detections (threshold lowered to 0.10 to separate shift from absence)
     dets = m.decode_boxes(out[3].float().cpu(), out[4].float().cpu(), thresh=0.10)[0]
     pred = [(float(d[2]), float(d[3])) for d in dets if int(d[0]) == 0]
     bx, nb = b[4], int(b[5])
@@ -43,26 +43,26 @@ for i in range(0, len(ds), step):
         for dx, dy in pred:
             d2 = (xe-dx)**2 + (ye-dy)**2
             if best is None or d2 < best[0]: best = (d2, dx, dy)
-        side = "前" if xe > 0 else "後"
+        side = "front" if xe > 0 else "rear"
         if best is None:
             rows[side].append((99.0, 0.0)); continue
         dist = best[0] ** 0.5
-        # 半径方向 (奥行き) の符号付きずれ: + = 予測が GT より遠い
+        # signed radial (range) shift: + = prediction farther than GT
         ux, uy = xe / max(r, 1e-6), ye / max(r, 1e-6)
         dr = (best[1]-xe)*ux + (best[2]-ye)*uy
         rows[side].append((dist, dr))
     done += 1
     if done >= a.frames: break
 
-print(f"=== 20-40m 帯: GT 箱から最近傍予測まで (しきい値 0.10, {done} フレーム) ===")
-for side in ("前", "後"):
+print(f"=== 20-40m band: GT box to nearest prediction (thr 0.10, {done} frames) ===")
+for side in ("front", "rear"):
     A = np.array(rows[side])
     d, dr = A[:,0], A[:,1]
-    print(f"\n{side}方 (GT {len(A)} 箱)")
-    for lo, hi, nm in ((0,1,"0-1m"),(1,2,"1-2m"),(2,3,"2-3m"),(3,5,"3-5m"),(5,98,"5m超"),(98,100,"予測なし")):
+    print(f"\n{side} (GT {len(A)} boxes)")
+    for lo, hi, nm in ((0,1,"0-1m"),(1,2,"1-2m"),(2,3,"2-3m"),(3,5,"3-5m"),(5,98,">5m"),(98,100,"none")):
         s = (d>=lo)&(d<hi)
-        print(f"  最近傍 {nm:<6}: {100*s.mean():5.1f}%")
+        print(f"  nearest {nm:<6}: {100*s.mean():5.1f}%")
     near = d < 5
     if near.sum() >= 5:
-        print(f"  5m 以内の箱の奥行きずれ: 中央値 {np.median(dr[near]):+.2f}m "
-              f"(+=遠く予測) / 遠寄り {100*(dr[near]>1).mean():.0f}% 近寄り {100*(dr[near]<-1).mean():.0f}%")
+        print(f"  range shift of boxes within 5m: median {np.median(dr[near]):+.2f}m "
+              f"(+=predicted farther) / farther {100*(dr[near]>1).mean():.0f}% nearer {100*(dr[near]<-1).mean():.0f}%")

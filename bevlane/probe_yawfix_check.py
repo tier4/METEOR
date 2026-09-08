@@ -1,5 +1,5 @@
-"""yawfix の受け入れ判定: GT 箱の車線中央オフセット (距離比例成分) を
-指定 gt キーで測る。dataset を介さず png / bev_box を直接読む。"""
+"""Acceptance check for yawfix: measure the GT-box lane-center offset (range-proportional
+component) for a given gt key. Reads png / bev_box directly, bypassing the dataset."""
 import argparse
 import os
 
@@ -14,9 +14,9 @@ ap.add_argument("--tag", default="")
 a = ap.parse_args()
 
 scenes = [l.strip() for l in open(a.list) if l.strip()]
-BANDS = [("前 0-15m", 0, 15, 1), ("前 15-30m", 15, 30, 1),
-         ("前 30-45m", 30, 45, 1), ("後 0-15m", 0, 15, -1),
-         ("後 15-30m", 15, 30, -1)]
+BANDS = [("front 0-15m", 0, 15, 1), ("front 15-30m", 15, 30, 1),
+         ("front 30-45m", 30, 45, 1), ("rear 0-15m", 0, 15, -1),
+         ("rear 15-30m", 15, 30, -1)]
 off = {b[0]: [] for b in BANDS}
 n_fr = 0
 for s in scenes:
@@ -53,14 +53,14 @@ for s in scenes:
             for nm, lo, hi, sgn in BANDS:
                 if lo <= abs(xe) < hi and (xe > 0) == (sgn > 0):
                     off[nm].append(d)
-print(f"--- {a.tag or a.gt_key} ({n_fr} 枚): 箱の車線中央オフセット (+=左)")
+print(f"--- {a.tag or a.gt_key} ({n_fr} frames): box lane-center offset (+=left)")
 means = {}
 for nm, *_ in BANDS:
     o = np.array(off[nm])
     if len(o) >= 8:
         means[nm] = o.mean()
         print(f"  {nm:<9} n={len(o):4d}  {o.mean():+.3f}±{o.std():.3f} m")
-if "前 15-30m" in means and "前 0-15m" in means:
-    print(f"  距離比例成分 (前 15-30 − 前 0-15): "
-          f"{means['前 15-30m'] - means['前 0-15m']:+.3f} m")
+if "front 15-30m" in means and "front 0-15m" in means:
+    print(f"  range-proportional component (front 15-30 − front 0-15): "
+          f"{means['front 15-30m'] - means['front 0-15m']:+.3f} m")
 print("YAWFIX_CHECK_DONE")

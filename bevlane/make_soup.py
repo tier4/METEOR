@@ -30,7 +30,7 @@ import sys
 import torch
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-import bevlane  # noqa: F401,E402  torch>=2.6 の weights_only 互換シム
+import bevlane  # noqa: F401,E402  torch>=2.6 weights_only compatibility shim
 
 
 def main():
@@ -51,7 +51,7 @@ def main():
             ref_keys = set(acc)
         else:
             if set(sd) != ref_keys:
-                raise SystemExit(f"{c} のキー集合が違います "
+                raise SystemExit(f"{c} has a different key set "
                                  f"(+{len(set(sd) - ref_keys)} "
                                  f"-{len(ref_keys - set(sd))})")
             for k in acc:
@@ -71,7 +71,7 @@ def main():
     ck[a.key] = out
     ck["soup_of"] = a.ckpts
     torch.save(ck, a.out)
-    print(f"\n{m} 個を平均 ({n_int // max(m - 1, 1)} 個の整数バッファは最後の値を採用)"
+    print(f"\naveraged {m} checkpoints ({n_int // max(m - 1, 1)} integer buffers take the last value)"
           f" -> {a.out}")
 
 

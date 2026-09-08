@@ -136,9 +136,9 @@ def evaluate(frozen, ref0, loader, device, args, max_b=40):
                            if args.do_stat and len(out) > 10 else None),
                      pl=(out[18].float()
                          if args.do_pl and len(out) > 18 else None))
-        # ---- 3D BBox: 帯別 recall + 位置誤差 (raw vs refined) ----
-        # 2026-08-20 追加: box の効果がこれまで一切可視化されておらず、
-        # accept 判定にも残らなかった。
+        # ---- 3D BBox: recall per band + position error (raw vs refined) ----
+        # Added 2026-08-20: the box effect had never been visualized and did not
+        # feed into the accept decision.
         if args.do_box and "hm" in r and det_boxes is not None:
             for _tag, (_hm, _rg) in (("r", (out[3], out[4])),
                                      ("f", (r["hm"], r["reg"]))):
@@ -438,7 +438,7 @@ def main():
     ap.add_argument("--do-lg", action="store_true")
     ap.add_argument("--lanegraph-w", type=float, default=0.5)
     ap.add_argument("--yaw-fix-deg", type=float, default=0.0,
-                    help="GT 層間回転の補正 (train.py と同じ、out/yawfix_plan.md)")
+                    help="inter-layer GT rotation fix (same as train.py, out/yawfix_plan.md)")
     ap.add_argument("--do-all", action="store_true",
                     help="refine every head the network emits")
     ap.add_argument("--box-w", type=float, default=1.0)

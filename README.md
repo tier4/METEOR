@@ -74,7 +74,7 @@ every configuration; training uses modality dropout so no mode decays.
 
 | Input | What it is | Status |
 |---|---|---|
-| **LiDAR** | pillar raster (4 ch @ 0.4 m) added as a residual into the BEV; a zero raster is bit-equal to camera-only | **runs on the Orin** (`--with-lidar` export, `METEOR_LIDAR=1`, host-side presence flag; +0.5 ms) |
+| **LiDAR** | pillar raster (4 ch @ 0.4 m) added as a residual into the BEV; a zero raster is bit-equal to camera-only. On the adverse holdouts (night / rain / snow / reflections / cracked road) feeding the sweep lifts vehicle recall from ≈0.5 to ≈0.92, road IoU by +0.05–0.08 and lane IoU by +0.07–0.10 in every condition | **runs on the Orin** (`--with-lidar` export, `METEOR_LIDAR=1`, host-side presence flag; +0.5 ms) |
 | **SD map** (free OpenStreetMap) | road / centreline / intersections / crossings rasterised into the ego frame; zero input bit-equal to no map | trained; small road-IoU gain beyond 20 m near intersections; not used at deployment |
 | **Traffic-light recognition** (external) | per-camera box-level lamp states painted into a raster | no measurable effect on seg / planning yet |
 | **Pseudo-LiDAR** (predicted) | the network predicts the LiDAR raster from cameras and feeds it back through the LiDAR stem | trained; not used at deployment |
@@ -359,7 +359,7 @@ If you use METEOR in your work, please cite it (see [CITATION.cff](CITATION.cff)
 
 | Doc | Contents |
 |---|---|
-| [QUICKSTART.md](docs/QUICKSTART.md) | shortest path from the published artefacts to an inference video (in Japanese) |
+| [QUICKSTART.md](docs/QUICKSTART.md) | shortest path from the published artefacts to an inference video |
 | [REPRODUCE.md](docs/REPRODUCE.md) | running this on another machine: environment, data layout, how a round is supervised, the verified release path (§8) |
 | [ARCHITECTURE.md](docs/ARCHITECTURE.md) | stage-by-stage tensor shapes, params & FLOPs, depth-gated IPM |
 | [DATA_PIPELINE.md](docs/DATA_PIPELINE.md) | the autolabel factory, taxonomies, quality gates |

@@ -37,10 +37,10 @@ def _occ_ground(occ_pred):
     the r27 GT cleanup targets; the guard must not consume it."""
     if occ_pred is None:
         return None
-    # 2026-08-20: 幻影 VETO の実測全件が z ビン 12-15 (地上 3.8-5.4 m) の
-    # building ボクセルだった (路面上空の幻視/高架構造)。ガードが見るべきは
-    # 車両が通過する高さ窓だけ: z ビン 3..9 (路面 +0.2〜+3.0 m)。上空の
-    # ボクセルは実在 (門型標識・高架) でも衝突対象ではない。
+    # 2026-08-20: every observed phantom VETO came from building voxels in z bins
+    # 12-15 (3.8-5.4 m above ground): hallucinations above the road / elevated structures.
+    # The guard should only look at the height window a vehicle passes through: z bins 3..9
+    # (road +0.2 to +3.0 m). Voxels above that, even real (gantries, overpasses), are not collision targets.
     blk = np.isin(occ_pred[3:10], STATIC_OCC).any(0)
     blk[86:101, 96:105] = False          # x in (0,5.6], |y|<=1.6 m
     return blk
@@ -84,10 +84,10 @@ def check_path(path, occ_pred, dets, det_offs, tl_probs, lane_argmax, v0):
     # ---- 1b. static occupancy on the path -------------------------------
     blk = _occ_ground(occ_pred)
     if blk is not None and not events:
-        # 2026-08-20 誤 VETO 対策: 単フレーム 3x3>=3 は夜間の occ 幻影で
-        # 42% のフレームが VETO になっていた (val+curve 112 枚で幻影率 33/33
-        # = 100%)。(a) 3x3>=5 に強化、(b) 同位置 (2m 以内) で 2 フレーム
-        # 連続したときだけ発火する持続確認を追加。
+        # 2026-08-20 false-VETO fix: single-frame 3x3>=3 fired VETO on 42% of frames
+        # due to night-time occ phantoms (phantom rate 33/33 = 100% on 112 val+curve
+        # frames). (a) tightened to 3x3>=5, (b) added a persistence check that fires only
+        # when the same location (within 2 m) persists for 2 consecutive frames.
         _cand = None
         for ti in range(6):
             px, py = float(path[ti, 0]), float(path[ti, 1])

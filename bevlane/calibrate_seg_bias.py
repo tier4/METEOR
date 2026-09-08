@@ -56,20 +56,20 @@ def main():
     pfx = "module." if any(k.startswith("module.") for k in sd) else ""
     key = pfx + BIAS_KEY
     if key not in sd:
-        raise SystemExit(f"{key} がありません。存在するのは: "
+        raise SystemExit(f"{key} not found. Available: "
                          f"{[k for k in sd if k.endswith('out.3.bias')]}")
 
     b = sd[key].clone()
-    print(f"{key}  変更前: " + " ".join(f"{v:+.3f}" for v in b.tolist()))
+    print(f"{key}  before: " + " ".join(f"{v:+.3f}" for v in b.tolist()))
     for part in a.bias.split(","):
         c, off = part.split(":")
         c, off = int(c), float(off)
         if not 0 <= c < b.numel():
-            raise SystemExit(f"クラス {c} は範囲外 (0-{b.numel() - 1})")
+            raise SystemExit(f"class {c} out of range (0-{b.numel() - 1})")
         b[c] -= off
         print(f"  class {c}: -{off}")
     sd[key] = b
-    print(f"{key}  変更後: " + " ".join(f"{v:+.3f}" for v in b.tolist()))
+    print(f"{key}  after: " + " ".join(f"{v:+.3f}" for v in b.tolist()))
 
     ck["model"] = sd
     ck["seg_bias_calib"] = a.bias

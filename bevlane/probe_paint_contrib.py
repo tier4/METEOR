@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
-"""paint 系の枝が「本当に使われているか」を寄与率で測る。
+"""Measure whether the paint branches are actually used, via contribution ratio.
 
-ゼロ初期化 1x1 射影の注入は機能保存で安全だが、**学習がその枝を使わない**
-まま重みをゼロ付近に置くことがある。v103 の paint-seg がまさにそれで、
-ctx 出力に対する加算の大きさは 0.06% しかなく、枝を捨てても検出 recall は
-小数点以下 3 桁まで同一だった。以後、注入系レバーは必ずこれで生存確認する。
+Injection through a zero-initialized 1x1 projection is function-preserving and safe,
+but **training may never use the branch** and leave the weights near zero. v103
+paint-seg was exactly that: the addition was 0.06% of the ctx output and dropping
+the branch left detection recall identical to 3 decimals. Every injection lever gets this liveness check.
 
-寄与率 = |注入分| 平均 / |ctx 出力| 平均。
+Contribution ratio = mean |injection| / mean |ctx output|.
 """
 import argparse
 import os
@@ -77,15 +77,15 @@ def main():
             net(x[0][None].to(dev), x[1][None].to(dev), x[2][None].to(dev))
 
     c = float(np.mean(acc["ctx"])) if acc["ctx"] else float("nan")
-    print(f"\nctx 出力 |x| 平均 = {c:.5f}  (n={len(acc['ctx'])} 回)")
+    print(f"\nmean |x| of ctx output = {c:.5f}  (n={len(acc['ctx'])} calls)")
     for nm, key in (("paint-seg", "seg"), ("paint-det", "det")):
         if not acc[key]:
-            print(f"  {nm}: 枝なし")
+            print(f"  {nm}: no branch")
             continue
         d = float(np.mean(acc[key]))
         r = d / c * 100
-        verdict = "生存" if r >= 1.0 else "**死んでいる (1% 未満)**"
-        print(f"  {nm}: 加算 |d| 平均 {d:.5f} -> 寄与率 {r:.2f} %  {verdict}")
+        verdict = "alive" if r >= 1.0 else "**dead (< 1%)**"
+        print(f"  {nm}: mean |d| added {d:.5f} -> contribution {r:.2f} %  {verdict}")
 
 
 if __name__ == "__main__":

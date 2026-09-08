@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-"""GT だけで Pred デモと同一フォーマットの動画を作る (2026-08-29)。
+"""Build a video in the same format as the Pred demo from GT only (2026-08-29).
 
-レイアウトは実機デモ準拠: 8 カメラ (GT 2Dセグ + GT 箱) / 8 深度 (GT) /
-OCC ボクセル (GT, 左下) / BEV (gt_cons + GT 箱 + GT 他車軌跡 + GT 自車経路)。
-モデル推論は一切使わない。
+Layout follows the on-device demo: 8 cameras (GT 2D seg + GT boxes) / 8 depth (GT) /
+OCC voxels (GT, bottom-left) / BEV (gt_cons + GT boxes + GT agent tracks + GT ego path).
+No model inference is used.
 
   python3 bevlane/gt_full_demo.py --root out/bevlane_okinawa \
       --list scenes.txt --out out/demo_okinawa_gtfull.mp4 [--stride 2]
@@ -22,15 +22,15 @@ from deploy.occ_iso import cube_render_fast                             # noqa
 
 ORD = ["CAM_FRONT_WIDE", "CAM_FRONT_LEFT", "CAM_FRONT_RIGHT",
        "CAM_FRONT_NARROW", "CAM_BACK_LEFT", "CAM_BACK_WIDE",
-       "CAM_BACK_RIGHT", "CAM_BACK_NARROW"]          # 表示タイル順
+       "CAM_BACK_RIGHT", "CAM_BACK_NARROW"]          # display tile order
 CAMS6 = ["CAM_FRONT_WIDE", "CAM_FRONT_LEFT", "CAM_FRONT_RIGHT",
-         "CAM_BACK_WIDE", "CAM_BACK_LEFT", "CAM_BACK_RIGHT"]  # depth_gt4 順
+         "CAM_BACK_WIDE", "CAM_BACK_LEFT", "CAM_BACK_RIGHT"]  # depth_gt4 order
 VW, VH = 1920, 1080
 CW, CH = 358, 200
 
 
 def turbo_depth(d):
-    """metric depth [108,192] -> TURBO (無効=暗)。"""
+    """metric depth [108,192] -> TURBO (invalid = dark)."""
     m = np.asarray(d, np.float32)
     valid = m > 0.5
     b = ((m - 1.0) / 1.25).clip(0, 63) / 63.0 * 255.0
@@ -66,7 +66,7 @@ def main():
         for f in man["frames"][::a.stride]:
             fi = f["frame"]
             canvas = np.full((VH, VW, 3), 16, np.uint8)
-            # --- GT 各種を読む (無いものは黙って省略) ---
+            # --- read the GT inputs (silently skip missing ones) ---
             def _npz(sub, key):
                 try:
                     return np.load(os.path.join(d, sub, f"{fi:04d}.npz"))[key]
@@ -85,7 +85,7 @@ def main():
             gt = cv2.imread(os.path.join(d, "gt_cons", f"{fi:04d}.png"), 0)
             if gt is None:
                 gt = cv2.imread(os.path.join(d, f["gt"]), 0)
-            # GT 3D 箱 -> dict (draw_boxes_on_rgb / BEV 共用)
+            # GT 3D boxes -> dict (shared by draw_boxes_on_rgb / BEV)
             boxes = []
             if bev_box is not None:
                 for b in bev_box:
@@ -96,7 +96,7 @@ def main():
                                   "y": float(b[2]), "l": float(b[3]),
                                   "w": float(b[4]), "yaw": float(b[5]),
                                   "stationary": False})
-            # --- 8 カメラ (GT seg2d 重畳 + GT 箱投影) ---
+            # --- 8 cameras (GT seg2d overlay + GT box projection) ---
             seg_order = {c: i for i, c in enumerate(
                 man.get("seg2d_cams", list(man["cams"].keys())))}
             for ti, ch in enumerate(ORD):
@@ -128,7 +128,7 @@ def main():
                 canvas[y0:y0 + CH, x0:x0 + CW] = img
                 cv2.putText(canvas, ch, (x0, y0 - 6), 0, 0.42,
                             (200, 200, 200), 1)
-            # --- 8 深度 (GT) ---
+            # --- 8 depth (GT) ---
             deps = {}
             if dep6 is not None:
                 for i, ch in enumerate(CAMS6[:dep6.shape[0]]):
@@ -141,12 +141,12 @@ def main():
                 r, c_ = divmod(ti, 4)
                 x0 = 8 + c_ * (CW + 8)
                 y0 = 26 + 2 * (CH + 16) + r * (CH + 12)
-                if ti == 4:      # 左下スロットは OCC ボクセル (実機と同配置)
+                if ti == 4:      # bottom-left slot is OCC voxels (same layout as on-device)
                     continue
                 if ch in deps:
                     canvas[y0:y0 + CH, x0:x0 + CW] = cv2.resize(
                         turbo_depth(deps[ch]), (CW, CH))
-            # --- OCC ボクセル (GT, 左下) ---
+            # --- OCC voxels (GT, bottom-left) ---
             if occ is not None:
                 oc = occ[:10, 40:160, 40:160]
                 iso = cube_render_fast(oc, W=CW, H=CH)
@@ -154,7 +154,7 @@ def main():
                 canvas[y0:y0 + CH, x0:x0 + CW] = iso
                 cv2.putText(canvas, "GT OCC voxel +-24m", (x0, y0 - 4), 0,
                             0.42, (220, 220, 220), 1)
-            # --- BEV (gt_cons + GT 箱 + GT 軌跡 + 自車経路) ---
+            # --- BEV (gt_cons + GT boxes + GT tracks + ego path) ---
             if gt is not None:
                 g = gt.copy()
                 g[g == 255] = 0

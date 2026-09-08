@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
-"""probe / 評価スクリプト共通の「取りこぼしなし」モデル構築 (2026-09-05, 静かな故障 #10)。
+"""Lossless model construction shared by probe / eval scripts (2026-09-05, silent failure #10).
 
-chain_decomp / closed_loop_eval / dump_* は素の MODELS["v52"] に strict=False で
-重みを流していたため、sem_ego (E2E 入力路) 22 / lane_branch 14 / delta_stat 14 /
-paint_proj 2 が捨てられ、depth_head 41 は幅不一致で乱数のままだった。
-ここでは deploy/export_onnx.build (ckpt のキーから enable_* を呼ぶ) を使い、
-読めなかったキー・形不一致が 0 であることを検証してから返す。"""
+chain_decomp / closed_loop_eval / dump_* poured weights into a bare MODELS["v52"] with
+strict=False, dropping sem_ego (E2E input path) 22 / lane_branch 14 / delta_stat 14 /
+paint_proj 2 tensors, and depth_head 41 stayed random due to a width mismatch.
+Here we use deploy/export_onnx.build (calls enable_* from the ckpt keys) and verify
+zero unloaded keys and zero shape mismatches before returning."""
 import os, sys, torch
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -21,12 +21,12 @@ def load_full(ckpt, device="cuda", mv="v52", verbose=True):
     cur = net.state_dict()
     unexpected = [k for k in sd if k not in cur]
     mism = [k for k in sd if k in cur and tuple(cur[k].shape) != tuple(sd[k].shape)]
-    # build() は読み込み済みだが、kin_gate 等を後付けした場合に備えて再ロード
+    # build() has already loaded, but reload in case kin_gate etc. were attached afterwards
     net.load_state_dict({k: v for k, v in sd.items() if k in cur and tuple(cur[k].shape) == tuple(sd[k].shape)}, strict=False)
     if verbose:
         print(f"[probe_net] {os.path.basename(os.path.dirname(ckpt))}/{os.path.basename(ckpt)}: "
               f"ckpt {len(sd)} keys, unexpected {len(unexpected)}, mismatch {len(mism)}"
               + (f"  !! {unexpected[:3]} {mism[:3]}" if unexpected or mism else "  (OK)"), flush=True)
     if unexpected or mism:
-        raise RuntimeError(f"probe_net: 取りこぼし unexpected={len(unexpected)} mismatch={len(mism)} — enable_* が足りない")
+        raise RuntimeError(f"probe_net: dropped weights unexpected={len(unexpected)} mismatch={len(mism)} — missing enable_*")
     return net.to(device).eval()

@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-"""ego のプール出力のチャネル毎 平均/分散 を測って JSON に保存する。
+"""Measure per-channel mean/variance of the ego pool output and save as JSON.
 
-convert_ego_pool はこの統計を BN の running stats に入れ、ego_mlp の第 1 層で
-打ち消すことで **変換直後の出力を一致させる** (機能保存)。統計が無いと
-BN が恒等にならず、変換した瞬間に ego の出力が桁で変わってしまう。
+convert_ego_pool puts these stats into the BN running stats and cancels them in the
+first ego_mlp layer so that **the output matches right after conversion** (function-
+preserving). Without the stats the BN is not identity and ego output changes by orders of magnitude.
 """
 import argparse
 import json
@@ -34,7 +34,7 @@ def main():
     load_net(net, a.ckpt, verbose=False)
     seq = net.ego_stem
     pi = [i for i, m in enumerate(seq) if isinstance(m, nn.AdaptiveAvgPool2d)]
-    assert pi, "AdaptiveAvgPool が無い (既に変換済み?)"
+    assert pi, "no AdaptiveAvgPool found (already converted?)"
     buf = {}
     seq[pi[-1] - 1].register_forward_hook(
         lambda m, i, o: buf.__setitem__("x", o.detach().float()))
@@ -60,13 +60,13 @@ def main():
               open(a.out, "w"))
     step_in = float(buf["x"].max() - buf["x"].min()) / 127
     ac = float(P.std(0).mean())
-    print(f"{P.shape[0]} フレーム / プール手前 {hw} / ch {P.shape[1]}")
-    print(f"  現行 (入力の物差し {step_in:.4f}): 変動 {ac:.5f} = "
-          f"{ac / step_in:.3f} 段階")
+    print(f"{P.shape[0]} frames / pre-pool {hw} / ch {P.shape[1]}")
+    print(f"  current (input step {step_in:.4f}): variation {ac:.5f} = "
+          f"{ac / step_in:.3f} steps")
     Q = (P - mu) / va.clamp(min=1e-8).sqrt()
-    print(f"  conv+BN 後: 変動 {float(Q.std(0).mean()):.4f} / 1段階 "
+    print(f"  after conv+BN: variation {float(Q.std(0).mean()):.4f} / 1 step "
           f"{float(Q.max()-Q.min())/127:.5f} = "
-          f"{float(Q.std(0).mean())/(float(Q.max()-Q.min())/127):.2f} 段階")
+          f"{float(Q.std(0).mean())/(float(Q.max()-Q.min())/127):.2f} steps")
     print(f"-> {a.out}")
 
 

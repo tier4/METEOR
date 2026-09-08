@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
-"""描画 (compose_frame) のボトルネック計測 (2026-09-05)。推論 N フレーム → compose_frame を cProfile。
-使い方: python3 deploy/profile_render.py eng/xxx.engine [root] [n]"""
+"""Rendering (compose_frame) bottleneck measurement (2026-09-05). Infer N frames -> cProfile compose_frame.
+Usage: python3 deploy/profile_render.py eng/xxx.engine [root] [n]"""
 import sys, os, json, time, cProfile, pstats, io, numpy as np, cv2
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from deploy.runtime import MeteorRT
@@ -24,12 +24,12 @@ for f in frames:
     t = time.perf_counter(); out = rt.infer(imgs, K[0][None], Tc[0][None], v0=v0, pose=po, out_slot=0); t_inf.append((time.perf_counter() - t) * 1000)
     outs.append((raw, v0, {k: (v.copy() if hasattr(v, "copy") else v) for k, v in out.items()}, po))
 print(f"infer {np.mean(t_inf):.1f} ms/frame (n={N})")
-# 素の描画時間
+# raw rendering time
 ts = []
 for raw, v0, out, po in outs:
     t = time.perf_counter(); R.compose_frame(raw, K, Tc, v0, out, 80.0, fps_now=5.0, pose=po); ts.append((time.perf_counter() - t) * 1000)
 print(f"compose_frame {np.mean(ts):.0f} ms/frame (min {np.min(ts):.0f} max {np.max(ts):.0f})")
-# OCC を外した場合
+# with OCC removed
 occ_bak = [o[2].pop("occ", None) for o in outs]
 ts2 = []
 for raw, v0, out, po in outs:
@@ -55,7 +55,7 @@ _run("occ off", {"METEOR_OCC_PANEL": "0"})
 _run("occ off + depth off", {"METEOR_OCC_PANEL": "0", "METEOR_DEPTH_PANEL": "0"})
 _run("occ off + depth off + no thin", {"METEOR_OCC_PANEL": "0", "METEOR_DEPTH_PANEL": "0", "METEOR_NO_THIN": "1"})
 _run("occ off + depth off + no thin + no segfuse", {"METEOR_OCC_PANEL": "0", "METEOR_DEPTH_PANEL": "0", "METEOR_NO_THIN": "1", "METEOR_SEG_FUSE": "0"})
-# cProfile (関数別)
+# cProfile (per function)
 pr = cProfile.Profile(); pr.enable()
 for raw, v0, out, po in outs: R.compose_frame(raw, K, Tc, v0, out, 80.0, fps_now=5.0, pose=po)
 pr.disable(); sio = io.StringIO(); ps = pstats.Stats(pr, stream=sio).sort_stats("cumulative"); ps.print_stats(28); txt = sio.getvalue()

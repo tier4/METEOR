@@ -1,14 +1,14 @@
 #!/usr/bin/env python3
-"""リフトが使う深度分布を推論時に鋭くすると遠方 recall は上がるか (再学習なし)。
+"""Does sharpening the lift depth distribution at inference raise far recall (no retraining)?
 
-きっかけ (2026-08-22 実測): 深度の **期待値** は 40-60m でも誤差 4.7m と
-十分良いのに、**分布** は最大確率 0.09・エントロピー 3.5 = ±17m に広がって
-いる。リフトはこの分布に従って特徴を BEV セルへ配るので、正しい距離を
-「知っている」のに証拠が塗り広げられて薄まる。であれば、分布を期待値の
-まわりに集める (温度 T<1) だけで遠方のピークが立つはず — 学習を一切
-変えずに試せる。
+Trigger (measured 2026-08-22): the depth **expectation** is good even at 40-60 m
+(4.7 m error), but the **distribution** is spread out: max prob 0.09, entropy 3.5
+= +-17 m. The lift distributes features to BEV cells by this distribution, so
+the model knows the right range yet smears its evidence thin. Concentrating the
+distribution around the expectation (temperature T<1) should raise far peaks --
+testable without touching training.
 
-同一フレーム・1 プロセス・温度だけ切替 (optional-input A/B の掟)。
+Same frames, one process, only the temperature toggled (optional-input A/B rule).
 """
 import argparse
 import os
@@ -39,16 +39,16 @@ TEMPS = [t if (t in ("exp", "max") or t.startswith("cal")) else float(t)
 net = MODELS["v52"](n_seg=21).cuda().eval()
 load_net(net, a.ckpt)
 
-# sharpen_dprob を温度つきに差し替える (元の実装を包む)
+# replace sharpen_dprob with a temperature-aware version (wraps the original)
 _orig = type(net).sharpen_dprob
 _T = {"t": 1.0}
 
 
 def _sharp(self, dprob):
-    """t が数値なら温度、"exp" なら期待値まわりの三角核、"max" なら one-hot。
+    """Numeric t = temperature; "exp" = triangular kernel around the expectation; "max" = one-hot.
 
-    exp: 深度の期待値は 40-60m でも誤差 4.7m と良いので、その 1 点に
-    LiDAR 版 sharpen と同じ三角核 (幅 1 ビン) を立てて滲みを捨てる。
+    exp: the depth expectation is good (4.7 m error at 40-60 m), so place the same
+    triangular kernel (1 bin wide) as the LiDAR sharpen on that point and drop the smear.
     """
     dp = _orig(self, dprob)
     t = _T["t"]
@@ -59,7 +59,7 @@ def _sharp(self, dprob):
         BN, D, fh, fw = p32.shape
         q = torch.einsum("ji,bihw->bjhw", _CAL, p32)
         q = q / q.sum(1, keepdim=True).clamp_min(1e-8)
-        if "+" in t:                       # cal+0.3 のように温度も併用
+        if "+" in t:                       # e.g. cal+0.3 also applies a temperature
             tt = float(t.split("+")[1])
             q = q.clamp_min(1e-8) ** (1.0 / tt)
             q = q / q.sum(1, keepdim=True)
@@ -77,11 +77,11 @@ def _sharp(self, dprob):
     return (q / q.sum(1, keepdim=True)).to(dp.dtype)
 
 
-# --- 深度較正 ("cal"): 予測 z -> 真値 z の単調写像を深度軸に適用する ---
-# 全画素 392 万点で測ると予測は一貫して「遠すぎ」(45-50m 帯で -7.1m)。
-# これは分布の鋭さではなく軸のずれなので、質量を写像先のビンへ配り直す。
-# 実装は D x D の固定行列 1 個 (64x64) = 実質ゼロコスト。本採用時は
-# リフトのビン中心そのものを書き換えれば計算すら要らない。
+# --- depth calibration ("cal"): apply the monotone map pred z -> true z along the depth axis ---
+# Over all 3.92M pixels the prediction is consistently too far (-7.1 m in the 45-50 m band).
+# That is an axis offset, not a sharpness issue, so redistribute mass to the mapped bins.
+# Implementation is one fixed D x D matrix (64x64) = essentially free. For production,
+# rewriting the lift bin centers themselves removes even that.
 _CAL = None
 if os.path.exists("out/depth_calib_table.npy"):
     _t = np.load("out/depth_calib_table.npy")
@@ -96,7 +96,7 @@ if os.path.exists("out/depth_calib_table.npy"):
         _M[_lo[_i], _i] += 1 - _w[_i]
         _M[min(_lo[_i] + 1, net.D - 1), _i] += _w[_i]
     _CAL = _M.cuda()
-    print(f"[cal] 較正表を読み込み: {float(_zc[20]):.1f}m -> "
+    print(f"[cal] calibration table loaded: {float(_zc[20]):.1f}m -> "
           f"{float(_tgt[20]):.1f}m, {float(_zc[40]):.1f}m -> {float(_tgt[40]):.1f}m")
 
 
@@ -126,8 +126,8 @@ for i in range(0, len(ds), step):
         pv = [(float(d[2]), float(d[3])) for d in dets if int(d[0]) == 0]
         R = res[t]
         R["nd"].append(len(pv))
-        # 適合率: 予測箱が GT 車両 (3m 以内) に当たっているか。
-        # recall だけ見ると鋭化で箱が増えた分だけ数字が上がるので必須。
+        # precision: does the predicted box hit a GT vehicle (within 3 m)?
+        # Required: recall alone rises simply because sharpening adds boxes.
         gtv = [(float(bx[kk][1]), float(bx[kk][2]))
                for kk in range(max(nb, 0))
                if float(bx[kk][3]) > 0 and float(bx[kk][0]) < 1.5]
@@ -155,9 +155,9 @@ for i in range(0, len(ds), step):
     if done >= a.frames:
         break
 
-print(f"\n=== 深度分布の温度 A/B ({done} 枚, 同一フレーム, cam-only) ===")
+print(f"\n=== depth distribution temperature A/B ({done} frames, same frames, cam-only) ===")
 print("   T     " + "  ".join(f"{lo}-{hi}m" for lo, hi in BANDS)
-      + "   箱数/枚  適合率   F1(20-40m)  横誤差")
+      + "   boxes/frame  precision   F1(20-40m)  lat err")
 for t in TEMPS:
     R = res[t]
     rec = "  ".join(

@@ -1,21 +1,21 @@
 #!/usr/bin/env python3
-"""生の t4dataset シーンを、デモが読む形式へ直接変換する (2026-08-25)。
+"""Convert a raw t4dataset scene directly into the format the demo reads (2026-08-25).
 
-学習用の変換 (run_batch: 蓄積 LiDAR・GT 生成で数十分/シーン) と違い、
-デモに要るのは画像・K/T・ポーズだけなので数十秒で終わる:
+Unlike the training conversion (run_batch: LiDAR accumulation + GT generation,
+tens of minutes per scene), the demo only needs images, K/T and poses, so this takes seconds:
 
     <out>/<scene>/manifest.json    cams (K, T_ego_cam) + frames (imgs)
-    <out>/<scene>/img/*.jpg        768x432 に縮小した 8 カメラ画像
-    <out>/<scene>/ego_motion.npz   pose [N,3] (x,y,yaw) と v0 [N]
+    <out>/<scene>/img/*.jpg        8 camera images downscaled to 768x432
+    <out>/<scene>/ego_motion.npz   pose [N,3] (x,y,yaw) and v0 [N]
 
-使い方:
+Usage:
     python3 bevlane/t4_to_demo.py \
         --scene data/batchA/converted_valid_delay/Pct6CqsV_... \
         --out out/t4demo
-    ./demo.sh --root out/t4demo   (または orin_render --root out/t4demo)
+    ./demo.sh --root out/t4demo   (or orin_render --root out/t4demo)
 
-t4 の罠 (実測済み): ego_pose.json は時刻順に並んでいないことがある。
-必ず timestamp でソートして速度を出す。
+t4 gotcha (observed): ego_pose.json is not always in time order.
+Always sort by timestamp before computing velocity.
 """
 import argparse
 import json
@@ -28,16 +28,16 @@ import numpy as np
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from bevlane.extract_gt import (IMG_H, IMG_W,                # noqa: E402
                                 load_scene_light, quat_to_rot)
-from bevlane.dataset import CAMS                             # noqa: E402  8 カメラ定義
+from bevlane.dataset import CAMS                             # noqa: E402  8-camera definition
 
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--scene", required=True, help="t4 シーンのディレクトリ")
+    ap.add_argument("--scene", required=True, help="t4 scene directory")
     ap.add_argument("--out", default="out/t4demo")
     ap.add_argument("--stride", type=int, default=1)
     ap.add_argument("--cams", default=",".join(CAMS),
-                    help="使うカメラ (既定 = 学習定義の 8)")
+                    help="cameras to use (default = the 8 from training)")
     a = ap.parse_args()
 
     sdir = a.scene.rstrip("/")
@@ -100,8 +100,8 @@ def main():
     json.dump({"scene": scene, "img_hw": [IMG_H, IMG_W],
                "cams": cam_cache, "frames": manifest},
               open(os.path.join(out_dir, "manifest.json"), "w"))
-    print(f"{scene}: {len(manifest)} フレーム / {len(cam_cache)} カメラ "
-          f"/ v0 中央値 {np.median(v0)*3.6:.1f} km/h -> {out_dir}")
+    print(f"{scene}: {len(manifest)} frames / {len(cam_cache)} cameras "
+          f"/ v0 median {np.median(v0)*3.6:.1f} km/h -> {out_dir}")
 
 
 if __name__ == "__main__":

@@ -1,7 +1,7 @@
-"""1 プロセス・同一フレームで LiDAR 有無を切り替える正式 A/B:
-  (1) GUARD VETO (STATIC obstacle) の発生率と真偽
-  (2) 3D BBox の精度 (帯別 recall + 符号付き誤差)
-optional-input A/B の掟 (同一プロセス・同一フレーム・kwarg だけ切替) に従う。
+"""Formal A/B toggling LiDAR on/off in one process on the same frames:
+  (1) GUARD VETO (STATIC obstacle) rate and truthfulness
+  (2) 3D BBox accuracy (recall per band + signed error)
+Follows the optional-input A/B rule (same process, same frames, only the kwarg toggled).
 """
 import argparse, os, sys
 import numpy as np, torch
@@ -24,10 +24,10 @@ ds = BevLaneDataset(a.root, scenes, gt_key="gt_cons", with_boxdet=True,
                     with_ego=True, with_occ=True, with_lidarbev=True,
                     max_per_scene=8, n_cams=8, trim_start=3, trim_end=10)
 m = MODELS["v52"](n_seg=21).cuda().eval()
-# paint-seg / paint-det の枝は enable_* を呼ばないと存在せず、strict=False の
-# 直読みでは黙って捨てられていた (2026-08-22 発覚)。共通ローダで必ず生やす。
+# paint-seg / paint-det branches do not exist until enable_* is called; a plain
+# strict=False load silently dropped them (found 2026-08-22). Always grow them via the shared loader.
 if os.environ.get("METEOR_NO_PAINT"):
-    print("[ab] METEOR_NO_PAINT=1: paint 枝を捨てて測定 (旧 probe の再現)")
+    print("[ab] METEOR_NO_PAINT=1: measuring with paint branches dropped (reproduces the old probe)")
     _sd = torch.load(a.ckpt, map_location="cpu")
     _sd = {k.replace("module.", ""): v for k, v in _sd.get("model", _sd).items()}
     _cur = m.state_dict()
@@ -36,7 +36,7 @@ if os.environ.get("METEOR_NO_PAINT"):
 else:
     load_net(m, a.ckpt)
 
-# 出力順: imgs,K,Tc,gt, boxes,n, ego, occ, lidar_bev (フラグ順に確認済み想定)
+# output order: imgs,K,Tc,gt, boxes,n, ego, occ, lidar_bev (assumed verified against flag order)
 BANDS = [(0, 20), (20, 40), (40, 60)]
 res = {}
 for mode in ("cam", "lidar"):
@@ -77,7 +77,7 @@ for i in range(0, len(ds), step):
             R["veto"] += 1
             if "STATIC" in g["reason"]:
                 R["veto_static"] += 1
-                # 真偽判定: GT occ (255=ignore) の同座標 3x3 に静的物があるか
+                # truth check: is there a static object in the 3x3 at the same coords of GT occ (255=ignore)
                 px, py = g["p_event"]
                 og = np.where(occ_gt.numpy() == 255, 0, occ_gt.numpy())
                 blk_gt = np.isin(og, (1, 8)).any(0)
@@ -85,7 +85,7 @@ for i in range(0, len(ds), step):
                 if 2 <= r0 < 198 and 2 <= c0 < 198 \
                         and blk_gt[r0-1:r0+2, c0-1:c0+2].sum() < 1:
                     R["phantom"] += 1
-        # 3D BBox recall + 符号付き横誤差 (車両)
+        # 3D BBox recall + signed lateral error (vehicles)
         pv = [(x, y) for (c, s, x, y, l, w, yw) in d_in if c == 0]
         for kk in range(max(nb, 0)):
             cls, xe, ye, ln = [float(v) for v in bx[kk][:4]]
@@ -104,12 +104,12 @@ for i in range(0, len(ds), step):
     done += 1
     if done >= a.frames: break
 
-print(f"\n=== {a.tag} LiDAR A/B ({done} 枚, 同一フレーム) ===")
+print(f"\n=== {a.tag} LiDAR A/B ({done} frames, same frames) ===")
 for mode in ("cam", "lidar"):
     R = res[mode]
     rec = " ".join(f"{lo}-{hi}m R={R['hit'][(lo,hi)]/max(R['gt_n'][(lo,hi)],1):.3f}"
                    for lo, hi in BANDS)
     dy = np.array(R["dy"])
     print(f"[{mode:5}] VETO {R['veto']}/{R['n']} (STATIC {R['veto_static']}, "
-          f"うち幻影 {R['phantom']}) | veh {rec} | 横誤差 {dy.mean():+.3f}±{dy.std():.3f}")
+          f"phantom {R['phantom']}) | veh {rec} | lat err {dy.mean():+.3f}±{dy.std():.3f}")
 print("GUARD_AB_DONE")

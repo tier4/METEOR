@@ -159,7 +159,7 @@ robustness aids, not quantization-aware training.
   `hist_bev` buffer is fp16 (I/O format), but the network under calibration
   reads it as the fp32 the ONNX declares. Reinterpreting fp16 bits as fp32
   injected ~1e9 garbage, the `hist`/`tfuse` scales in the cache came out
-  **5·10⁷× too large**, and every INT8 engine from v95 to v120 had a frozen
+  **5×10⁷× too large**, and every INT8 engine from v95 to v120 had a frozen
   ego trajectory and a constant stationary flag while BEV seg and 3D boxes
   looked perfect. Fix: convert on the host (`dtoh → astype(fp32) → htod`).
   Rule: **feed the calibrator the dtype the network reads, not the dtype the

@@ -1,10 +1,10 @@
-"""3D 検出の GT 付き fp16 vs INT8 判定 (ローカル GPU, 2026-08-27)。
+"""fp16 vs INT8 verdict for 3D detection with GT (local GPU, 2026-08-27).
 
-Orin ペア比較で「INT8 が 40m 超の車両箱を +2.4/frame 出す」を検出したが
-GT なしでは幻影か実物か判定不能だった。ローカル val シーン (bev_box GT) で
-P/R をゾーン別に測って白黒つける。
-使い方: python3 deploy/det3d_gt_probe.py <engine> [n_scenes] [stride]
-GT: boxes [N,6] = (cls, x_fwd, y_left, L, W, yaw)、cls1=vehicle。
+The Orin paired comparison found "INT8 emits +2.4/frame vehicle boxes beyond 40 m",
+but without GT we could not tell phantoms from real ones. Measure P/R per zone on
+local val scenes (bev_box GT) to settle it.
+Usage: python3 deploy/det3d_gt_probe.py <engine> [n_scenes] [stride]
+GT: boxes [N,6] = (cls, x_fwd, y_left, L, W, yaw), cls1=vehicle.
 """
 import json
 import os
@@ -53,7 +53,7 @@ for sc in scenes:
         if not os.path.isfile(gtp):
             continue
         gt = np.load(gtp)["boxes"]
-        gt = gt[gt[:, 0] == 1] if len(gt) else gt   # vehicle のみ
+        gt = gt[gt[:, 0] == 1] if len(gt) else gt   # vehicles only
         im = np.stack([cv2.imread(os.path.join(d, f["imgs"][c]))[:, :, ::-1]
                        .transpose(2, 0, 1) for c in ORD])[None] \
             .astype(np.uint8)

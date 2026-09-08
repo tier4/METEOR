@@ -1,12 +1,12 @@
-"""E2E 軌道の「右寄り」が定数バイアスかどうかを切り分ける。
+"""Determine whether the rightward drift of the E2E trajectory is a constant bias.
 
-問い: 予測軌道が右レーン端を沿うように見えるのはバグ (系統オフセット) か、
-場面依存の誤差か。3 つを分けて測る:
-  (1) GT 自体の横位置分布 — 教師が右に寄っていれば学習データ起因
-  (2) 予測 - GT の平均と分散 — 平均が非ゼロで分散が小さければ定数バイアス
-  (3) 横方向レンジ別 — 直進場面に限定しても残るか
+Question: is the predicted path hugging the right lane edge a bug (systematic offset)
+or scene-dependent error? Three separate measurements:
+  (1) lateral distribution of the GT itself -- if the teacher leans right, it is the data
+  (2) mean and variance of pred - GT -- nonzero mean with small variance = constant bias
+  (3) by lateral range -- does it persist on straight scenes only
 
-y の符号: ego 座標系で +y = 左、-y = 右。
+Sign of y: in ego coordinates +y = left, -y = right.
 """
 import argparse
 import os
@@ -43,8 +43,8 @@ def main():
     m.load_state_dict({k: v for k, v in sd.items()
                        if k in cur and cur[k].shape == v.shape}, strict=False)
 
-    HOR = [1, 3, 5]                     # 6 点中の添字 (0.5s 刻みなら 1/2/3 秒相当)
-    gt_y, pr_y, df_y = [], [], []      # [フレーム][horizon]
+    HOR = [1, 3, 5]                     # indices among the 6 points (1/2/3 s at a 0.5 s step)
+    gt_y, pr_y, df_y = [], [], []      # [frame][horizon]
     gt_last = []
     step = max(1, len(ds) // a.frames)
     done = 0
@@ -76,20 +76,20 @@ def main():
     gt_last = np.array(gt_last)
     straight = np.abs(gt_last) < 0.5
 
-    print(f"\n=== {a.tag or a.ckpt} ({done} 枚, 直進 {straight.sum()} 枚) ===")
-    print("(+y = 左 / -y = 右)")
+    print(f"\n=== {a.tag or a.ckpt} ({done} frames, {straight.sum()} straight) ===")
+    print("(+y = left / -y = right)")
     for j, h in enumerate(HOR):
-        print(f"[点{h+1}/6]"
+        print(f"[pt{h+1}/6]"
               f" GT y {gt_y[:, j].mean():+.3f}±{gt_y[:, j].std():.3f}"
-              f" | 予測 y {pr_y[:, j].mean():+.3f}±{pr_y[:, j].std():.3f}"
-              f" | 予測-GT {df_y[:, j].mean():+.3f}±{df_y[:, j].std():.3f}"
-              f" | 右寄り率 {(df_y[:, j] < 0).mean() * 100:.0f}%")
+              f" | pred y {pr_y[:, j].mean():+.3f}±{pr_y[:, j].std():.3f}"
+              f" | pred-GT {df_y[:, j].mean():+.3f}±{df_y[:, j].std():.3f}"
+              f" | right-of-GT {(df_y[:, j] < 0).mean() * 100:.0f}%")
     j = len(HOR) - 1
     s, c = df_y[straight, j], df_y[~straight, j]
-    print(f"\n最終点の 予測-GT: 直進のみ {s.mean():+.3f}±{s.std():.3f} "
-          f"(n={len(s)}) / 旋回含む {c.mean():+.3f}±{c.std():.3f} (n={len(c)})")
-    print(f"GT 自体の最終点 y: 全体 {gt_last.mean():+.3f}±{gt_last.std():.3f} / "
-          f"直進のみ {gt_last[straight].mean():+.3f}±{gt_last[straight].std():.3f}")
+    print(f"\nfinal-point pred-GT: straight only {s.mean():+.3f}±{s.std():.3f} "
+          f"(n={len(s)}) / incl. turns {c.mean():+.3f}±{c.std():.3f} (n={len(c)})")
+    print(f"GT final-point y: all {gt_last.mean():+.3f}±{gt_last.std():.3f} / "
+          f"straight only {gt_last[straight].mean():+.3f}±{gt_last[straight].std():.3f}")
     print("PROBE_RIGHT_BIAS_DONE")
 
 

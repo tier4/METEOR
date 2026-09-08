@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
-"""CV-from-flow プローブ (2026-08-27): 学習なしで「CV+残差」レバーの上限を測る。
+"""CV-from-flow probe (2026-08-27): upper bound of the "CV + residual" lever without training.
 
-probe_agent_cv.py の続き。モデル (v125) のエージェント軌跡 2.14m は
-oracle-CV 0.8m に大差で負けている。では flow ヘッドの推定速度から作る
-「現実の CV」はどこまで出るか? これが良ければ、traj ヘッドを
-CV(flow)+残差 に再パラメータ化するラウンド (v128 候補) の期待値が立つ。
+Follow-up to probe_agent_cv.py. The model's (v125) agent trajectory error of 2.14 m
+loses badly to oracle-CV at 0.8 m. So how good is a realistic CV built from the
+flow head's velocity estimate? If good, it sets the expected value for a round
+that reparameterizes the traj head as CV(flow) + residual (v128 candidate).
 """
 import argparse
 import math
@@ -51,7 +51,7 @@ with torch.no_grad():
         imgs = batch[0].to(dev)
         K = batch[1].to(dev)
         Tc = batch[2].to(dev)
-        # agenttraj 4 連 (boxes[64,6], count, traj[64,6,2], tvalid[64,6])
+        # agenttraj quadruple (boxes[64,6], count, traj[64,6,2], tvalid[64,6])
         tj = bx = None
         tensors = [t for t in batch if torch.is_tensor(t)]
         for j in range(len(tensors) - 3):
@@ -66,13 +66,13 @@ with torch.no_grad():
         pb, th = _temporal_inputs(net, batch, dev, None)
         with torch.autocast("cuda", torch.float16):
             out = net(imgs, K, Tc, None, pb, th)
-        tp = out[9][0].float()                       # [39,H,W] det 格子
-        # eager 出力順: ...traj9 stationary10 tl11 risk12 flow13。
-        # 「C==2 の最初のテンソル」だと hm (2ch ヒートマップ) を掴む誤り。
+        tp = out[9][0].float()                       # [39,H,W] det grid
+        # eager output order: ...traj9 stationary10 tl11 risk12 flow13.
+        # "first tensor with C==2" would wrongly grab hm (2-ch heatmap).
         flow = out[13]
         assert torch.is_tensor(flow) and flow.dim() == 4 \
-            and flow.shape[1] == 2, f"flow 位置ズレ: {flow.shape}"
-        flow = flow[0].float()                       # [2,FH,FW] ±40m 窓
+            and flow.shape[1] == 2, f"flow index mismatch: {flow.shape}"
+        flow = flow[0].float()                       # [2,FH,FW] +-40m window
         Hh, Ww = tp.shape[-2:]
         FH, FW = flow.shape[-2:]
         for k in range(max(0, int(nbT))):
@@ -89,16 +89,16 @@ with torch.no_grad():
             g = tj[k].to(dev)
             vv = v.to(dev)
             cls = "veh" if float(bx[k, 0]) < 1.5 else "vru"
-            # --- モデル予測 (勝者モード)
+            # --- model prediction (winning mode)
             vec = tp[:, ri, ci]
             kb = int(vec[36:39].argmax())
             p = vec[kb * 12:(kb + 1) * 12].view(6, 2)
             add(f"model_{cls}", ((p - g).norm(dim=1) * vv).sum() / vv.sum())
-            # --- CV(flow): flow 窓 ±40m
+            # --- CV(flow): flow window +-40m
             rf = int((40.0 - x) / (80.0 / FH))
             cf = int((40.0 - y) / (80.0 / FW))
             if 0 <= rf < FH and 0 <= cf < FW:
-                vel = flow[:, rf, cf]                # 0.5s あたり変位
+                vel = flow[:, rf, cf]                # displacement per 0.5s
                 pcv = steps * vel.view(1, 2)
                 add(f"cvflow_{cls}",
                     ((pcv - g).norm(dim=1) * vv).sum() / vv.sum())
@@ -108,7 +108,7 @@ with torch.no_grad():
                         pa = math.atan2(float(pcv[5, 1]), float(pcv[5, 0]))
                         add(f"cvflow_head_{cls}", math.degrees(
                             abs((pa - ga + math.pi) % (2 * math.pi) - math.pi)))
-                    # 速度推定そのものの誤差 (0.5s 変位)
+                    # error of the velocity estimate itself (0.5s displacement)
                     add(f"flowerr_{cls}", float((vel - g[0].to(dev)).norm()))
             n_ag += 1
 

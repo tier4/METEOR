@@ -1,8 +1,8 @@
-"""シーンごとのヨーバイアス b̂ = median(進行方位 − pose ヨー) を推定して保存。
+"""Estimate and save the per-scene yaw bias b̂ = median(course heading − pose yaw).
 
-直進区間 (0.4 s で 2 m 以上移動・ヨーレート ≈0) のみ使用。サンプルが
-少ないシーンは同じ root の全シーン中央値で代替 (車両/日付単位の取り付け差)。
-出力: JSON {scene: {"bias_deg": float, "n": int, "fallback": bool}}
+Uses only straight segments (>= 2 m travelled in 0.4 s, yaw rate ≈0). Scenes with
+few samples fall back to the median over all scenes of the same root (per-vehicle/date mounting offset).
+Output: JSON {scene: {"bias_deg": float, "n": int, "fallback": bool}}
 """
 import argparse
 import json
@@ -56,7 +56,7 @@ for s, diffs in per.items():
         n_fb += 1
 json.dump(out, open(a.out, "w"), indent=1, ensure_ascii=False)
 bs = [v["bias_deg"] for v in out.values()]
-print(f"{a.out}: {len(out)} シーン (代替 {n_fb}) "
-      f"root中央値 {np.degrees(root_med):+.3f}° "
-      f"分布 {np.mean(bs):+.3f}±{np.std(bs):.3f}°")
+print(f"{a.out}: {len(out)} scenes (fallback {n_fb}) "
+      f"root median {np.degrees(root_med):+.3f}° "
+      f"distribution {np.mean(bs):+.3f}±{np.std(bs):.3f}°")
 print("YAW_BIAS_DONE")

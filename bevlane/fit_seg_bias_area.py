@@ -1,11 +1,11 @@
-"""road/crosswalk の logit オフセット較正フィット (2026-08-27)。
+"""Logit-offset calibration fit for road/crosswalk (2026-08-27).
 
-ユーザー要望「BEV Seg の road / crosswalk の precision を高めたい」。
-細線クラスで実証済みの決定境界較正 (calibrate_seg_bias.py, r61 で
-IoU +1.5% と precision 同時改善) を面クラスへ拡張するためのフィット。
-val フレームで (road, crosswalk) オフセット格子の P/R/IoU を測る。
+User request: raise the precision of BEV Seg road / crosswalk.
+Extends the decision-boundary calibration proven on thin classes (calibrate_seg_bias.py,
+r61: IoU +1.5% with precision improving at the same time) to the area classes.
+Measures P/R/IoU over a (road, crosswalk) offset grid on val frames.
 
-使い方: python3 bevlane/fit_seg_bias_area.py --ckpt out/v128_best_e2e.pt
+Usage: python3 bevlane/fit_seg_bias_area.py --ckpt out/v128_best_e2e.pt
 """
 import argparse
 import sys
@@ -25,7 +25,7 @@ ap.add_argument("--root", default="out/bevlane")
 ap.add_argument("--scenes", type=int, default=24)
 ap.add_argument("--max-per-scene", type=int, default=5)
 ap.add_argument("--skip", type=int, default=0,
-                help="検証用に別シーン帯を使う (fit/verify 分離)")
+                help="use a different scene range for verification (fit/verify split)")
 a = ap.parse_args()
 
 dev = "cuda"
@@ -79,7 +79,7 @@ with torch.no_grad():
                 acc[(r_off, x_off, l_off, s_off, e_off)][c][2] += int(t.sum()) - tp
 
 print(f"frames={nfr} scenes={len(sc)} ckpt={a.ckpt}")
-print(f"{'road':>5} {'xw':>5} {'lane':>5} | road P/R/IoU | xwalk P/R/IoU | lane P/R/IoU/面積比")
+print(f"{'road':>5} {'xw':>5} {'lane':>5} | road P/R/IoU | xwalk P/R/IoU | lane P/R/IoU/area ratio")
 for g in GRID:
     line = f"{g[0]:4.1f} {g[1]:4.1f} {g[2]:4.1f} {g[3]:4.1f} {g[4]:4.1f} |"
     for c in (ROAD, XW, LANE, STOP, EDGE):

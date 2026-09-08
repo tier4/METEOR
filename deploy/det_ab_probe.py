@@ -1,11 +1,11 @@
-"""INT8 と fp16 の検出ペア比較 (Orin 実機, 2026-08-27)。
+"""Paired INT8 vs fp16 detection comparison (on-device Orin, 2026-08-27).
 
-同一フレーム列を 2 エンジンに流し、decode_boxes の結果をクラス別に
-中心距離でマッチングする。GT が無い実機では fp16 を基準にした差分が
-「INT8 で検出がどう変わったか」の一次情報:
-  b_only (INT8 だけが出す箱) が多い → precision 低下の疑い
-  a_only (fp16 だけが出す箱) が多い → recall 低下の疑い
-使い方: python3 det_ab_probe.py <fp16.engine> <int8.engine> [root] [stride]
+Runs the same frame sequence through both engines and matches decode_boxes
+results per class by center distance. Without GT on the device, the diff
+against the fp16 reference is the primary signal of how INT8 changed detection:
+  many b_only (boxes only INT8 emits) -> suspected precision drop
+  many a_only (boxes only fp16 emits) -> suspected recall drop
+Usage: python3 det_ab_probe.py <fp16.engine> <int8.engine> [root] [stride]
 """
 import json
 import os
@@ -23,8 +23,8 @@ ORD = ["CAM_FRONT_WIDE", "CAM_FRONT_LEFT", "CAM_FRONT_RIGHT", "CAM_BACK_WIDE",
 ENG_A, ENG_B = sys.argv[1], sys.argv[2]
 ROOT = sys.argv[3] if len(sys.argv) > 3 else "calib"
 STRIDE = int(sys.argv[4]) if len(sys.argv) > 4 else 4
-TH = 0.25          # demo と同じ閾値
-MATCH_R = 1.5      # 中心距離 [m]
+TH = 0.25          # same threshold as the demo
+MATCH_R = 1.5      # center distance [m]
 
 
 def load_scene(d):
@@ -42,7 +42,7 @@ def frame_img(d, f):
 
 
 def match(da, db):
-    """クラス別 greedy マッチ。返り値: matched, a_only, b_only (box リスト)。"""
+    """Per-class greedy match. Returns: matched, a_only, b_only (box lists)."""
     used = set()
     matched, a_only = [], []
     for a in da:
@@ -94,14 +94,14 @@ for sc in scenes:
             A["bo_sc"] += [x["score"] for x in bo]
             A["bo_far"] += sum(1 for x in bo if abs(x["x"]) > 40)
 
-print(f"engines A={os.path.basename(ENG_A)} (基準) "
+print(f"engines A={os.path.basename(ENG_A)} (reference) "
       f"B={os.path.basename(ENG_B)}  root={ROOT} frames={nfr} th={TH}")
 for cls in ("vehicle", "vru"):
     A = acc[cls]
     agree = A["m"] / max(A["a"], 1)
-    print(f"  {cls:8s} A={A['a']:5d} B={A['b']:5d} 一致={A['m']:5d} "
-          f"(A基準一致率 {agree:.2f})  A_only={A['ao']:4d} "
-          f"B_only={A['bo']:4d} (うち40m超 {A['bo_far']})")
+    print(f"  {cls:8s} A={A['a']:5d} B={A['b']:5d} matched={A['m']:5d} "
+          f"(agreement vs A {agree:.2f})  A_only={A['ao']:4d} "
+          f"B_only={A['bo']:4d} (of which beyond 40 m {A['bo_far']})")
     for tag in ("ao", "bo"):
         s = A[tag + "_sc"]
         if s:

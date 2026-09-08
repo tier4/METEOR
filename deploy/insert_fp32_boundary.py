@@ -1,10 +1,10 @@
-"""ego / stationary ブランチの入口に Cast(fp32) を挿入して精度境界を作る。
+"""Insert Cast(fp32) at the ego / stationary branch entries to create a precision boundary.
 
-2026-08-22: v98/v103 の INT8 エンジンは ego 出力が凍結し (フレーム間差
-0.06 vs fp16 の 2.05)、stationary のロジット幅も半減する (std 4.79 vs 9.31)
-ため、全物体が「停止」判定になり E2E パスが動かない。--layerPrecisions の
-fp16 指定は Myelin 融合層に届かず無効だったので、ONNX 側で明示的な
-Cast を入れて TensorRT に精度境界を伝える。
+2026-08-22: the v98/v103 INT8 engines froze the ego output (frame-to-frame diff
+0.06 vs 2.05 for fp16) and halved the stationary logit range (std 4.79 vs 9.31),
+so every object got a "stationary" verdict and the E2E path did not move. The
+--layerPrecisions fp16 setting never reached the Myelin-fused layers, so we
+insert explicit Casts on the ONNX side to tell TensorRT the precision boundary.
 """
 import argparse
 import onnx
@@ -25,7 +25,7 @@ done = 0
 for t in targets:
     n = by_name.get(t)
     if n is None:
-        print(f"[warn] ノードなし: {t}")
+        print(f"[warn] node not found: {t}")
         continue
     src = n.input[0]
     cast_out = f"{src}__fp32b"
@@ -41,4 +41,4 @@ for n, cast, cast_out in new_nodes:
     g.node.insert(idx, cast)
 
 onnx.save(m, a.out, save_as_external_data=False)
-print(f"{done} 箇所に精度境界を挿入 -> {a.out}")
+print(f"inserted precision boundary at {done} sites -> {a.out}")

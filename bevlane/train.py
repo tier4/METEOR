@@ -39,22 +39,22 @@ LINE_CLASSES = [4, 5, 6]  # laneline / stopline / road_edge: precision/thin
 # Japanese val set cannot see the class at all.
 
 
-# ---- 走行可能面からの距離場とオフロード罰則 (2026-08-16, VLA 版から移植) ----
-# コマンドで横に動かす損失 (intent_loss) には「道がそれを許すか」の概念が無く、
-# 参照実装では左コマンド時に 6 点中 1.15 点が路外に出て、安全層の VETO 閾値に
-# 14% のフレームで抵触したと記録されている。当方のクローズドループでも
-# VETO 7.5% が出ており、同じ病理とみられる。
+# ---- distance field from the drivable surface + off-road penalty (2026-08-16, ported from the VLA variant) ----
+# The lateral-command loss (intent_loss) has no notion of "does the road allow it";
+# the reference implementation recorded 1.15 of 6 points leaving the road on left
+# commands and hitting the safety-layer VETO threshold in 14% of frames. Our
+# closed loop shows VETO 7.5%, presumably the same pathology.
 DRIVABLE = (1, 3, 4, 5, 7, 8)   # road/crosswalk/laneline/stopline/marking/parking
-DIST_CELL_M = 1.6               # 0.2 m ラスタを 8 倍ダウンサンプル
-DIST_MAX_CELL = 12              # 約 19 m で飽和
+DIST_CELL_M = 1.6               # 0.2 m raster downsampled 8x
+DIST_MAX_CELL = 12              # saturates at ~19 m
 
 
 def drivable_dist(seg_gt):
-    """各セルから最も近い走行可能セルまでの距離 [m] (上限あり)。
+    """Distance [m] from each cell to the nearest drivable cell (capped).
 
-    二値マスクでは壁の奥が平坦になり勾配が消える (参照実装で実測: 平均プール
-    版は無効だった)。距離場なら 15 m 内側からでも道へ押し戻される。
-    cv2.distanceTransform ではなく反復 dilation で作り、GPU 上で完結させる。
+    A binary mask is flat beyond the wall so the gradient vanishes (measured in the
+    reference impl: the avg-pool variant did nothing). A distance field pushes back
+    toward the road even from 15 m inside. Iterated dilation, not cv2.distanceTransform: stays on the GPU.
     """
     dr = torch.zeros(seg_gt.shape, device=seg_gt.device, dtype=torch.float32)
     for c in DRIVABLE:
@@ -68,14 +68,14 @@ def drivable_dist(seg_gt):
 
 
 def offroad_loss(seg_gt, ego_pred, rows=None, topk=2, k_modes=None):
-    """コマンドされた経路が走行可能面を外れることを罰する。
+    """Penalize the commanded path leaving the drivable surface.
 
-    設計上の要点 (参照実装が実測で確定させたもの):
-      * 距離場を使う (壁の奥でも勾配が残る)
-      * 6 点の平均ではなく最悪の 2 点 (5 点が正常でも 1 点の貫通を隠さない)
-      * 3 本の混合ではなく選択されたモードだけ (圧力が 3 分の 1 に薄まるのを防ぐ)
-      * コマンドのある行だけに適用 (コマンド無しの行では GT 自体が縁石を掠める
-        ので、罰則が第二の相反する目的になってしまう)
+    Design points (all settled empirically in the reference implementation):
+      * use a distance field (gradient survives beyond the wall)
+      * worst 2 of the 6 points, not the mean (5 good points must not hide 1 breach)
+      * only the selected mode, not a blend of the 3 (keeps the pressure from being diluted 3x)
+      * only rows that carry a command (on command-less rows the GT itself grazes the
+        curb, so the penalty would become a second, conflicting objective)
     """
     from bevlane.model import EGO_K as _K
     K = k_modes or _K
@@ -90,7 +90,7 @@ def offroad_loss(seg_gt, ego_pred, rows=None, topk=2, k_modes=None):
     md = e[:, 12 * K:12 * K + K].argmax(1)
     sel = wp[torch.arange(B, device=wp.device), md]         # [B,6,2]
     H, W = seg_gt.shape[-2], seg_gt.shape[-1]
-    xf = 80.0                       # 行 0 = 前方 80 m (後方は H から決まる)
+    xf = 80.0                       # row 0 = 80 m ahead (rear extent follows from H)
     gx = ((50.0 - sel[..., 1]) / 0.2) / W * 2.0 - 1.0
     gy = ((xf - sel[..., 0]) / 0.2) / H * 2.0 - 1.0
     grid = torch.stack([gx, gy], -1).view(B, 6, 1, 2)
@@ -444,24 +444,24 @@ def bev_rotation_aug(theta_max_deg, Tc, gt, det_boxes, det_n, traj_gt,
             return None
         r4 = r.float().unsqueeze(1) if r.dim() == 3 else r.float()
         A = torch.zeros(B, 2, 3, device=dev, dtype=torch.float32)
-        # 回転の向き (2026-08-14 修正): affine_grid の (u,v)=(col,row) 座標は
-        # BEV の (x,y) に対して軸交換 = 鏡映なので、点側 (rot_pts / カメラ
-        # Tc@R) と同じ向きに回すには s の符号を反転する必要がある。旧実装は
-        # ラスタだけ逆回転しており、rot-aug を当てた全サンプルで seg/occ GT が
-        # 画像・箱と 2θ (最大 20 度) ずれていた。
+        # Rotation direction (fixed 2026-08-14): affine_grid's (u,v)=(col,row)
+        # coordinates are an axis swap = mirror of BEV (x,y), so rotating the
+        # same way as the point side (rot_pts / camera Tc@R) requires flipping
+        # the sign of s. The old code rotated only the rasters backwards, so every
+        # rot-aug sample had seg/occ GT off from images/boxes by 2θ (up to 20 deg).
         A[:, 0, 0] = c; A[:, 0, 1] = s * (r4.shape[2] / r4.shape[3])
         A[:, 1, 0] = -s * (r4.shape[3] / r4.shape[2]); A[:, 1, 1] = c
-        # 回転中心の補正 (2026-08-13): affine_grid はラスタ中心周りに回すが、
-        # カメラ/box/ego (rot_pts) は自車周り。対称 ±80 グリッドでは両者が
-        # 一致して無害だったが、rear-40 (+80/−40) ではラスタ中心=+20m となり
-        # GT ラスタだけ最大 ~20·sinθ≈3.5m ずれる (v58 以降の全ラウンドが被弾)。
-        # 自車行の正規化座標 y_e 周りの回転に補正する。±80 では y_e=0 で
-        # 従来と完全一致。
-        # 回転中心はラスタごとに違う。グリッド全域 (+XF..−XR) を張る
-        # レーン/det/unk は自車が中心にいないので自車行周りに補正が要り、
-        # occ/risk (±40 m の対称窓) は中心 = 自車なので補正してはいけない。
-        # 形状からの推測は危険 (対称グリッドでは lane 800x500 と risk
-        # 400x250 が同じ縦横比 1.6 になる) ため、呼び出し側で明示する。
+        # Rotation-center fix (2026-08-13): affine_grid rotates about the raster
+        # center, but cameras/boxes/ego (rot_pts) rotate about the ego. On the
+        # symmetric ±80 grid the two coincide (harmless); on rear-40 (+80/−40) the
+        # raster center is +20m and GT rasters alone shift up to ~20*sinθ≈3.5m
+        # (every round since v58 was hit). Correct to rotate about the ego row's
+        # normalized coordinate y_e; on ±80, y_e=0 reproduces the old behaviour exactly.
+        # The rotation center differs per raster. Lane/det/unk span the whole grid
+        # (+XF..−XR) with the ego off-center, so they need the ego-row correction;
+        # occ/risk (symmetric ±40 m window) have center = ego and must NOT be corrected.
+        # Inferring from shape is unsafe (on the symmetric grid lane 800x500 and
+        # risk 400x250 share aspect 1.6), so the caller states it explicitly.
         _ye = (2.0 * _BXF / (_BXF + _BXR) - 1.0) if ego_v is None else ego_v
         A[:, 0, 2] = -dy / _BYH - s * (r4.shape[2] / r4.shape[3]) * _ye
         A[:, 1, 2] = _ye * (1.0 - c)
@@ -535,9 +535,9 @@ class EMA:
 
     def __init__(self, module, decay=0.999, exclude=()):
         self.decay = decay
-        # exclude: EMA に入れない接頭辞 (2026-09-08, v158): seg_head.* を平均すると lr 1e-4 の回で
-        # 2D セグが単一クラスへ崩壊する (v151/v152/v155/v157 で毎エポック再現)。除外した頭は
-        # swap_in 時に生重みのまま残る (ガードの「生 seg_head 移植」を常時化したのと同じ)。
+        # exclude: prefixes kept out of the EMA (2026-09-08, v158): averaging seg_head.* makes the
+        # 2D seg collapse to a single class in lr 1e-4 runs (reproduced every epoch in v151/v152/v155/v157).
+        # Excluded heads keep their raw weights on swap_in (same as making the guard's "graft raw seg_head" permanent).
         self.shadow = {n: p.detach().clone().float()
                        for n, p in module.named_parameters()
                        if p.requires_grad and not n.startswith(tuple(exclude))}
@@ -574,10 +574,10 @@ EGO_FREEZE_PREFIX = ("ego_stem", "ego_mlp", "ego_q", "ego_attn", "ego_delta",
 
 
 def _apply_freeze_ego(mdl):
-    """--freeze-ego (v142): E2E 頭の凍結。requires_grad を切り BN 統計も固定。
-    **DDP ラップの前に呼ぶこと** (後から切ると DDP が勾配を待ち続けて
-    "Expected to have finished reduction" で落ちる — v142 初回で実証)。
-    BN の eval 固定は _reeval_frozen が model.train() のたびに再適用する。"""
+    """--freeze-ego (v142): freeze the E2E head. Clears requires_grad and fixes BN stats.
+    **Call before the DDP wrap** (freezing afterwards makes DDP wait for gradients
+    and crash with "Expected to have finished reduction" — seen on the first v142 run).
+    _reeval_frozen re-applies the BN eval pin on every model.train()."""
     base = mdl.module if hasattr(mdl, "module") else mdl
     base._freeze_ego_prefix = EGO_FREEZE_PREFIX
     n = 0
@@ -592,9 +592,9 @@ def _apply_freeze_ego(mdl):
 
 
 def _reeval_frozen(model):
-    """--det-head-only: model.train() で凍結部の BN が動き出すのを防ぐ。"""
+    """--det-head-only: keep the frozen part's BN from waking up on model.train()."""
     n0 = model.module if hasattr(model, "module") else model
-    # --freeze-ego (v142): ego 系モジュールの BN を eval に固定
+    # --freeze-ego (v142): pin the BN of the ego modules to eval
     _fe = getattr(n0, "_freeze_ego_prefix", None)
     if _fe:
         for nm, m in n0.named_modules():
@@ -633,8 +633,8 @@ def _fit(gt, pred):
 def _temporal_inputs(model, batch, device, tmp_idx):
     if tmp_idx is None:
         return None, None
-    # 履歴画像は [B,H,N,3,432,768] = 6 次元で一意。固定インデックス式は
-    # フラグ構成が変わると破綻するので、合わなければ形状で引き直す。
+    # History images are uniquely [B,H,N,3,432,768] = 6-D. A fixed index formula
+    # breaks when the flag set changes, so fall back to a shape lookup if it does not match.
     if not (tmp_idx < len(batch) and torch.is_tensor(batch[tmp_idx])
             and batch[tmp_idx].dim() == 6):
         _i = next((i for i, t in enumerate(batch)
@@ -670,9 +670,9 @@ def evaluate_ego(model, loader, device, ego_idx, max_batches=40,
     nc = adec = 0.0
     ado = adcv = admv = adst = 0.0
     nmv = nst = 0.0
-    # 連鎖乖離の代理指標 (2026-09-04): 高速帯 (v0 8-15 m/s) の wp0 縦バイアス。
-    # chain_decomp.py で連鎖乖離 +3.2s がこの量 (v132 −0.50, v140 last −0.87)
-    # にほぼ比例すると分かった。エポック末で読めれば ckpt 選択に使える。
+    # Chain-divergence proxy (2026-09-04): wp0 longitudinal bias in the high-speed band (v0 8-15 m/s).
+    # chain_decomp.py showed the chain divergence at +3.2s is nearly proportional to this
+    # quantity (v132 −0.50, v140 last −0.87). Reading it at epoch end allows ckpt selection.
     hsb = hsn = 0.0
     done = 0
     for bi, batch in enumerate(loader):
@@ -1214,10 +1214,10 @@ def evaluate_det3d(model, loader, device, bx_idx, max_batches=30,
         if bi >= max_batches:
             break
         imgs, K, Tc = (t.to(device, non_blocking=True) for t in batch[:3])
-        # 箱テンソルは形状で特定する (2026-08-14): 損失重みを 0 にすると
-        # use_depth/use_seg2d 等が落ちてタプル長が変わり、呼び出し側の
-        # 固定インデックス式 (4 + use_seg2d ...) が別のテンソルを指す。
-        # 箱は [B,K,6]、個数は [B] の整数系という形で一意に決まる。
+        # Locate the box tensor by shape (2026-08-14): zeroing a loss weight drops
+        # use_depth/use_seg2d etc., the tuple length changes, and the caller's
+        # fixed index formula (4 + use_seg2d ...) points at a different tensor.
+        # Boxes are uniquely [B,K,6]; counts are an integer [B].
         if not (torch.is_tensor(batch[bx_idx]) and batch[bx_idx].dim() == 3
                 and batch[bx_idx].shape[-1] == 6):
             bx_idx = next((i for i, t in enumerate(batch)
@@ -1229,10 +1229,10 @@ def evaluate_det3d(model, loader, device, bx_idx, max_batches=30,
                               for t in batch][:8], flush=True)
         bx = batch[bx_idx]
         nb = batch[bx_idx + 1]
-        # 個数テンソルは [B] だったり [B,1] だったりする。以前ここで
-        # dim()!=1 を「並びが違う」と判断して全バッチを飛ばしてしまい、
-        # 検出が常に 0 個 = vehRn/P/yaw が全部 0 と表示されていた
-        # (2026-08-14, ユーザー報告)。形を潰して受け入れる。
+        # The count tensor may be [B] or [B,1]. This used to treat dim()!=1 as
+        # "wrong layout" and skip every batch, so detections were always 0 =
+        # vehRn/P/yaw all displayed as 0 (2026-08-14, user report).
+        # Flatten the shape and accept it.
         if torch.is_tensor(nb) and nb.dim() > 1:
             nb = nb.reshape(nb.shape[0], -1)[:, 0]
         nb = nb.clamp(min=0)
@@ -1479,36 +1479,36 @@ def main():
                          "automatically (in=3); named output layers stay "
                          "dense too.")
     ap.add_argument("--freeze-trunk", action="store_true",
-                    help="共有部 (backbone/FPN/depth/ctx/リフト/時間融合) を"
-                         "凍結し、各ヘッドだけを学習する。共有の学習可能"
-                         "パラメータが無くなるので、ヘッド同士の勾配干渉が"
-                         "構造的にゼロになる (BN 統計も凍結)")
+                    help="freeze the shared part (backbone/FPN/depth/ctx/lift/temporal "
+                         "fusion) and train only the heads. With no shared trainable "
+                         "parameters, gradient interference between heads is "
+                         "structurally zero (BN stats frozen too)")
     ap.add_argument("--det-head-only", action="store_true",
-                    help="3D BBox ヘッドだけを微調整 (backbone/リフト/時間融合/"
-                         "他ヘッドは全て凍結し BN 統計も止める)。共有特徴が"
-                         "動かないので seg/E2E など他出力は数値的に不変 = "
-                         "ゼロリスクで姿勢だけ直せるかの検証・実運用手段")
+                    help="fine-tune only the 3D BBox head (backbone/lift/temporal fusion/"
+                         "other heads all frozen, BN stats stopped). Shared features "
+                         "do not move, so seg/E2E and other outputs are numerically unchanged = "
+                         "a zero-risk way to test/ship a pose-only fix")
     ap.add_argument("--det-only", action="store_true",
-                    help="3D BBox 単独学習 (切り分け用): det 以外の損失を 0 に "
-                         "し、det 経路外のヘッドを凍結する。DDP は勾配の来ない "
-                         "パラメータで落ちるため、重み 0 と凍結はセットで必要。"
-                         "refiner は hm/reg/seg/ego を同時に出すので "
-                         "METEOR_NOREF=1 と併用すること")
+                    help="3D BBox only (for isolation): zero all non-det losses "
+                         "and freeze heads off the det path. DDP crashes on parameters "
+                         "that receive no gradient, so zero weights and freezing go together. "
+                         "The refiner emits hm/reg/seg/ego jointly, so "
+                         "combine with METEOR_NOREF=1")
     ap.add_argument("--depth-ent-w", type=float, default=0.0,
-                    help="深度分布のエントロピー罰則 (鋭化)。実測で 30-60m 帯は"
-                         "ほぼ一様分布 (最大確率 0.07) になっており、これが"
-                         "遠方 3D BBox recall の頭打ちの直接原因")
+                    help="entropy penalty on the depth distribution (sharpening). Measured: "
+                         "the 30-60m band is nearly uniform (max prob 0.07), which is "
+                         "the direct cause of the far-range 3D BBox recall ceiling")
     ap.add_argument("--depth-far-w", type=float, default=0.0,
-                    help="遠方画素の深度 CE 重み (0 で従来と同一)")
+                    help="depth CE weight for far pixels (0 = unchanged)")
     ap.add_argument("--lidar-distill-w", type=float, default=0.0,
-                    help="LiDAR->カメラのモダリティ蒸留の重み (0=無効)。"
-                         "教師=LiDAR 強制 ON の no-grad パス、生徒=主パスの"
-                         "LiDAR ドロップ行。fused BEV と det hm の L2")
+                    help="LiDAR->camera modality distillation weight (0=off). "
+                         "Teacher = no-grad pass with LiDAR forced ON, student = the "
+                         "LiDAR-dropped rows of the main pass. L2 on fused BEV and det hm")
     ap.add_argument("--lidar-distill-every", type=int, default=4,
-                    help="蒸留を行うステップ間隔 (全 rank 同期のため step 基準)")
+                    help="step interval for distillation (step-based so all ranks stay in sync)")
     ap.add_argument("--yaw-fix-deg", type=float, default=0.0,
-                    help="GT 層間回転の補正角 [deg]。ポーズ由来 GT (BEV ラスタ"
-                         "・wp) を自車原点まわりに回す (out/yawfix_plan.md)")
+                    help="correction angle [deg] for the inter-layer GT rotation. Rotates pose-derived "
+                         "GT (BEV rasters, wp) about the ego origin (out/yawfix_plan.md)")
     ap.add_argument("--bn-guard", type=float, default=0.0,
                     help="in-loop conv->BN renorm when running_var exceeds "
                          "this (0=off). Function-preserving; 1e4 recommended")
@@ -1588,57 +1588,57 @@ def main():
     ap.add_argument("--intent-w", type=float, default=0.0,
                     help="v43 command-consistency hinge weight")
     ap.add_argument("--paint-seg", default="",
-                    help="PointPainting: seg2d の指定クラス確率をリフト前の "
-                         "ctx にゼロ初期化 1x1 射影で加算 (例 2,3,4,5,6,7)")
+                    help="PointPainting: add the given seg2d class probabilities to the pre-lift "
+                         "ctx via a zero-initialized 1x1 projection (e.g. 2,3,4,5,6,7)")
     ap.add_argument("--ego-conv-pool", default="",
-                    help="ego の大域平均プーリングを INT8 耐性のある畳み込みへ"
-                         "置き換える。値は make_ego_pool_stats.py が出す JSON。"
-                         "統計で正規化を畳み込み、ego_mlp 側で打ち消すので"
-                         "変換直後の出力は不変 (機能保存)")
+                    help="replace the ego global average pooling with an INT8-tolerant "
+                         "convolution. Value is the JSON written by make_ego_pool_stats.py. "
+                         "The normalization is folded in with the stats and cancelled in ego_mlp, "
+                         "so the output right after conversion is unchanged (function-preserving)")
     ap.add_argument("--pact", default="",
-                    help="上限つき ReLU (PACT) に置換する層の接頭辞 "
-                         "(例 tfuse,ego_stem)。alpha は実測 max で初期化する "
-                         "ので導入時点は機能保存")
+                    help="prefixes of layers to replace with clipped ReLU (PACT) "
+                         "(e.g. tfuse,ego_stem). alpha is initialized from the measured max, "
+                         "so it is function-preserving at insertion")
     ap.add_argument("--pact-w", type=float, default=0.0,
-                    help="PACT の alpha に掛ける L1。上限を押し下げて外れ値を刈る")
+                    help="L1 on the PACT alphas. Pushes the clip down to prune outliers")
     ap.add_argument("--pact-lr", type=float, default=0.02,
-                    help="PACT の alpha 専用 lr。alpha は実測 max (30-130) から "
-                         "p99.9 の数倍 (10-15) まで下げる必要があり、本体の lr "
-                         "(1e-4) では Adam でも届かないため別グループにする")
+                    help="dedicated lr for the PACT alphas. alpha must come down from the measured "
+                         "max (30-130) to a few times p99.9 (10-15), which the base lr "
+                         "(1e-4) cannot reach even with Adam, hence a separate group")
     ap.add_argument("--pact-alpha-init", default="out/pact_alpha_init.json",
-                    help="層名 -> alpha 初期値の JSON (実測 max x1.10)")
+                    help="JSON of layer name -> initial alpha (measured max x1.10)")
     ap.add_argument("--dense-teacher", default="",
-                    help="密教師 ckpt (例 out/ckpt_v151/best_e2e.pt)。スパース微調整で fused BEV と E2E 出力を教師に合わせる (2026-09-07)")
-    ap.add_argument("--dense-distill-w", type=float, default=0.0, help="密教師蒸留の重み (0=無効)")
-    ap.add_argument("--dense-distill-ego-w", type=float, default=1.0, help="蒸留のうち E2E 出力 (ego) の相対重み")
-    ap.add_argument("--dense-distill-every", type=int, default=1, help="教師パスを何 step 毎に走らせるか")
+                    help="dense teacher ckpt (e.g. out/ckpt_v151/best_e2e.pt). During sparse fine-tuning, match fused BEV and E2E outputs to the teacher (2026-09-07)")
+    ap.add_argument("--dense-distill-w", type=float, default=0.0, help="dense-teacher distillation weight (0=off)")
+    ap.add_argument("--dense-distill-ego-w", type=float, default=1.0, help="relative weight of the E2E output (ego) within the distillation")
+    ap.add_argument("--dense-distill-every", type=int, default=1, help="run the teacher pass every N steps")
     ap.add_argument("--ema-exclude", default="",
-                    help="EMA に含めないパラメータ接頭辞 (カンマ区切り, 例 seg_head.)")
+                    help="parameter prefixes excluded from the EMA (comma-separated, e.g. seg_head.)")
     ap.add_argument("--sparse-ramp-steps", type=int, default=0,
-                    help="2:4 を段階的に入れる: 最初の N step は 1:4 (各 4 要素の最小 1 つだけ零) で学習し、"
-                         "N step 後に 2:4 へ切替 (一発剪定より回復が良い; v157, 2026-09-08)")
+                    help="ramp into 2:4: train the first N steps at 1:4 (only the smallest of each 4 zeroed), "
+                         "then switch to 2:4 after N steps (recovers better than one-shot pruning; v157, 2026-09-08)")
     ap.add_argument("--sparse-exclude", default="",
-                    help="--sparse-24 で密のまま残すモジュール接頭辞 (カンマ区切り, 例 ego_,traj_,tfuse3,tgate,sem_ego,delta_stat,refiner.e2e)")
+                    help="module prefixes kept dense under --sparse-24 (comma-separated, e.g. ego_,traj_,tfuse3,tgate,sem_ego,delta_stat,refiner.e2e)")
     ap.add_argument("--hist-lr-mult", type=float, default=1.0,
-                    help="履歴系モジュール (tfuse3/tgate/traj_stem/delta_stat/ego 系) の lr 倍率")
+                    help="lr multiplier for the history modules (tfuse3/tgate/traj_stem/delta_stat/ego family)")
     ap.add_argument("--val-hs", type=int, default=240,
-                    help="エポック末に高速帯 (v0>=8) の val フレームを最大 N 枚別途評価し、"
-                         "wp0 縦バイアスを best_chain 選択に使う (0=無効)")
+                    help="at epoch end, separately evaluate up to N high-speed (v0>=8) val frames and "
+                         "use the wp0 longitudinal bias for best_chain selection (0=off)")
     ap.add_argument("--depth-slim-force", action="store_true",
-                    help="init の深度頭幅と違っても要求した --depth-slim 幅を"
-                         "維持し、init を先頭チャネルで切り出して初期化する")
+                    help="keep the requested --depth-slim width even if it differs from the init's "
+                         "depth head width, initializing from the init's leading channels")
     ap.add_argument("--depth-band-balance", type=float, default=0.0,
-                    help="深度 CE を 10m 帯の逆頻度で重み付け (1.0 で完全均等)。"
-                         "深度 GT の有効画素は 0-10m が 58.9%%、40-60m は 4.6%% "
-                         "しかなく、--depth-far-w は最大 2 倍にしかならない")
+                    help="weight the depth CE by inverse frequency of 10m bands (1.0 = fully balanced). "
+                         "Valid depth GT pixels are 58.9%% at 0-10m but only 4.6%% at 40-60m, "
+                         "so --depth-far-w gives at most 2x")
     ap.add_argument("--paint-det", default="",
-                    help="2D 検出ヒートマップ (hm2d) の指定クラス確率を"
-                         "リフト前の ctx にゼロ初期化 1x1 射影で加算 "
-                         "(例 0,1,2)。深度分布の鋭化が飽和した遠方物体を、"
-                         "2D で見えている証拠として BEV に届ける")
+                    help="add the given 2D detection heatmap (hm2d) class probabilities "
+                         "to the pre-lift ctx via a zero-initialized 1x1 projection "
+                         "(e.g. 0,1,2). Delivers far objects, where depth sharpening has saturated, "
+                         "to the BEV as evidence seen in 2D")
     ap.add_argument("--offroad-w", type=float, default=0.0,
-                    help="コマンド経路が走行可能面を外れることへの罰則 "
-                         "(距離場 x 最悪2点 x 選択モードのみ)")
+                    help="penalty for the commanded path leaving the drivable surface "
+                         "(distance field x worst 2 points x selected mode only)")
     ap.add_argument("--intent-mode-w", type=float, default=0.0,
                     help="v44 command->mode CE weight (raw logits)")
     ap.add_argument("--lat-aug", type=float, default=0.0,
@@ -1650,7 +1650,7 @@ def main():
     ap.add_argument("--use-sdmap", action="store_true",
                     help="v46: feed the OSM SD-map raster (optional input)")
     ap.add_argument("--val-scenes-file", default=None,
-                    help="val シーンを固定リストで上書き (ホールドアウト評価用)")
+                    help="override the val scenes with a fixed list (for holdout evaluation)")
     ap.add_argument("--val-batch", type=int, default=0,
                     help="batch for the val loaders (default: max(train batch, 2)); evaluation is no-grad, so it should not shrink with the training batch -- at batch 1 the capped evals covered half the samples and the rare curve subset (ADEc) hit zero -> nan")
     ap.add_argument("--sync-bn", action="store_true",
@@ -1697,12 +1697,12 @@ def main():
     ap.add_argument("--bev-dropblock", type=float, default=0.0,
                     help="MAE-like BEV block-mask prob per sample")
     ap.add_argument("--bev-wedgedrop", type=float, default=0.0,
-                    help="BEV 角度セクタ (くさび) 零化のサンプル毎確率。"
-                         "カメラ 1 本分の視野欠損を特徴レベルで模擬")
+                    help="per-sample probability of zeroing a BEV angular sector (wedge). "
+                         "Simulates losing one camera's field of view at feature level")
     ap.add_argument("--bev-ringdrop", type=float, default=0.0,
-                    help="BEV 距離帯リング零化のサンプル毎確率")
+                    help="per-sample probability of zeroing a BEV range ring")
     ap.add_argument("--bev-chandrop", type=float, default=0.0,
-                    help="BEV チャネルドロップ率 (SpatialDropout 風)")
+                    help="BEV channel drop rate (SpatialDropout-style)")
     ap.add_argument("--use-tl", action="store_true",
                     help="v47: per-camera box-level traffic-light input")
     ap.add_argument("--tl-drop", type=float, default=0.5,
@@ -1727,19 +1727,19 @@ def main():
     ap.add_argument("--x2-oversample", type=float, default=1.0,
                     help="sampling weight for the x2gen2 (7-camera) scenes")
     ap.add_argument("--farveh-oversample", type=float, default=1.0,
-                    help="D2': 遠方車両リッチシーン (out/farveh_scenes.txt) の"
-                         "サンプル重み。40-80m recall 対策")
+                    help="D2': sampling weight for far-vehicle-rich scenes (out/farveh_scenes.txt). "
+                         "Targets 40-80m recall")
     ap.add_argument("--tversky-area-w", type=float, default=0.0,
-                    help="S2: road(1)/crosswalk(3) への FP 罰則 tversky")
+                    help="S2: tversky FP penalty on road(1)/crosswalk(3)")
     ap.add_argument("--vru-cw", type=float, default=5.0,
-                    help="V レバー: det ヒートマップの VRU クラス重み (既定 5.0)")
+                    help="V lever: VRU class weight in the det heatmap (default 5.0)")
     ap.add_argument("--okinawa-oversample", type=float, default=1.0,
-                    help="沖縄シーン (out/okinawa_train_scenes.txt) の重み")
+                    help="weight for Okinawa scenes (out/okinawa_train_scenes.txt)")
     ap.add_argument("--vru-oversample", type=float, default=1.0,
-                    help="V レバー: VRU リッチシーン (out/vru_scenes.txt) の重み")
+                    help="V lever: weight for VRU-rich scenes (out/vru_scenes.txt)")
     ap.add_argument("--cosmos-no-ego", action="store_true",
-                    help="v131 設計: cosmos3_* フレームを ego (E2E) 損失から"
-                         "除外 (認識のみ学習)。v126 の ADEc +0.027 対策")
+                    help="v131 design: exclude cosmos3_* frames from the ego (E2E) loss "
+                         "(perception-only training). Counter to the v126 ADEc +0.027")
     ap.add_argument("--cosmos-oversample", type=float, default=1.0,
                     help="sampling weight for registered cosmos3_* weather/"
                          "lighting transfer scenes")
@@ -1769,11 +1769,11 @@ def main():
     ap.add_argument("--seg-w", type=float, default=1.0)
     ap.add_argument("--init-ckpt", default="")
     ap.add_argument("--depth-bins", type=int, default=64,
-                    help="深度ヘッドのビン数 (Orin 48bin レバー。64 以外は"
-                         "init の深度ヘッドが drop され再学習)")
+                    help="number of depth head bins (Orin 48bin lever. Anything but 64 "
+                         "drops the init's depth head and retrains it)")
     ap.add_argument("--depth-slim", type=float, default=0.0,
-                    help="深度ヘッド幅の縮小倍率 (0=無効, 例 0.75)。"
-                         "init-ckpt 読み込み後に新規初期化ヘッドへ置換")
+                    help="depth head width shrink factor (0=off, e.g. 0.75). "
+                         "Replaced by a freshly initialized head after loading init-ckpt")
     ap.add_argument("--train-list", default="",
                     help="file of scene names to restrict training to")
     ap.add_argument("--min-cov-core", type=float, default=0.03,
@@ -1787,37 +1787,37 @@ def main():
     ap.add_argument("--train-bg", action="store_true",
                     help="supervise unlabeled(0) as background class")
     ap.add_argument("--ego-speed-w", type=float, default=0.0,
-                    help="ego 損失の速度重み 1+v0/この値 (上限 4)。高速直進の"
-                         "少数フレームを L1 中央値で無視させない (v139b)")
+                    help="ego loss speed weight 1+v0/this (cap 4). Keeps the few high-speed "
+                         "straight frames from being ignored by the L1 median (v139b)")
     ap.add_argument("--freeze-ego", action="store_true",
-                    help="E2E (ego) 頭を凍結: ego_stem/ego_mlp/ego_attn/ego_delta/"
-                         "sem_ego/kin_delta/dec_head/refiner.e2e 等の requires_grad を"
-                         "切り、BN を eval 固定。認識レバーのラウンドで連鎖乖離を守る (v142)")
+                    help="freeze the E2E (ego) head: clear requires_grad on ego_stem/ego_mlp/ego_attn/ego_delta/"
+                         "sem_ego/kin_delta/dec_head/refiner.e2e etc. and pin BN to eval. "
+                         "Protects chain divergence in perception-lever rounds (v142)")
     ap.add_argument("--kin-anchor", action="store_true",
-                    help="v139: ego waypoint に g_t*[v0*t,0] を加算 (ゼロ初期化)")
+                    help="v139: add g_t*[v0*t,0] to the ego waypoints (zero-initialized)")
     ap.add_argument("--semantic-ego", action="store_true",
-                    help="ego に「意味出力 (seg/det) を読むゼロ初期化残差」を追加"
-                         "する。INT8 で健全なテンソルだけを読む経路を学習させ、"
-                         "fp16-keep から tfuse/ego を外して素の INT8 (99ms) を狙う")
+                    help="add a zero-initialized residual to ego that reads the semantic outputs (seg/det). "
+                         "Learns a path that reads only INT8-healthy tensors, aiming to drop "
+                         "tfuse/ego from fp16-keep for plain INT8 (99ms)")
     ap.add_argument("--traj-flow", action="store_true",
-                    help="A1: flow 場を traj ヘッド入力へゼロ初期化残差で接続"
-                         " (detach 供給、stat 入力は不変)")
+                    help="A1: connect the flow field to the traj head input via a zero-initialized residual"
+                         " (fed detached, stat input unchanged)")
     ap.add_argument("--depth-log-bins", action="store_true",
-                    help="D5: 深度ビンを対数間隔化 (遠方の相対分解能を確保)")
+                    help="D5: log-spaced depth bins (preserves relative resolution at range)")
     ap.add_argument("--mode-scorer", action="store_true",
-                    help="E3: 経路条件付きモード選択スコアラ (ゼロ初期化)")
+                    help="E3: route-conditioned mode selection scorer (zero-initialized)")
     ap.add_argument("--det-temporal", action="store_true",
-                    help="D7: det hm へ時間特徴のゼロ初期化残差")
+                    help="D7: zero-initialized temporal-feature residual into the det hm")
     ap.add_argument("--traj-cv", action="store_true",
-                    help="A6: 他車軌跡を CV(v̂)+残差へ再パラメータ化")
+                    help="A6: reparameterize other-agent trajectories as CV(v̂)+residual")
     ap.add_argument("--graft-lr-mult", type=float, default=1.0,
-                    help="det_tmp/traj_vel 残差の専用 lr 倍率 (probe 用)")
+                    help="dedicated lr multiplier for the det_tmp/traj_vel residuals (for probes)")
     ap.add_argument("--traj-flow-lr-mult", type=float, default=1.0,
-                    help="A1b: traj_flow 残差の専用 lr 倍率 (probe 短期で"
-                         "ゼロ初期化を育てるため)")
+                    help="A1b: dedicated lr multiplier for the traj_flow residual (to grow the "
+                         "zero init within a short probe)")
     ap.add_argument("--delta-stat", action="store_true",
-                    help="停止判定を時間差分 |bev - warp(prev)| から出す新ヘッド"
-                         "に差し替える (INT8 で stat が潰れる問題の根本対処)")
+                    help="replace the stop decision with a new head driven by the temporal difference "
+                         "|bev - warp(prev)| (root fix for stat collapsing under INT8)")
     ap.add_argument("--gt-valid", action="store_true",
                     help="ignore cells outside per-frame LiDAR-observed mask")
     ap.add_argument("--box-corner-w", type=float, default=0.0,
@@ -1827,7 +1827,7 @@ def main():
                     help="gt = raster autolabel; gt_vec = hybrid vector-line GT")
     args = ap.parse_args()
     if getattr(args, "det_head_only", False):
-        args.det_only = True          # 損失の落とし方は det-only と同じ
+        args.det_only = True          # losses are dropped the same way as det-only
     if getattr(args, "det_only", False):
         for _w in ("seg_w", "dice_w", "lovasz_w", "boundary_w", "tversky_w",
                    "depth_w", "seg2d_w", "bbox2d_w", "ego_w", "occ_w",
@@ -1856,8 +1856,8 @@ def main():
 
     train_s, val_s = split_scenes(args.root)
     if args.val_scenes_file:
-        # ホールドアウト評価用: val を固定リストで上書き (実在シーンのみ)。
-        # 学習側からは二重に除外 (HOLDOUT_FILES と重複しても無害)。
+        # Holdout evaluation: override val with a fixed list (existing scenes only).
+        # Also excluded from train (harmless if it overlaps HOLDOUT_FILES).
         want = set(open(args.val_scenes_file).read().split())
         val_s = sorted(want & set(os.listdir(args.root)))
         train_s = [s for s in train_s if s not in want]
@@ -1939,10 +1939,10 @@ def main():
                             seg2d_key=args.seg2d_key, with_ego=use_ego,
                             with_occ=use_occ, with_agenttraj=use_traj,
                             with_temporal=use_temporal, with_tl=use_tl,
-                            # 箱は通常 agenttraj 経由で入るので、traj 損失を
-                            # 切った構成 (--det-only 等) では val から箱が
-                            # 消えて 3D 評価が全部 0 になっていた
-                            # (2026-08-14, ユーザー報告)。明示的に補う。
+                            # Boxes normally arrive via agenttraj, so configs with
+                            # the traj loss off (--det-only etc.) lost the boxes
+                            # from val and every 3D metric read 0
+                            # (2026-08-14, user report). Request them explicitly.
                             with_boxdet=(use_boxdet and not use_traj),
                             with_risk=use_risk, with_lanegraph=use_lg,
                             temporal_hist=hist_n, with_unknown=use_unk,
@@ -1990,11 +1990,11 @@ def main():
             print(f"[val] epoch-end slice: {len(va_ep)} samples over "
                   f"{len(_sc)} of {len(val_s)} scenes (stride {_st})",
                   flush=True)
-        # 高速帯 val (2026-09-05, v145 判定の反省): エポック末スライスには
-        # v0>=8 m/s のフレームが ~19 しかなく、連鎖乖離を支配する高速帯の
-        # 縦バイアス (v145: −1.13 m) が val では −0.02 と全く見えなかった。
-        # val 全体から v0>=8 のフレームを等間隔に最大 --val-hs 枚集めて
-        # 別スライスで測り、best_chain の選択にはこちらのバイアスを使う。
+        # High-speed val (2026-09-05, lesson from the v145 call): the epoch-end
+        # slice has only ~19 frames with v0>=8 m/s, so the high-speed longitudinal
+        # bias that dominates chain divergence (v145: −1.13 m) showed as −0.02 in val.
+        # Gather up to --val-hs frames with v0>=8 evenly from the whole val set,
+        # measure them as a separate slice, and use this bias for best_chain selection.
         dv_hs = None
         if use_ego and args.val_hs > 0:
             _v0c = {}
@@ -2096,8 +2096,8 @@ def main():
                       f"{n_x}/{len(tr)} frames ({len(x2)} scenes)", flush=True)
         if args.okinawa_oversample > 1.0 and \
                 os.path.exists("out/okinawa_train_scenes.txt"):
-            # 沖縄ドメイン (2026-09-01): holdout ADEc 1.18 vs 本土 0.49。
-            # 496 シーン / 11.6k = 4.3% の露出では不足 → 重み押し上げ。
+            # Okinawa domain (2026-09-01): holdout ADEc 1.18 vs mainland 0.49.
+            # 496 scenes / 11.6k = 4.3% exposure is not enough -> boost the weight.
             oki = set(open("out/okinawa_train_scenes.txt").read().split())
             if weights is None:
                 weights = torch.ones(len(tr))
@@ -2127,8 +2127,8 @@ def main():
                       flush=True)
         if args.farveh_oversample > 1.0 and \
                 os.path.exists("out/farveh_scenes.txt"):
-            # D2' (2026-08-27): 40-80m recall は近傍の半分 (0.19-0.28 vs
-            # 0.46-0.53)。遠方車両リッチなシーンを重み増しして露出を上げる。
+            # D2' (2026-08-27): 40-80m recall is half of near range (0.19-0.28 vs
+            # 0.46-0.53). Upweight far-vehicle-rich scenes to raise exposure.
             fv = set(open("out/farveh_scenes.txt").read().split())
             if weights is None:
                 weights = torch.ones(len(tr))
@@ -2176,16 +2176,16 @@ def main():
     mkw = {"n_seg": args.n_seg2d} \
         if args.model in ("v13", "v13d", "v14d", "v15", "v16", "v17", "v18", "v19", "v20", "v21", "v22", "v23", "v24", "v25", "v26", "v27", "v28", "v29", "v30", "v31", "v32", "v33", "v34", "v35", "v36", "v37", "v38", "v39", "v40", "v41", "v42", "v43", "v44", "v45", "v46", "v47", "v48", "v49", "v51", "v52", "v53", "v54", "v55", "v56", "v63b", "v64r50", "v52r50", "v52r50s8", "v52rvgg", "v55rvgg", "v52s8") else {}
     if args.depth_bins != 64:
-        # Orin 48bin レバー (2026-08-31): D はクラス属性なので、構築前に
-        # 具象クラスへシャドウする。ビン数を変えてもレンジ (1..79.75m) は
-        # 維持 = ステップを粗くする。init の 64bin ヘッドは形不一致で
-        # drop され再学習になる。
+        # Orin 48bin lever (2026-08-31): D is a class attribute, so shadow it on
+        # the concrete class before construction. Changing the bin count keeps
+        # the range (1..79.75m) = coarser step. The init's 64bin head is dropped
+        # on shape mismatch and retrained.
         _M = MODELS[args.model]
         _span = (_M.D - 1) * _M.D_STEP
         _M.D = args.depth_bins
         _M.D_STEP = _span / (args.depth_bins - 1)
         if is_main:
-            print(f"[depth-bins] D={_M.D} step={_M.D_STEP:.4f} (レンジ維持)",
+            print(f"[depth-bins] D={_M.D} step={_M.D_STEP:.4f} (range kept)",
                   flush=True)
     model = MODELS[args.model](**mkw).to(device)
     # METEOR_MODPROBE=1: name the FIRST module whose output goes non-finite.
@@ -2207,7 +2207,7 @@ def main():
                              for t in inp if torch.is_tensor(t))
                 _MODBAD.append(f"{nm} ({type(mod).__name__}) "
                                f"out{tuple(outp.shape)} "
-                               f"入力は{'有限' if fin_in else '既に非有限'}")
+                               f"input {'finite' if fin_in else 'already non-finite'}")
             return _h
         n_h = 0
         for _nm, _m in model.named_modules():
@@ -2215,7 +2215,7 @@ def main():
                 _m.register_forward_hook(_mk(_nm))
                 n_h += 1
         if is_main:
-            print(f"[modprobe] {n_h} モジュールに装着", flush=True)
+            print(f"[modprobe] hooked {n_h} modules", flush=True)
     if args.grad_ckpt:
         model.grad_ckpt = True
         if is_main:
@@ -2266,8 +2266,8 @@ def main():
         except TypeError:  # PyTorch < 2.0
             _init_raw = torch.load(args.init_ckpt, map_location="cpu")
         sd = _init_raw["model"]
-        # init 側が縮小済み深度ヘッドなら、読み込み前に同じ幅で再構築する
-        # (形状不一致で drop されて学習済み重みを失うのを防ぐ)
+        # If the init already has a slimmed depth head, rebuild at the same width
+        # before loading (avoids dropping trained weights on shape mismatch)
         _npre0 = model.module if hasattr(model, "module") else model
         if "depth_head.0.0.weight" in sd and hasattr(_npre0, "depth_head"):
             _w_ck = tuple(sd[f"depth_head.{i}.0.weight"].shape[0]
@@ -2275,11 +2275,11 @@ def main():
                           if f"depth_head.{i}.0.weight" in sd)
             _w_cur = tuple(m[0].out_channels for m in _npre0.depth_head[:-1])
             if len(_w_ck) == 4 and args.depth_slim_force and args.depth_slim > 0:
-                # --depth-slim-force (2026-09-05, v146): 先に要求幅へ再構築して
-                # から、init の深度頭テンソルを先頭チャネルで切り出して warm
-                # start する (init 合わせの再構築でレバーが無効化されるのを防ぎ、
-                # 新規初期化より速く収束させる)。後段の depth_slim ブロックは
-                # 幅が既定 (256) でないので二重適用しない。
+                # --depth-slim-force (2026-09-05, v146): rebuild at the requested width
+                # first, then warm-start by slicing the init's depth head tensors to
+                # their leading channels (keeps the init-matching rebuild from disabling
+                # the lever, and converges faster than fresh init). The later depth_slim
+                # block does not apply twice because the width is no longer the default (256).
                 from bevlane.model import enable_depth_slim
                 enable_depth_slim(_npre0, scale=args.depth_slim)
                 _w_cur = tuple(m[0].out_channels for m in _npre0.depth_head[:-1])
@@ -2290,12 +2290,12 @@ def main():
                             and tuple(sd[_k].shape) != tuple(_msd[_k].shape):
                         sd[_k] = sd[_k][tuple(slice(0, d) for d in _msd[_k].shape)].clone()
                         _nsl += 1
-                print(f"[depth-slim] 要求幅 {_w_cur} を維持し init {_w_ck} を"
-                      f"切り出して初期化 ({_nsl} tensor)", flush=True)
+                print(f"[depth-slim] kept requested width {_w_cur}; initialized by "
+                      f"slicing init {_w_ck} ({_nsl} tensor)", flush=True)
             elif len(_w_ck) == 4 and _w_ck != _w_cur:
                 from bevlane.model import enable_depth_slim
                 enable_depth_slim(_npre0, widths=_w_ck)
-                print(f"[depth-slim] init に合わせ幅 {_w_ck} で再構築",
+                print(f"[depth-slim] rebuilt at width {_w_ck} to match init",
                       flush=True)
         # Dynamic branches MUST exist before state_dict filtering/loading.
         # They used to be attached below, after this block, so every warm
@@ -2368,80 +2368,80 @@ def main():
         if not hasattr(_n0p, "paint_proj"):
             _n0p.enable_paint_seg([int(x) for x in args.paint_seg.split(",")])
         if is_main:
-            print(f"[paint-seg] クラス {args.paint_seg} をリフト前に注入 "
-                  f"(ゼロ初期化 = 機能保存)", flush=True)
+            print(f"[paint-seg] injecting classes {args.paint_seg} before the lift "
+                  f"(zero-initialized = function-preserving)", flush=True)
     if args.ego_speed_w > 0:
         (model.module if hasattr(model, "module") else model).EGO_SPEED_W = args.ego_speed_w
         if is_main:
-            print(f"[ego-speed-w] 速度重み 1+v0/{args.ego_speed_w} (cap 4)", flush=True)
+            print(f"[ego-speed-w] speed weight 1+v0/{args.ego_speed_w} (cap 4)", flush=True)
     if args.kin_anchor:
         from bevlane.model import enable_kinematic_anchor
         enable_kinematic_anchor(model.module if hasattr(model, "module") else model)
         if is_main:
-            print("[kin-anchor] 運動学アンカー g_t*[v0*t,0] を有効化 (ゼロ初期化)", flush=True)
+            print("[kin-anchor] kinematic anchor g_t*[v0*t,0] enabled (zero-initialized)", flush=True)
     if args.freeze_ego:
         _nf = _apply_freeze_ego(model)
         if is_main:
-            print(f"[freeze-ego] E2E 頭を凍結: {_nf/1e6:.2f}M params (requires_grad=False, BN eval; DDP 前)", flush=True)
+            print(f"[freeze-ego] E2E head frozen: {_nf/1e6:.2f}M params (requires_grad=False, BN eval; before DDP)", flush=True)
     if args.semantic_ego:
         from bevlane.model import enable_semantic_ego
         _n0se = model.module if hasattr(model, "module") else model
         enable_semantic_ego(_n0se)
         if is_main:
-            print("[semantic-ego] 意味出力読みの ego 残差を有効化", flush=True)
+            print("[semantic-ego] semantic-output-reading ego residual enabled", flush=True)
     if args.vru_cw != 5.0:
         _n0v = model.module if hasattr(model, "module") else model
         _n0v.VRU_CW = args.vru_cw
         if is_main:
-            print(f"[vru-cw] VRU クラス重み {args.vru_cw}", flush=True)
+            print(f"[vru-cw] VRU class weight {args.vru_cw}", flush=True)
     if args.depth_log_bins:
         from bevlane.model import enable_depth_logbins
         _n0lb = model.module if hasattr(model, "module") else model
         enable_depth_logbins(_n0lb)
         if is_main:
-            print("[depth-log-bins] 対数ビン有効化", flush=True)
+            print("[depth-log-bins] log bins enabled", flush=True)
     if args.mode_scorer:
         from bevlane.model import enable_mode_scorer
         _n0m = model.module if hasattr(model, "module") else model
         enable_mode_scorer(_n0m)
         if is_main:
-            print("[mode-scorer] 経路条件付き選択スコアラを有効化", flush=True)
+            print("[mode-scorer] route-conditioned selection scorer enabled", flush=True)
     if args.det_temporal:
         from bevlane.model import enable_det_temporal
         _n0d = model.module if hasattr(model, "module") else model
         enable_det_temporal(_n0d)
         if is_main:
-            print("[det-temporal] hm への時間特徴残差を有効化", flush=True)
+            print("[det-temporal] temporal-feature residual into hm enabled", flush=True)
     if args.traj_cv:
         from bevlane.model import enable_traj_cv
         _n0c = model.module if hasattr(model, "module") else model
         enable_traj_cv(_n0c)
         if is_main:
-            print("[traj-cv] CV 再パラメータ化を有効化", flush=True)
+            print("[traj-cv] CV reparameterization enabled", flush=True)
     if args.traj_flow:
         from bevlane.model import enable_traj_flow
         _n0tf = model.module if hasattr(model, "module") else model
         enable_traj_flow(_n0tf)
         if is_main:
-            print("[traj-flow] flow→traj ゼロ初期化残差を有効化", flush=True)
+            print("[traj-flow] flow->traj zero-initialized residual enabled", flush=True)
 
     if args.delta_stat:
         from bevlane.model import enable_delta_stat
         _n0m = model.module if hasattr(model, "module") else model
         enable_delta_stat(_n0m)
         if is_main:
-            print("[delta-stat] 停止判定を時間差分ヘッドへ差し替え", flush=True)
+            print("[delta-stat] stop decision switched to the temporal-difference head", flush=True)
 
     if args.depth_slim > 0:
-        # init-ckpt が既に縮小済みなら読み込み時に幅を合わせてあるので、
-        # ここで置き換えるのは既定幅 (256 始まり) のときだけ。
+        # If init-ckpt was already slimmed, the width was matched at load time,
+        # so replace here only when the width is still the default (starts at 256).
         _n0d = model.module if hasattr(model, "module") else model
         if _n0d.depth_head[0][0].out_channels == 256:
             from bevlane.model import enable_depth_slim
             enable_depth_slim(_n0d, scale=args.depth_slim)
             if is_main:
                 _w = tuple(m[0].out_channels for m in _n0d.depth_head[:-1])
-                print(f"[depth-slim] 深度ヘッドを幅 {_w} へ縮小 (新規初期化)",
+                print(f"[depth-slim] depth head slimmed to width {_w} (fresh init)",
                       flush=True)
 
     if args.ego_conv_pool:
@@ -2465,15 +2465,15 @@ def main():
         if not hasattr(_n0d, "paint_det_proj"):
             _n0d.enable_paint_det([int(x) for x in args.paint_det.split(",")])
         if is_main:
-            print(f"[paint-det] 2D 検出クラス {args.paint_det} をリフト前に"
-                  f"注入 (ゼロ初期化 = 機能保存)", flush=True)
-    # 損失重みが 0 のヘッドは勾配が来ないため、DDP の reducer が
-    # 「前の iteration の reduction が終わっていない」で落ちる。
-    # 2026-08-15: この凍結は --freeze-trunk の中にしか無かったので、
-    # 幹あり (フェーズ A) の学習が pl_head / lanegraph 一式で起動直後に
-    # 落ちていた。重み 0 のヘッドは元々学習されないので、常時凍結は
-    # 学習内容を変えない (機能保存)。lidar_stem/sdmap_stem のように
-    # freeze-trunk 時だけ幹扱いするものはここには入れない。
+            print(f"[paint-det] injecting 2D detection classes {args.paint_det} before "
+                  f"the lift (zero-initialized = function-preserving)", flush=True)
+    # Heads with loss weight 0 receive no gradient, so the DDP reducer crashes
+    # with "reduction from the previous iteration has not finished".
+    # 2026-08-15: this freeze lived only inside --freeze-trunk, so trunk-on
+    # (phase A) training crashed right after start on the pl_head / lanegraph
+    # set. Zero-weight heads were never trained anyway, so freezing them always
+    # changes nothing (function-preserving). Modules like lidar_stem/sdmap_stem that
+    # count as trunk only under freeze-trunk do not belong here.
     _ZERO_W = {
         "pl_head": args.pseudo_lidar_w,
         "lg_tower": args.lanegraph_w, "lg_in": args.lanegraph_w,
@@ -2503,12 +2503,12 @@ def main():
         if _nm and _nm.split(".")[0] in _offz:
             _m.eval()
     if is_main and _offz:
-        print(f"[freeze-zero] 損失 0 のため凍結: {', '.join(_offz)}",
+        print(f"[freeze-zero] frozen (loss 0): {', '.join(_offz)}",
               flush=True)
     if args.freeze_trunk and not args.det_only:
-        # 共有幹 = 画像特徴 -> depth/ctx -> リフト -> 時間融合。ここを止めると
-        # ヘッド同士が共有する学習可能パラメータが無くなり、干渉が構造的に
-        # 消える (各ヘッドの勾配は自分のパラメータにしか届かない)。
+        # Shared trunk = image features -> depth/ctx -> lift -> temporal fusion.
+        # Freezing it leaves no trainable parameter shared between heads, so
+        # interference vanishes structurally (each head's gradient reaches only its own parameters).
         _TRUNK = ("stem", "layer1", "layer2", "layer3", "layer4",
                   "lat1", "lat2", "lat3", "lat4", "fuse",
                   "depth_head", "depth_up", "ctx", "tgate", "tfuse3", "tfuse")
@@ -2522,7 +2522,7 @@ def main():
         for _nm, _m in _n0.named_modules():
             if _nm and _nm.split(".")[0] in _TRUNK:
                 _m.eval()
-        # 損失が 0 のヘッドは勾配が来ないので DDP が落ちる -> 併せて凍結する。
+        # Heads with loss 0 receive no gradient and crash DDP -> freeze them too.
         _HEAD_W = {
             "dec": args.seg_w, "lane_branch": args.seg_w,
             "lane_sdf": args.lane_sdf_w, "seg_deep": args.seg_w,
@@ -2571,22 +2571,22 @@ def main():
             if _nm and _nm.split(".")[0] in _off:
                 _m.eval()
         if is_main and _off:
-            print(f"[freeze-trunk] 損失 0 のため凍結: {', '.join(_off)}",
+            print(f"[freeze-trunk] frozen (loss 0): {', '.join(_off)}",
                   flush=True)
         _n0._freeze_eval_keep = tuple(
             n for n, _ in _n0.named_children()
             if n not in _TRUNK and n not in _off)
         if is_main:
-            print(f"[freeze-trunk] ヘッド {_tr / 1e6:.1f}M を学習 / 共有幹 "
-                  f"{_fr / 1e6:.1f}M を凍結 (BN 統計含む)", flush=True)
+            print(f"[freeze-trunk] training heads {_tr / 1e6:.1f}M / shared trunk "
+                  f"{_fr / 1e6:.1f}M frozen (incl. BN stats)", flush=True)
     if args.det_only:
-        # det 経路 = backbone -> FPN -> depth/ctx -> lift -> 時間融合 ->
-        # det_stem -> hm/reg。それ以外は凍結する。
-        # --det-head-only はさらに trunk も凍結し、det ヘッドだけを動かす。
-        # --det-head-only は refiner の box 枝も学習対象にする (refiner は
-        # hm/reg を最終的に上書きするので、これを凍結したまま生ヘッドだけ
-        # 動かすと供給側と補正側が食い違う)。seg/ego 枝は凍結したままなので
-        # 他出力は不変、DDP の未使用パラメータ問題も起きない。
+        # det path = backbone -> FPN -> depth/ctx -> lift -> temporal fusion ->
+        # det_stem -> hm/reg. Everything else is frozen.
+        # --det-head-only additionally freezes the trunk and moves only the det head.
+        # --det-head-only also trains the refiner's box branch (the refiner
+        # ultimately overwrites hm/reg, so moving only the raw head with it frozen
+        # makes the producer and the corrector disagree). seg/ego branches stay
+        # frozen, so other outputs are unchanged and DDP's unused-parameter issue does not arise.
         _KEEP = (("det_stem", "hm_head", "reg_head", "refiner.box")
                  if args.det_head_only else
                  ("stem", "layer1", "layer2", "layer3", "layer4",
@@ -2606,16 +2606,16 @@ def main():
                 _p.requires_grad_(False)
                 _fr += _p.numel()
         if args.det_head_only:
-            # 凍結部の BatchNorm は train() のままだと running stats が動き、
-            # 「他出力は不変」が崩れる。該当モジュールを eval() に固定する。
+            # BatchNorm in the frozen part left in train() moves its running stats,
+            # breaking "other outputs unchanged". Pin those modules to eval().
             for _nm, _m in _n0.named_modules():
                 if _nm and not _keep(_nm):
                     _m.eval()
-            _n0._freeze_eval_keep = _KEEP     # train() 再突入時に維持する印
+            _n0._freeze_eval_keep = _KEEP     # marker to preserve on re-entering train()
         if is_main:
             print(f"[det-only{'/head' if args.det_head_only else ''}] "
-                  f"学習 {_tr / 1e6:.1f}M / 凍結 {_fr / 1e6:.1f}M "
-                  f"パラメータ; det 以外の損失は 0", flush=True)
+                  f"training {_tr / 1e6:.1f}M / frozen {_fr / 1e6:.1f}M "
+                  f"params; non-det losses are 0", flush=True)
     if args.det_sup_front is not None or args.det_sup_rear is not None:
         _n = model.module if hasattr(model, "module") else model
         _n.DET_SUP_XF = args.det_sup_front
@@ -2676,7 +2676,7 @@ def main():
             find_unused_parameters=(args.seg_w == 0 or
                                     (args.model in ("v13", "v13d", "v14d", "v15", "v16", "v17", "v18", "v19", "v20", "v21", "v22", "v23", "v24", "v25", "v26", "v27", "v28", "v29", "v30", "v31", "v32", "v33", "v34", "v35", "v36", "v37", "v38", "v39", "v40", "v41", "v42", "v43", "v44", "v45", "v46", "v47", "v48", "v49", "v51", "v52", "v53", "v54", "v55", "v56", "v63b", "v64r50", "v52r50", "v52r50s8", "v52rvgg", "v55rvgg", "v52s8") and not use_seg2d)))
     _sp_pairs = []
-    _sp_final = []          # ramp 用: 切替後の 2:4 マスク (順序は _sp_pairs と同じ)
+    _sp_final = []          # for the ramp: post-switch 2:4 masks (same order as _sp_pairs)
     if args.sparse_24:
         # Dense exceptions: the network outputs (their per-channel scale is the
         # calibration surface) and anything whose input-channel count is not a
@@ -2695,8 +2695,8 @@ def main():
         _n_sp = _n_dense = 0
         with torch.no_grad():
             for _nm, _p in _net0.named_parameters():
-                # --sparse-exclude (2026-09-06, v152 候補): E2E/計画系など精度に敏感で
-                # Orin の ms に寄与しない枝を密のまま残す (プレフィックス列挙)。
+                # --sparse-exclude (2026-09-06, v152 candidate): keep accuracy-sensitive branches
+                # that add no Orin ms (E2E/planning etc.) dense (prefix list).
                 _excl = tuple(x for x in args.sparse_exclude.split(",") if x)
                 if _p.dim() != 4 or _p.shape[1] % 4 != 0 or _p.shape[1] < 16 \
                         or _p.shape[0] < 32 \
@@ -2712,7 +2712,7 @@ def main():
                 _m.scatter_(2, _idx, 0.0)
                 _m = _m.reshape(_o, _c, _kh, _kw)
                 if args.sparse_ramp_steps > 0:
-                    # 1:4 マスク (最小 1 つだけ零) で開始し、ramp 後に 2:4 (_m) へ
+                    # start with a 1:4 mask (only the smallest zeroed), switch to 2:4 (_m) after the ramp
                     _m1 = torch.ones_like(_f)
                     _m1.scatter_(2, _srt[:, :, :1], 0.0)
                     _m1 = _m1.reshape(_o, _c, _kh, _kw)
@@ -2731,9 +2731,9 @@ def main():
                   + (f"; ramp: 1:4 for the first {args.sparse_ramp_steps} steps"
                      if args.sparse_ramp_steps > 0 else ""),
                   flush=True)
-    # ---- 密教師 (dense-teacher) 蒸留 (2026-09-07, v156): 2:4 スパース微調整で失われる
-    # 計画精度を、同一入力に対する密モデルの fused BEV と E2E 出力へ寄せて回収する。
-    # 教師は probe_net.load_full (export と同じ正しい構築, unexpected/mismatch=0 検証) で作る。
+    # ---- dense-teacher distillation (2026-09-07, v156): recover the planning accuracy lost
+    # in 2:4 sparse fine-tuning by matching the dense model's fused BEV and E2E outputs on the same input.
+    # The teacher is built with probe_net.load_full (same correct construction as export, verified unexpected/mismatch=0).
     _teacher = None
     if args.dense_teacher and args.dense_distill_w > 0:
         from bevlane.probe_net import load_full as _load_full
@@ -2752,15 +2752,15 @@ def main():
         print(f"[ema] decay {args.ema} over "
               f"{sum(v.numel() for v in ema.shadow.values()) / 1e6:.1f}M "
               "parameters; evaluated alongside the raw weights", flush=True)
-    # PACT の alpha は本体と桁の違う動きが要る (30-130 -> 10-15)。本体の
-    # lr 1e-4 だと Adam の 1 ステップ 1e-4 x 24 万ステップ = 24 しか動けず、
-    # tfuse の 127 -> 10 には届かない。別 param group にして専用 lr を与える。
+    # PACT alphas must move by orders of magnitude more than the body (30-130 -> 10-15).
+    # At the body lr 1e-4, Adam moves 1e-4 per step x 240k steps = 24 at most,
+    # short of tfuse's 127 -> 10. Give them a separate param group with their own lr.
     _pact_ps = [p for n, p in model.named_parameters()
                 if p.requires_grad and n.endswith(".alpha")]
     _pact_id = {id(p) for p in _pact_ps}
-    # A1b (2026-08-27): ゼロ初期化の traj_flow 残差は本体 lr では 4000 step
-    # 級のプローブで育たない (実測 |w| が traj_head の 1/70)。PACT と同じ
-    # 「桁の違う動きが要るものは別 group」で専用倍率を与える。
+    # A1b (2026-08-27): the zero-initialized traj_flow residual does not grow at the
+    # body lr within a ~4000-step probe (measured |w| is 1/70 of traj_head). Same
+    # rule as PACT: "what must move by orders of magnitude gets its own group", with its own multiplier.
     _tfl_ps = [p for n, p in model.named_parameters()
                if p.requires_grad and n.startswith(
                    ("traj_flow.", "module.traj_flow."))] \
@@ -2772,15 +2772,15 @@ def main():
                    "module.mode_scorer.", "traj_vel.", "module.traj_vel."))] \
         if args.graft_lr_mult != 1.0 else []
     _gr_id = {id(p) for p in _gr_ps}
-    # v139b: 運動学アンカーのゲート (6 個) は decay 無し・lr x20 の専用グループ。
-    # v139 では base 群 (wd 1e-4, 符号が打ち消し合う勾配) で 30k step 後も
-    # 0.001 に留まり、アンカーが事実上不在だった。
+    # v139b: the kinematic anchor gates (6) get their own group with no decay and lr x20.
+    # In v139 they sat in the base group (wd 1e-4, sign-cancelling gradients) and were
+    # still at 0.001 after 30k steps, so the anchor was effectively absent.
     _kin_ps = [p for n, p in model.named_parameters()
                if p.requires_grad and n.endswith("kin_gate")]
     _kin_id = {id(p) for p in _kin_ps}
-    # --hist-lr-mult (2026-09-05, v149): 履歴系モジュール (時系列融合・動き残差・
-    # 時間差分停止判定・ego 頭) を lr 倍率付きの専用グループに分離。E2E 全ラウンドで
-    # 履歴が零だったため、これらは実履歴に対して未学習に近い (v144 は一様 lr で劣後)。
+    # --hist-lr-mult (2026-09-05, v149): split the history modules (temporal fusion, motion
+    # residual, temporal-difference stop head, ego head) into their own lr-scaled group. History
+    # was zero in every E2E round, so these are nearly untrained on real history (v144 lagged with a uniform lr).
     _HIST_PREFIX = ("tfuse3.", "tgate.", "traj_stem.", "delta_stat.", "ego_stem.",
                     "ego_mlp.", "ego_q.", "ego_attn.", "ego_delta.", "sem_ego.")
     _hl_ps = [p for n, p in model.named_parameters()
@@ -2798,39 +2798,39 @@ def main():
         _groups.append({"params": _kin_ps, "lr": lr * 20.0, "weight_decay": 0.0})
         _maxlr.append(lr * 20.0)
         if is_main:
-            print(f"[kin-anchor] gate {len(_kin_ps)} tensor を lr x20 / wd 0 の "
-                  f"param group に分離", flush=True)
+            print(f"[kin-anchor] gate {len(_kin_ps)} tensor split into a lr x20 / wd 0 "
+                  f"param group", flush=True)
     if _hl_ps:
         _groups.append({"params": _hl_ps, "lr": lr * args.hist_lr_mult,
                         "weight_decay": 1e-4})
         _maxlr.append(lr * args.hist_lr_mult)
         if is_main:
-            print(f"[hist-lr] 履歴系 {len(_hl_ps)} tensors を lr x{args.hist_lr_mult} "
-                  f"の param group に分離", flush=True)
+            print(f"[hist-lr] history {len(_hl_ps)} tensors split into a lr x{args.hist_lr_mult} "
+                  f"param group", flush=True)
     if _gr_ps:
         _groups.append({"params": _gr_ps,
                         "lr": lr * args.graft_lr_mult,
                         "weight_decay": 0.0})
         _maxlr.append(lr * args.graft_lr_mult)
         if is_main:
-            print(f"[graft] {len(_gr_ps)} tensors を lr x"
-                  f"{args.graft_lr_mult} の param group に分離", flush=True)
+            print(f"[graft] {len(_gr_ps)} tensors split into a lr x"
+                  f"{args.graft_lr_mult} param group", flush=True)
     if _tfl_ps:
         _groups.append({"params": _tfl_ps,
                         "lr": lr * args.traj_flow_lr_mult,
                         "weight_decay": 0.0})
         _maxlr.append(lr * args.traj_flow_lr_mult)
         if is_main:
-            print(f"[traj-flow] {len(_tfl_ps)} tensors を lr x"
-                  f"{args.traj_flow_lr_mult} の param group に分離",
+            print(f"[traj-flow] {len(_tfl_ps)} tensors split into a lr x"
+                  f"{args.traj_flow_lr_mult} param group",
                   flush=True)
     if _pact_ps:
         _groups.append({"params": _pact_ps, "lr": args.pact_lr,
                         "weight_decay": 0.0})
         _maxlr.append(args.pact_lr)
         if is_main:
-            print(f"[pact] alpha {len(_pact_ps)} 個を専用 lr {args.pact_lr} "
-                  f"の param group に分離 (weight_decay なし)", flush=True)
+            print(f"[pact] {len(_pact_ps)} alphas split into a dedicated lr {args.pact_lr} "
+                  f"param group (no weight_decay)", flush=True)
     opt = torch.optim.AdamW(_groups, lr=lr, weight_decay=1e-4)
     total_steps = len(dl) * args.epochs
     sched = torch.optim.lr_scheduler.OneCycleLR(
@@ -2851,8 +2851,8 @@ def main():
     t0 = time.time()
     best = 0.0
     best_e2e = 1e9
-    val2d_miou = None   # seg2d 生存ガード (2026-08-28)
-    best_chain = 1e9    # 連鎖代理 (ADEc + |高速帯 wp0 バイアス|) 最小の EMA ckpt
+    val2d_miou = None   # seg2d survival guard (2026-08-28)
+    best_chain = 1e9    # EMA ckpt with the lowest chain proxy (ADEc + |high-speed wp0 bias|)
 
     for ep in range(args.epochs):
         if sampler:
@@ -3035,10 +3035,10 @@ def main():
                 keep_sd = (torch.rand(imgs.shape[0], 1, 1, 1, device=device)
                            >= args.sdmap_drop).to(sdmap_t.dtype)
                 sd_in = sdmap_t * keep_sd
-            # ---- LiDAR->カメラ モダリティ蒸留の教師パス (2026-08-20 登録) ----
-            # 教師 = LiDAR 強制 ON (drop なし) の no-grad/eval パス。生徒 =
-            # この後の主パスのうち LiDAR がドロップされた行。fused BEV と
-            # det hm を合わせる。step 基準の間欠実行 (全 rank 同期)。
+            # ---- teacher pass for LiDAR->camera modality distillation (registered 2026-08-20) ----
+            # Teacher = no-grad/eval pass with LiDAR forced ON (no drop). Student =
+            # the LiDAR-dropped rows of the main pass that follows. Matches fused BEV
+            # and det hm. Runs intermittently on a step basis (all ranks in sync).
             _dist_t = None
             _dist_keep = keep if (use_lidar and depth_gt is not None) else None
             if (args.lidar_distill_w > 0 and use_lidarbev
@@ -3067,7 +3067,7 @@ def main():
                        for n, b in (model.module if ddp else model
                                     ).named_buffers()
                        if "running_" in n}
-            # ---- 密教師パス (同じ入力, no-grad) ----
+            # ---- dense-teacher pass (same input, no-grad) ----
             _dt_t = None
             if _teacher is not None and use_temporal \
                     and step % max(args.dense_distill_every, 1) == 0:
@@ -3121,16 +3121,16 @@ def main():
                     elif len(out) > 3:
                         boxl = out[3]
                 loss = 0.0
-                # ---- モダリティ蒸留損失 (LiDAR ドロップ行のみ, 2026-08-20) ----
+                # ---- modality distillation loss (LiDAR-dropped rows only, 2026-08-20) ----
                 if _dist_t is not None and _dist_keep is not None:
                     _m = (_dist_keep.view(-1) < 0.5)
                     if bool(_m.any()):
-                        # 前景集中の重み付け (2026-08-20 修正)。素の MSE は
-                        # 面積支配で、路面など広い領域に引っ張られて遠方車両
-                        # (数セル = 全体の 0.01%) の情報が無視されていた
-                        # (w=0.5 で寄与 1.38 と十分大きいのに cam recall が
-                        # 0.486 から 1 ミリも動かなかった原因)。教師 hm の
-                        # ピーク強度を空間重みにして、車両セルを 10 倍重視する。
+                        # Foreground-focused weighting (fixed 2026-08-20). Plain MSE is
+                        # area-dominated: large regions like the road surface pull it and
+                        # far vehicles (a few cells = 0.01% of the total) were ignored
+                        # (why cam recall did not budge from 0.486 even though w=0.5
+                        # contributed a sizeable 1.38). Use the teacher hm peak
+                        # intensity as a spatial weight, 10x emphasis on vehicle cells.
                         _fs = net0._fused_bev.float()
                         _th = _dist_t[1]
                         if _th is not None:
@@ -3147,7 +3147,7 @@ def main():
                         else:
                             _dl = F.mse_loss(_fs[_m], _dist_t[0][_m])
                         if hm is not None and _th is not None:
-                            # hm も前景重み付き (背景 0 合わせの支配を防ぐ)
+                            # hm is foreground-weighted too (keeps background-zero matching from dominating)
                             _hw = 0.1 + 0.9 * _th.sigmoid().amax(
                                 1, keepdim=True).clamp(0, 1)
                             _hse = ((hm.float()[_m] - _th[_m]) ** 2
@@ -3162,7 +3162,7 @@ def main():
                                   f"{float(args.lidar_distill_w * _dl):.4f}"
                                   f" (n={int(_m.sum())}/{_m.numel()})",
                                   flush=True)
-                # ---- 密教師蒸留損失 (2026-09-07): fused BEV (教師 hm ピーク重み) + E2E 出力 ----
+                # ---- dense-teacher distillation loss (2026-09-07): fused BEV (teacher hm peak weight) + E2E output ----
                 if _dt_t is not None:
                     _fs2 = net0._fused_bev.float()
                     if _dt_t[1] is not None:
@@ -3197,8 +3197,8 @@ def main():
                         ent_w=args.depth_ent_w, far_w=args.depth_far_w,
                         band_bal=args.depth_band_balance)
                 if args.pact_w > 0:
-                    # alpha を押し下げて外れ値を刈る。alpha は実測 max で
-                    # 初期化してあるので、この項が無いと一切動かない。
+                    # Push alpha down to prune outliers. alpha is initialized from the
+                    # measured max, so without this term it never moves.
                     loss = loss + args.pact_w * net0.pact_penalty()
                 if seg2d is not None and use_seg2d:
                     loss = loss + args.seg2d_w * net0.seg2d_loss(seg2d.float(), seg2d_gt)
@@ -3336,7 +3336,7 @@ def main():
                         ego_pred, intent_oh, margin=args.intent_margin)
                 if (args.offroad_w > 0 and intent_oh is not None
                         and ego_pred is not None and gt is not None):
-                    _rows = intent_oh.amax(1) > 0.5      # コマンドのある行だけ
+                    _rows = intent_oh.amax(1) > 0.5      # only rows with a command
                     loss = loss + args.offroad_w * offroad_loss(
                         gt, ego_pred, rows=_rows)
                 if (args.intent_mode_w > 0 and args.model in ("v44", "v45", "v46", "v47", "v48", "v49", "v51", "v52", "v53", "v54", "v55", "v56", "v63b", "v64r50", "v52r50", "v52r50s8", "v52rvgg", "v55rvgg", "v52s8")
@@ -3415,7 +3415,7 @@ def main():
                         logits.float(), gt, classes=LINE_CLASSES,
                         alpha=0.2, beta=0.8)
                 if args.tversky_area_w > 0:
-                    # S2 (2026-08-27): road/crosswalk の FP 罰則。precision 要望
+                    # S2 (2026-08-27): FP penalty on road/crosswalk. Precision request
                     loss = loss + args.tversky_area_w * tversky_loss(
                         logits.float(), gt, classes=(1, 3),
                         alpha=0.2, beta=0.8)
@@ -3458,7 +3458,7 @@ def main():
                             _bad.append(f"out[{_i}]"
                                         f"{tuple(_o.shape)}:{_nn}")
                     if _MODBAD:
-                        print(f"[modprobe] 最初に壊れたモジュール: "
+                        print(f"[modprobe] first broken module: "
                               f"{_MODBAD[0]}", flush=True)
                         _MODBAD.clear()
                     print(f"ep{ep} step{step} SKIP non-finite loss "
@@ -3478,7 +3478,7 @@ def main():
             _optimizer_stepped = scaler.get_scale() >= _scale_before
             if _sp_pairs:
                 if _sp_final and step >= args.sparse_ramp_steps:
-                    # 1:4 -> 2:4 切替 (一度だけ)。以後は 2:4 マスクを再適用
+                    # 1:4 -> 2:4 switch (once). From here on re-apply the 2:4 masks
                     _sp_pairs = [(_p, _mf) for (_p, _), _mf in zip(_sp_pairs, _sp_final)]
                     _sp_final = []
                     if is_main:
@@ -3495,12 +3495,12 @@ def main():
                       f"scale {_scale_before:g}->{scaler.get_scale():g}; "
                       "LR/EMA held", flush=True)
             step += 1
-            # 予防的 conv->BN renorm ガード (--bn-guard, 2026-08-13): この系列は
-            # seg_head.out の running_var が数時間で 1e7 級に暴走し fp16 を
-            # 溢れさせる (r59/v63a/v63b/v65 x2 で実測)。事後修復 (renorm_convbn)
-            # と同一の関数保存再スケールを、閾値超過の時点で in-loop 適用する。
-            # 全 rank が同一の決定的計算 -> 通信不要。再スケールした conv の
-            # Adam 状態はリセット (再起動時と同じ扱い)。
+            # Preventive conv->BN renorm guard (--bn-guard, 2026-08-13): in this model
+            # line seg_head.out's running_var runs away to ~1e7 within hours and
+            # overflows fp16 (seen in r59/v63a/v63b/v65 x2). Apply the same
+            # function-preserving rescale as the post-hoc fix (renorm_convbn) in-loop
+            # when the threshold is exceeded. All ranks compute the same deterministic
+            # result -> no communication. Adam state of the rescaled conv is reset (as on restart).
             if args.bn_guard > 0 and step % 200 == 0:
                 with torch.no_grad():
                     _n0 = model.module if ddp else model
@@ -3582,10 +3582,10 @@ def main():
                                 f"{float(np.nanmean(list(il.values()))):.3f}")
                     try:
                         _th = thickness_ratio(netq, dv, device, max_batches=3)
-                        msg += (" | 太さ lane={:.2f} stop={:.2f} edge={:.2f}"
+                        msg += (" | thickness lane={:.2f} stop={:.2f} edge={:.2f}"
                                 .format(_th[4], _th[5], _th[6]))
                     except Exception as _e:
-                        msg += f" | 太さ n/a({str(_e)[:20]})"
+                        msg += f" | thickness n/a({str(_e)[:20]})"
                     if use_rl and rl_acc[3] > 0:
                         msg += (f" | RL sel={rl_acc[0] / rl_acc[3]:+.3f}"
                                 f" best={rl_acc[1] / rl_acc[3]:+.3f}"
@@ -3835,10 +3835,10 @@ def main():
                           f"acc={eg['acc']:.2f}m/s2 brakeAcc={eg['brake']:.2f}",
                           flush=True)
                     print(f"[valE2Ed ep{ep}] oracle={eg['ade_o']:.2f} "
-                          f"(選択ロス {eg['ade'] - eg['ade_o']:+.2f}) "
-                          f"走行={eg['ade_mv']:.2f} 停車={eg['ade_st']:.2f} "
-                          f"等速直進={eg['ade_cv']:.2f} "
-                          f"高速帯wp0バイアス={eg['hs_bias']:+.3f}m "
+                          f"(selection loss {eg['ade'] - eg['ade_o']:+.2f}) "
+                          f"moving={eg['ade_mv']:.2f} stopped={eg['ade_st']:.2f} "
+                          f"const-vel-straight={eg['ade_cv']:.2f} "
+                          f"hs-wp0-bias={eg['hs_bias']:+.3f}m "
                           f"(n={eg['hs_n']:.0f})", flush=True)
             if use_ego and eg and dv_hs is not None:
                 _hs = evaluate_ego(net, dv_hs, device,
@@ -3846,7 +3846,7 @@ def main():
                                    max_batches=len(dv_hs) + 1, tmp_idx=vtmp)
                 if _hs:
                     eg["hs_bias"], eg["hs_n"] = _hs["hs_bias"], _hs["hs_n"]
-                    print(f"[valHS ep{ep}] 高速帯 wp0 バイアス={_hs['hs_bias']:+.3f}m "
+                    print(f"[valHS ep{ep}] high-speed wp0 bias={_hs['hs_bias']:+.3f}m "
                           f"ADE={_hs['ade']:.3f} (n={_hs['hs_n']:.0f})", flush=True)
             # The averaged weights get the SAME evaluation, on the same
             # slice, so "EMA is better" is a measurement rather than a habit.
@@ -3865,7 +3865,7 @@ def main():
                         if _hse:
                             eg_e["hs_bias"], eg_e["hs_n"] = _hse["hs_bias"], _hse["hs_n"]
                             if is_main:
-                                print(f"[valHS-ema ep{ep}] 高速帯 wp0 バイアス="
+                                print(f"[valHS-ema ep{ep}] high-speed wp0 bias="
                                       f"{_hse['hs_bias']:+.3f}m ADE={_hse['ade']:.3f} "
                                       f"(n={_hse['hs_n']:.0f})", flush=True)
                     if eg_e and is_main:
@@ -3873,14 +3873,14 @@ def main():
                               f"ADEc={eg_e['ade_c']:.2f}m "
                               f"FDE={eg_e['fde']:.2f}m "
                               f"oracle={eg_e['ade_o']:.2f} "
-                              f"(選択ロス {eg_e['ade'] - eg_e['ade_o']:+.2f}) "
-                              f"高速帯wp0バイアス={eg_e['hs_bias']:+.3f}m",
+                              f"(selection loss {eg_e['ade'] - eg_e['ade_o']:+.2f}) "
+                              f"hs-wp0-bias={eg_e['hs_bias']:+.3f}m",
                               flush=True)
-                    # seg2d 生存ガードを EMA 重み **自体** で検査する (2026-09-04)。
-                    # 従来は生の網の val2d を見て EMA を保存していたため、v131/v141
-                    # の best_e2e は seg2d が全滅 (SHIP-CHECK 不合格) していた。
-                    # EMA 側だけ死んでいるときは生の seg_head を移植して保存する
-                    # (v141 で手動移植した処置と同じ; 連鎖・ADEc は不変を確認済)。
+                    # Run the seg2d survival guard on the EMA weights **themselves** (2026-09-04).
+                    # Previously the EMA was saved based on the raw net's val2d, so the v131/v141
+                    # best_e2e had a dead seg2d (failed SHIP-CHECK).
+                    # If only the EMA side is dead, graft the raw seg_head and save
+                    # (same as the manual graft done for v141; chain/ADEc verified unchanged).
                     ema_sd = None
                     if use_seg2d:
                         s2e = evaluate_seg2d(net, dv_ep, device, args.n_seg2d,
@@ -3900,11 +3900,11 @@ def main():
                                         ema_sd[k] = _bk[k].to(ema_sd[k].dtype)
                                         nrep += 1
                                 if is_main:
-                                    print(f"[val2d-ema ep{ep}] seg2d 崩壊 -> "
-                                          f"生の seg_head を移植 ({nrep} tensor)",
+                                    print(f"[val2d-ema ep{ep}] seg2d collapsed -> "
+                                          f"grafted raw seg_head ({nrep} tensor)",
                                           flush=True)
                             else:
-                                ema_sd = False   # 生も死んでいる: 保存禁止
+                                ema_sd = False   # raw is dead too: do not save
                     if ema_sd is None:
                         ema_sd = net.state_dict()
                     if eg_e and eg_e.get("ade_c") == eg_e.get("ade_c") \
@@ -3918,9 +3918,9 @@ def main():
                                    os.path.join(args.out, "best_e2e.pt"))
                         print(f"[best-e2e] ep{ep} EMA ADEc={best_e2e:.3f}m "
                               "saved", flush=True)
-                    # 連鎖代理で選ぶ ckpt (2026-09-04): ADEc + |高速帯 wp0 バイアス|。
-                    # ADEc 最小のエポックが連鎖乖離最良とは限らない (v135/v132 の
-                    # 逆転) ので、連鎖の主因である縦バイアスを同じ重みで足す。
+                    # ckpt selected by the chain proxy (2026-09-04): ADEc + |high-speed wp0 bias|.
+                    # The min-ADEc epoch is not necessarily best for chain divergence (v135/v132
+                    # inversion), so add the longitudinal bias, the main chain driver, at equal weight.
                     if eg_e and is_main and ema_sd is not False \
                             and eg_e.get("ade_c") == eg_e.get("ade_c") \
                             and eg_e.get("hs_bias") == eg_e.get("hs_bias"):
@@ -3962,8 +3962,8 @@ def main():
             # Keep it explicitly, on ADEc alone.
             if use_ego and eg and eg.get("ade_c") == eg.get("ade_c") \
                     and (val2d_miou is None or val2d_miou > 0.30):
-                # seg2d 崩壊エポックの best_e2e 保存を禁止 (v125/v128/v130 で
-                # 配備 ckpt の 2D seg が全滅していた事故の再発防止)
+                # Forbid saving best_e2e on a seg2d-collapsed epoch (prevents a repeat of
+                # v125/v128/v130, where the deployed ckpt's 2D seg was dead)
                 if eg["ade_c"] < best_e2e:
                     best_e2e = eg["ade_c"]
                     torch.save({"model": net.state_dict(), "epoch": ep,

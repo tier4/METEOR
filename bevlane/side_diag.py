@@ -84,7 +84,7 @@ def run(tag, ckpt, model, n_cams):
               f"{miou:11.3f}")
     front = [0]
     side = [1, 2, 4, 5]
-    print(f"  side/front 比: depth "
+    print(f"  side/front ratio: depth "
           f"{(dep_ae[side].sum() / max(dep_n[side].sum(), 1)) / max(dep_ae[front].sum() / max(dep_n[front].sum(), 1), 1e-6):.2f}x  ")
     del m
     torch.cuda.empty_cache()
@@ -93,7 +93,7 @@ def run(tag, ckpt, model, n_cams):
 if __name__ == "__main__":
     which = sys.argv[1] if len(sys.argv) > 1 else "all"
     if which in ("light", "all"):
-        run("v59 light (depth半減)", "out/v59_remote_last.pt", "v55", 7)
+        run("v59 light (depth halved)", "out/v59_remote_last.pt", "v55", 7)
     if which in ("baseline", "all"):
         run("r64 baseline", "out/bevlane_ckpt_r64/best_e2e.pt", "v52", 8)
     if which in ("sparse", "all"):

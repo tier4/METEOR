@@ -1,17 +1,17 @@
-"""NaN に汚染されたヘッドを健全なチェックポイントから移植して修復する。
+"""Repair a NaN-contaminated head by transplanting it from a healthy checkpoint.
 
-2026-08-21: ローカル r74 以降、seg_head.out.0.weight (2D セグ最終 conv,
-82944 要素すべて) と seg_head.out.1 の BN 統計が NaN になっていた。
-model.py の nan_to_num が出力を 0 にクランプするため学習は完走するが、
-2D セグは常にゼロ = PointPainting も無意味 (r77 の paint 効果ゼロの正体)。
-score が r74..r80 の 7 ラウンド 0.283 に張り付いた根本原因。
+2026-08-21: since local r74, seg_head.out.0.weight (final 2D seg conv, all
+82944 elements) and the BN stats of seg_head.out.1 were NaN.
+nan_to_num in model.py clamps the output to 0, so training completes, but
+2D seg is always zero = PointPainting is meaningless (why r77 paint had zero effect).
+Root cause of the score being stuck at 0.283 for 7 rounds r74..r80.
 """
 import argparse
 import torch
 
 ap = argparse.ArgumentParser()
-ap.add_argument("--ckpt", required=True, help="修復対象 (NaN あり)")
-ap.add_argument("--donor", required=True, help="健全なチェックポイント")
+ap.add_argument("--ckpt", required=True, help="checkpoint to repair (contains NaN)")
+ap.add_argument("--donor", required=True, help="healthy donor checkpoint")
 ap.add_argument("--out", required=True)
 a = ap.parse_args()
 
@@ -24,26 +24,26 @@ dn = {k.replace("module.", ""): v for k, v in dn.items()}
 
 bad = [k for k, v in sd.items()
        if torch.is_floating_point(v) and torch.isnan(v).any()]
-print(f"NaN テンソル {len(bad)} 個を修復:")
+print(f"repairing {len(bad)} NaN tensors:")
 fixed = 0
 for k in bad:
     if k in dn and dn[k].shape == sd[k].shape and not torch.isnan(dn[k]).any():
         sd[k] = dn[k].clone()
-        print(f"  {k}: donor から移植")
+        print(f"  {k}: transplanted from donor")
         fixed += 1
     elif k.endswith("running_var"):
         sd[k] = torch.ones_like(sd[k])
-        print(f"  {k}: 1.0 でリセット")
+        print(f"  {k}: reset to 1.0")
         fixed += 1
     elif k.endswith("running_mean"):
         sd[k] = torch.zeros_like(sd[k])
-        print(f"  {k}: 0.0 でリセット")
+        print(f"  {k}: reset to 0.0")
         fixed += 1
     else:
-        print(f"  {k}: 修復できず (donor になし)")
+        print(f"  {k}: not repaired (missing in donor)")
 rest = sum(1 for k, v in sd.items()
            if torch.is_floating_point(v) and torch.isnan(v).any())
-print(f"修復 {fixed}/{len(bad)}、残存 NaN {rest}")
+print(f"repaired {fixed}/{len(bad)}, remaining NaN {rest}")
 if "model" in ck:
     ck["model"] = sd
 else:

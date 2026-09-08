@@ -91,18 +91,18 @@ def run(tag, ckpt, model, n_cams):
         miou = iou[seg_u[c] > 100].mean()
         print(f"{CAMS[c]:18s} {dep_ae[c] / max(dep_n[c], 1):10.2f} "
               f"{miou:11.3f}")
-    print("  距離帯別 depth MAE (全カメラ計):")
+    print("  depth MAE per range band (all cameras):")
     for bi, (lo, hi) in enumerate(BANDS):
         mae = band_ae[:, bi].sum() / max(band_n[:, bi].sum(), 1)
         print(f"    {lo:>4.0f}-{hi:<3.0f}m: {mae:6.2f} m  (n={int(band_n[:, bi].sum())})")
     front = [0]
     side = [1, 2, 4, 5]
-    print(f"  side/front 比: depth "
+    print(f"  side/front ratio: depth "
           f"{(dep_ae[side].sum() / max(dep_n[side].sum(), 1)) / max(dep_ae[front].sum() / max(dep_n[front].sum(), 1), 1e-6):.2f}x  ")
     del m
     torch.cuda.empty_cache()
 
 
 if __name__ == "__main__":
-    run("v63b light 最新", "out/v63b_best_e2e.pt", "v63b", 7)
+    run("v63b light latest", "out/v63b_best_e2e.pt", "v63b", 7)
     run("r64 baseline", "out/bevlane_ckpt_r64/best_e2e.pt", "v52", 8)

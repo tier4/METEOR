@@ -1,9 +1,9 @@
-"""予測レーン線 (class 4) の GT に対する符号付き横ずれを距離帯別に測る。
+"""Signed lateral offset of predicted lane lines (class 4) vs GT, per range band.
 
-ホールドアウト動画で「遠方の他車両が左レーン線スレスレ」に見える件:
-箱は GT に対し無バイアスだったので、残る仮説は「レーン線の描画位置が
-右 (-y) にずれている」。行ごとに GT 線の連結成分中心と最寄りの予測線
-中心を対応付け、pred-GT の y 差を距離帯で集計する (+=左)。
+Re the holdout-video impression that far vehicles hug the left lane line:
+boxes were unbiased vs GT, so the remaining hypothesis is that the lane line is
+drawn shifted right (-y). Per row, match each GT line component center to the
+nearest predicted line center and accumulate the pred-GT y difference per band (+=left).
 """
 import argparse
 import os
@@ -38,7 +38,7 @@ m.load_state_dict({k: v for k, v in sd.items()
 
 
 def runs(row_mask):
-    """行内の連結成分の中心列を返す。"""
+    """Return the center column of each connected component in a row."""
     cols = np.flatnonzero(row_mask)
     if len(cols) == 0:
         return []
@@ -50,9 +50,9 @@ def runs(row_mask):
     return out
 
 
-BANDS = [("前 0-10m", 0, 10), ("前 10-20m", 10, 20), ("前 20-30m", 20, 30),
-         ("前 30-40m", 30, 40), ("前 40-60m", 40, 60),
-         ("後 0-20m", -20, 0), ("後 20-40m", -40, -20)]
+BANDS = [("front 0-10m", 0, 10), ("front 10-20m", 10, 20), ("front 20-30m", 20, 30),
+         ("front 30-40m", 30, 40), ("front 40-60m", 40, 60),
+         ("rear 0-20m", -20, 0), ("rear 20-40m", -40, -20)]
 dy = {b[0]: [] for b in BANDS}
 step = max(1, len(ds) // a.frames)
 done = 0
@@ -79,14 +79,14 @@ for i in range(0, len(ds), step):
                 continue
             for g in gc:
                 d = min(pc, key=lambda p: abs(p - g)) - g
-                if abs(d) <= 7:                       # 1.4 m 以内のみ対応付け
-                    # 列は +y(左) ほど小さい: y = 50 - col*0.2
+                if abs(d) <= 7:                       # match only within 1.4 m
+                    # column index decreases toward +y (left): y = 50 - col*0.2
                     dy[nm].append(-d * 0.2)
     done += 1
     if done >= a.frames:
         break
 
-print(f"\n=== {a.tag or a.ckpt} レーン線 pred-GT 横ずれ ({done} 枚, +y=左) ===")
+print(f"\n=== {a.tag or a.ckpt} lane line pred-GT lateral offset ({done} frames, +y=left) ===")
 for nm, *_ in BANDS:
     e = np.array(dy[nm])
     if len(e) >= 10:

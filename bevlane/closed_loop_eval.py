@@ -76,7 +76,7 @@ def main():
                         n_cams=a.n_cams, max_per_scene=24,
                         trim_start=3, trim_end=10)
     from bevlane.probe_net import load_full
-    m = load_full(a.ckpt, mv=a.model)   # 2026-09-05: 取りこぼしなし構築 (静かな故障 #10)
+    m = load_full(a.ckpt, mv=a.model)   # 2026-09-05: lossless build (silent failure #10)
 
     # index frames per scene so chains walk stride-2 through real frames
     by_scene = {}
@@ -102,9 +102,9 @@ def main():
         with torch.no_grad(), torch.autocast("cuda", torch.float16):
             out = m(b[0][None].cuda(), b[1][None].cuda(), b[2][None].cuda(),
                     b[4][12][None].cuda())      # v0 conditioning, as in eval
-        # 出力は CPU に移してキャッシュする (2026-09-04)。GPU のまま持つと
-        # フレーム数に比例して VRAM が増え、120 シーンで 66 GB、240 シーンで
-        # OOM した (GUARD 段が 0 フレームだと pop されず全フレーム残る)。
+        # Cache outputs on CPU (2026-09-04). Kept on GPU, VRAM grows with the frame
+        # count: 66 GB at 120 scenes and OOM at 240 (when the GUARD stage has 0 frames
+        # nothing is popped and every frame stays resident).
         out = tuple(o.float().cpu() if torch.is_tensor(o) else o for o in out)
         cache[idx] = (b, out)
         return cache[idx]
@@ -204,22 +204,22 @@ def main():
         n_guard += 1
         cache.pop(idx, None)
 
-    print(f"=== CHAIN: 連鎖ロールアウトの累積乖離 (自計画追従 vs GT) ===")
+    print(f"=== CHAIN: cumulative divergence of chained rollout (following own plan vs GT) ===")
     for ci in range(a.chain):
         if drift_n[ci]:
             t = STEP_S * (ci + 1)
             print(f"  +{t:.1f}s  {drift[ci] / drift_n[ci]:.3f} m "
                   f"(n={int(drift_n[ci])})")
-    print(f"\n=== RECOV: 横オフセット復帰率 (1.0=完全復帰) ===")
+    print(f"\n=== RECOV: lateral offset recovery ratio (1.0=full recovery) ===")
     nn = max(recov["n"], 1)
     for k in sorted(recov):
         if k != "n":
             print(f"  {k}: {recov[k] / nn:.2f}")
-    print(f"\n=== GUARD: ガードレール判定 ({n_guard} frames) ===")
+    print(f"\n=== GUARD: guardrail decisions ({n_guard} frames) ===")
     for k, v in guard.most_common():
         print(f"  {k}: {v} ({100 * v / max(n_guard, 1):.1f}%)")
     for k, v in reasons.most_common(5):
-        print(f"    介入理由: {k} x{v}")
+        print(f"    intervention reason: {k} x{v}")
 
 
 if __name__ == "__main__":

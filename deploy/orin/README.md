@@ -1,11 +1,11 @@
-# Orin 側の運用スクリプト (ミラー)
+# Orin-side operational scripts (mirror)
 
-正本の所在:
-- C++ ランタイム: `deploy/cpp/` (ローカルが正本。`rsync deploy/cpp/ <orin-user>@<orin-host>:~/meteor/cpp/` → Orin で `cmake/make`)。
-- Python ランタイム/描画: `deploy/runtime.py`, `deploy/orin_realtime.py`, `deploy/orin_render.py`, `deploy/viz_np.py`, `deploy/orin_build_int8.py` (ローカルが正本、Orin `~/meteor/deploy/` へ rsync)。
-- このディレクトリ: Orin 上で直接書いた補助スクリプトのミラー (2026-09-08 取り込み)。
-  - `demo.sh` / `demo_cpp.sh`: デモ起動 (既定エンジン・描画 env)。
-  - `bench_rt.py` / `bench_rt_zc.py`: ランタイム込みレイテンシ計測 (zc = ゼロコピー入力)。
-  - `bev_frozen_test.py` / `stat_probe.py`: INT8 判定 (ego 凍結・停止判定分布)。
-  - `v142c3Z_orin_job.sh`: 配備チェーンが sed で派生させるジョブ雛形 (fp16 → 実較正 INT8 → 判定 → bench)。`v157c3Z_orin_job.sh` / `v157Lc3Z_orin_job.sh` は派生例 (後者は LiDAR 6 入力)。
-  - `prof_diff.py` / `sparse_profile_job.sh` / `record_lidar.sh`: 層別プロファイル差分・録画ジョブ。
+Where the canonical copies live:
+- C++ runtime: `deploy/cpp/` (local copy is canonical; `rsync deploy/cpp/ <orin-user>@<orin-host>:~/meteor/cpp/`, then `cmake/make` on the Orin).
+- Python runtime/rendering: `deploy/runtime.py`, `deploy/orin_realtime.py`, `deploy/orin_render.py`, `deploy/viz_np.py`, `deploy/orin_build_int8.py` (local copy is canonical, rsync'd to `~/meteor/deploy/` on the Orin).
+- This directory: mirror of helper scripts written directly on the Orin (imported 2026-09-08).
+  - `demo.sh` / `demo_cpp.sh`: demo launchers (default engine and rendering env).
+  - `bench_rt.py` / `bench_rt_zc.py`: end-to-end latency including the runtime (zc = zero-copy input).
+  - `bev_frozen_test.py` / `stat_probe.py`: INT8 checks (frozen ego, stationary-verdict distribution).
+  - `v142c3Z_orin_job.sh`: job template the deployment chain derives via sed (fp16 -> real-calibration INT8 -> checks -> bench). `v157c3Z_orin_job.sh` / `v157Lc3Z_orin_job.sh` are derived examples (the latter has 6 inputs incl. LiDAR).
+  - `prof_diff.py` / `sparse_profile_job.sh` / `record_lidar.sh`: per-layer profile diff and recording jobs.

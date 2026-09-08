@@ -1,8 +1,8 @@
-"""torch なしでランタイム込みのレイテンシを測る (Orin 用)。
+"""Measure end-to-end latency including the runtime, without torch (for Orin).
 
-trtexec の数字は H2D 12ms / D2H 5.8ms を含むが、実ランタイムは pinned
-memory + 非同期転送なのでそのままは出ない。90ms 目標に対して「実機で
-本当に何 ms か」を出すのが目的。
+trtexec numbers include H2D 12ms / D2H 5.8ms, but the real runtime uses pinned
+memory + async transfers, so they do not carry over. The goal is "how many ms
+does it really take on the device" against the 90ms target.
 """
 import json
 import os
@@ -33,15 +33,15 @@ for f in man["frames"][3:23]:
                     .transpose(2, 0, 1) for c in CAMS])
     frames.append((ims[None].astype(np.uint8), float(emo["v0"][fi]),
                    tuple(float(x) for x in emo["pose"][fi])))
-print(f"{len(frames)} フレーム読み込み")
+print(f"{len(frames)} frames loaded")
 
-# METEOR_SKIP_OUT: D2H しない出力名 (カンマ区切り)。描画に使わない大物
-# (depth 42MB / seg2d 14MB / 2D 検出ヘッド) を止めると転送とホストコピーが
-# 丸ごと消える。METEOR_OUT_SLOTS>1 なら出力の .copy() も省ける。
+# METEOR_SKIP_OUT: output names not to D2H (comma-separated). Skipping the large
+# outputs unused by rendering (depth 42MB / seg2d 14MB / 2D det heads) removes the
+# transfer and host copy entirely. METEOR_OUT_SLOTS>1 also skips the output .copy().
 _SKIP = tuple(x for x in os.environ.get("METEOR_SKIP_OUT", "").split(",") if x)
 _SLOTS = int(os.environ.get("METEOR_OUT_SLOTS", "1"))
 if _SKIP:
-    print(f"[bench] D2H を止める出力: {list(_SKIP)}")
+    print(f"[bench] outputs skipped for D2H: {list(_SKIP)}")
 print(f"[bench] out_slots = {_SLOTS}")
 for eng in sys.argv[1:]:
     rt = MeteorRT(eng, skip_outputs=_SKIP, n_out_slots=_SLOTS)
@@ -59,9 +59,9 @@ for eng in sys.argv[1:]:
         from deploy.runtime import rt_profile_report
         rep = rt_profile_report()
     except Exception as e:
-        rep = f"(内訳取得不可: {e})"
-    print(f"{eng}: 中央値 {np.median(a):7.2f} ms  平均 {a.mean():7.2f} ms  "
-          f"最小 {a.min():7.2f}  p90 {np.percentile(a, 90):7.2f}  "
+        rep = f"(breakdown unavailable: {e})"
+    print(f"{eng}: median {np.median(a):7.2f} ms  mean {a.mean():7.2f} ms  "
+          f"min {a.min():7.2f}  p90 {np.percentile(a, 90):7.2f}  "
           f"-> {1000 / np.median(a):.1f} FPS")
     print(rep)
     del rt

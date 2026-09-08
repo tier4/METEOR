@@ -1,9 +1,9 @@
-"""3D BBox の符号付き横誤差 (+y=左) を距離帯別に出す。
+"""Signed lateral error of 3D BBoxes (+y=left) per range band.
 
-ホールドアウト動画で「20m 以遠の他車両が左レーン線スレスレに寄る」ように
-見える件の定量化。横ずれが距離に比例して伸びるなら回転状のバイアス
-(キャリブのヨー / 検出ヘッドの遠方バイアス)、一定なら平行オフセット。
-GT 箱にマッチした予測だけで測る (リコール差の汚染を避ける、ペア比較の掟)。
+Quantifies the holdout-video impression that other vehicles beyond 20 m hug the
+left lane line. Lateral shift growing with range = rotational bias (calib yaw /
+far bias of the det head); constant shift = parallel offset.
+Only predictions matched to GT boxes are used (avoids recall contamination; paired-comparison rule).
 """
 import argparse
 import os
@@ -19,13 +19,13 @@ from bevlane.model import MODELS                                  # noqa: E402
 ap = argparse.ArgumentParser()
 ap.add_argument("--ckpt", required=True)
 ap.add_argument("--model", default="v52")
-ap.add_argument("--list", default=None, help="シーン名ファイル")
+ap.add_argument("--list", default=None, help="scene-name list file")
 ap.add_argument("--scenes", nargs="*", default=None)
 ap.add_argument("--root", default="out/bevlane")
 ap.add_argument("--frames", type=int, default=200)
 ap.add_argument("--thresh", type=float, default=0.25)
 ap.add_argument("--cls-max", type=float, default=1.5,
-                help="このクラス未満のみ (既定: 車両のみ)")
+                help="only classes below this (default: vehicles only)")
 ap.add_argument("--tag", default="")
 a = ap.parse_args()
 
@@ -39,12 +39,12 @@ cur = m.state_dict()
 m.load_state_dict({k: v for k, v in sd.items()
                    if k in cur and cur[k].shape == v.shape}, strict=False)
 
-BANDS = [("前 0-10m", 0, 10, 1), ("前 10-20m", 10, 20, 1),
-         ("前 20-30m", 20, 30, 1), ("前 30-40m", 30, 40, 1),
-         ("前 40-60m", 40, 60, 1),
-         ("後 0-20m", 0, 20, -1), ("後 20-40m", 20, 40, -1)]
-dy_s = {b[0]: [] for b in BANDS}       # 符号付き横誤差 (+=左)
-dx_s = {b[0]: [] for b in BANDS}       # 符号付き縦誤差 (+=遠く)
+BANDS = [("front 0-10m", 0, 10, 1), ("front 10-20m", 10, 20, 1),
+         ("front 20-30m", 20, 30, 1), ("front 30-40m", 30, 40, 1),
+         ("front 40-60m", 40, 60, 1),
+         ("rear 0-20m", 0, 20, -1), ("rear 20-40m", 20, 40, -1)]
+dy_s = {b[0]: [] for b in BANDS}       # signed lateral error (+=left)
+dx_s = {b[0]: [] for b in BANDS}       # signed longitudinal error (+=farther)
 step = max(1, len(ds) // a.frames)
 done = 0
 for i in range(0, len(ds), step):
@@ -78,8 +78,8 @@ for i in range(0, len(ds), step):
     if done >= a.frames:
         break
 
-print(f"\n=== {a.tag or a.ckpt} ({done} フレーム) 符号付き誤差 (+y=左) ===")
-print("帯          n    横(y)平均±SD        縦(距離)平均±SD")
+print(f"\n=== {a.tag or a.ckpt} ({done} frames) signed error (+y=left) ===")
+print("band        n    lateral(y) mean±SD  range mean±SD")
 for nm, *_ in BANDS:
     e, d = np.array(dy_s[nm]), np.array(dx_s[nm])
     if len(e) >= 3:

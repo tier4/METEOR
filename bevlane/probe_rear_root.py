@@ -1,18 +1,18 @@
-"""後方 3D BBox の距離精度が動かない原因を 3 つの仮説に分解して測る。
+"""Split the stuck rear 3D BBox range accuracy into 3 hypotheses and measure each.
 
-仮説 A: 深度ヘッドの推定そのものが後方カメラで悪い
-    -> depth_gt4/depth_gt4n を正解に、カメラ別・距離帯別の深度誤差を直接測る。
-       前方カメラと同じ精度なら深度ヘッドは無罪。
+Hypothesis A: the depth head itself is worse on the rear cameras
+    -> measure depth error per camera and range band against depth_gt4/depth_gt4n.
+       Same accuracy as the front cameras clears the depth head.
 
-仮説 B: 幾何 (画素分解能) の上限
-    -> K から各カメラの焦点距離を取り、30 m の車両が何画素に写るかを計算。
-       後方カメラの px/m が前方より低ければ、学習では埋まらない構造差。
+Hypothesis B: geometric (pixel resolution) ceiling
+    -> take each camera's focal length from K and compute how many pixels a vehicle at 30 m spans.
+       Lower px/m on the rear cameras is a structural gap training cannot close.
 
-仮説 C: 特徴はあるのに検出が沈んでいる (しきい値/較正の問題)
-    -> 後方 20-40 m の GT 箱位置でヒートマップのピーク値を測る。
-       ピークが立っていれば較正の問題、立っていなければ特徴の問題。
+Hypothesis C: features exist but detections are suppressed (threshold/calibration)
+    -> read the heatmap peak at GT box positions 20-40 m to the rear.
+       Clear peaks -> calibration problem; no peaks -> feature problem.
 
-1 パスで A と C を同時に測る (B はマニフェストから計算するだけ)。
+A and C are measured in one pass (B is computed from the manifest only).
 """
 import argparse
 import json
@@ -29,7 +29,7 @@ from bevlane.model import MODELS                                  # noqa: E402
 CAMS = ["CAM_FRONT_WIDE", "CAM_FRONT_LEFT", "CAM_FRONT_RIGHT",
         "CAM_BACK_WIDE", "CAM_BACK_LEFT", "CAM_BACK_RIGHT",
         "CAM_FRONT_NARROW", "CAM_BACK_NARROW"]
-D_MIN, D_STEP = 1.0, 1.25              # v52 の深度ビン
+D_MIN, D_STEP = 1.0, 1.25              # v52 depth bins
 BANDS = [(10, 20), (20, 40), (40, 80)]
 
 
@@ -43,16 +43,16 @@ def main():
     ap.add_argument("--frames", type=int, default=120)
     a = ap.parse_args()
 
-    # ---- 仮説 B: 画素分解能 (フォワード不要) ----
+    # ---- Hypothesis B: pixel resolution (no forward pass) ----
     scenes = [l.strip() for l in open(a.list) if l.strip()][:a.scenes]
     m0 = json.load(open(os.path.join(a.root, scenes[0], "manifest.json")))
-    print("=== 仮説 B: 30 m 先の車両 (幅 1.8 m) が写る画素数 ===")
+    print("=== Hypothesis B: pixels spanned by a vehicle (1.8 m wide) at 30 m ===")
     for c in CAMS:
         if c not in m0["cams"]:
             continue
         fx = float(np.array(m0["cams"][c]["K"])[0][0])
-        print(f"  {c:<18} fx={fx:7.1f}px   30m の車幅 {fx * 1.8 / 30:6.1f}px"
-              f"  1px の距離分解能@30m {30 * 30 / (fx * 1.55):.2f}m")
+        print(f"  {c:<18} fx={fx:7.1f}px   width@30m {fx * 1.8 / 30:6.1f}px"
+              f"  range per px@30m {30 * 30 / (fx * 1.55):.2f}m")
 
     net = MODELS[a.model](n_seg=21).cuda().eval()
     sd = torch.load(a.ckpt, map_location="cpu")
@@ -61,10 +61,10 @@ def main():
     net.load_state_dict({k: v for k, v in sd.items()
                          if k in cur and cur[k].shape == v.shape}, strict=False)
 
-    # 集計器
-    derr = {(c, b): [] for c in range(8) for b in BANDS}     # 仮説 A
+    # accumulators
+    derr = {(c, b): [] for c in range(8) for b in BANDS}     # Hypothesis A
     dbias = {(c, b): [] for c in range(8) for b in BANDS}
-    peaks = {("前", b): [] for b in BANDS} | {("後", b): [] for b in BANDS}
+    peaks = {("front", b): [] for b in BANDS} | {("rear", b): [] for b in BANDS}
 
     nfr = 0
     for s in scenes:
@@ -111,7 +111,7 @@ def main():
                 pred_m = np.stack([cv2.resize(p, dall.shape[-1:-3:-1],
                                               interpolation=cv2.INTER_NEAREST)
                                    for p in pred_m])
-            # ---- 仮説 A: カメラ別・帯別の深度誤差 ----
+            # ---- Hypothesis A: depth error per camera and band ----
             for ci in range(8):
                 g = dall[ci]
                 ok = g > 0.5
@@ -122,9 +122,9 @@ def main():
                     e = pred_m[ci][sel] - g[sel]
                     derr[(ci, b)].append(np.median(np.abs(e)))
                     dbias[(ci, b)].append(np.median(e))
-            # ---- 仮説 C: GT 箱位置のヒートマップピーク ----
-            hm = torch.sigmoid(out[3].float())[0, 0].cpu().numpy()  # 車両ch
-            res = 160.0 / hm.shape[0]              # 前後 160 m / 行数
+            # ---- Hypothesis C: heatmap peak at GT box positions ----
+            hm = torch.sigmoid(out[3].float())[0, 0].cpu().numpy()  # vehicle ch
+            res = 160.0 / hm.shape[0]              # 160 m fore-aft / rows
             for r in bx:
                 if int(r[0]) != 1 or float(r[3]) <= 0:
                     continue
@@ -140,7 +140,7 @@ def main():
                 c0, c1 = max(0, ci_ - w), min(hm.shape[1], ci_ + w + 1)
                 if r1 <= r0 or c1 <= c0:
                     continue
-                peaks[("前" if x > 0 else "後", band)].append(
+                peaks[("front" if x > 0 else "rear", band)].append(
                     float(hm[r0:r1, c0:c1].max()))
             nfr += 1
             if nfr >= a.frames:
@@ -148,8 +148,8 @@ def main():
         if nfr >= a.frames:
             break
 
-    print(f"\n=== 仮説 A: 深度ヘッドの誤差 (対 LiDAR 深度 GT, {nfr} フレーム) ===")
-    print(f"{'カメラ':<18} " + "  ".join(f"{b[0]}-{b[1]}m 誤差/偏り" for b in BANDS))
+    print(f"\n=== Hypothesis A: depth head error (vs LiDAR depth GT, {nfr} frames) ===")
+    print(f"{'camera':<18} " + "  ".join(f"{b[0]}-{b[1]}m err/bias" for b in BANDS))
     for ci, c in enumerate(CAMS):
         row = []
         for b in BANDS:
@@ -158,17 +158,17 @@ def main():
                        if v else "   —      ")
         print(f"  {c:<18} " + "  ".join(row))
 
-    print("\n=== 仮説 C: GT 箱位置のヒートマップピーク (車両ch) ===")
-    for side in ("前", "後"):
+    print("\n=== Hypothesis C: heatmap peak at GT box positions (vehicle ch) ===")
+    for side in ("front", "rear"):
         for b in BANDS:
             p = peaks[(side, b)]
             if not p:
                 continue
             p = np.array(p)
             print(f"  {side} {b[0]:2d}-{b[1]:2d}m (n={len(p):4d}): "
-                  f"ピーク中央値 {np.median(p):.3f}  "
-                  f"0.25未満 {100 * (p < 0.25).mean():4.1f}%  "
-                  f"0.10未満 {100 * (p < 0.10).mean():4.1f}%")
+                  f"median peak {np.median(p):.3f}  "
+                  f"<0.25 {100 * (p < 0.25).mean():4.1f}%  "
+                  f"<0.10 {100 * (p < 0.10).mean():4.1f}%")
 
 
 if __name__ == "__main__":

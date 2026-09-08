@@ -1,15 +1,15 @@
 #!/usr/bin/env python3
-"""paint-det の前提検証: 2D 検出は「遠方の車両」を本当に見えているか。
+"""Premise check for paint-det: does 2D detection really see far vehicles?
 
-cam-only の BEV veh recall が 20-40m で 0.50 前後に張り付いている原因は、
-2D で見えていないのか、それとも見えているのに深度分布が広がって BEV の
-正しいセルへ票が入らないのか。後者ならリフト前に 2D ヒートマップを注入する
-(paint-det) 意味があるが、前者なら注入しても入れる情報が無い。
+Cam-only BEV vehicle recall is stuck around 0.50 at 20-40 m. Is that because 2D
+does not see them, or because it does but the wide depth distribution fails to
+vote into the right BEV cell? In the latter case injecting the 2D heatmap before the
+lift (paint-det) makes sense; in the former there is no information to inject.
 
-測り方: bbox2d GT (画像座標) の各車両箱について、その大きさで割り当たる
-スケールの hm2d の中心近傍ピークを読む。ピーク > thr なら「2D で検出」。
-距離は Z ~ f * H_real / h_px で近似 (車高 1.5m、f は K から)。BEV 側の
-帯域 (20-40 / 40-60m) と同じ軸に並べて比較できる。
+Method: for each vehicle box in bbox2d GT (image coords), read the peak of hm2d near
+the center at the scale assigned by its size. Peak > thr = detected in 2D.
+Range is approximated as Z ~ f * H_real / h_px (vehicle height 1.5 m, f from K), so it
+lines up with the BEV bands (20-40 / 40-60 m).
 """
 import argparse
 import os
@@ -40,7 +40,7 @@ def main():
 
     dev = "cuda" if torch.cuda.is_available() else "cpu"
     from bevlane.probe_net import load_full
-    net = load_full(a.ckpt, device=dev)   # 2026-09-06: 取りこぼしなし構築 (静かな故障 #10)
+    net = load_full(a.ckpt, device=dev)   # 2026-09-06: lossless build (silent failure #10)
 
     scenes = [l.strip() for l in open(a.list) if l.strip()][:a.scenes]
     ds = BevLaneDataset(a.root, scenes, gt_key="gt_cons",
@@ -73,7 +73,7 @@ def main():
                     continue
                 if h <= 1 or w <= 1:
                     continue
-                z = fx * H_REAL[cls] / h            # 近似距離 [m]
+                z = fx * H_REAL[cls] / h            # approximate range [m]
                 band = next((b for b in BANDS if b[0] <= z < b[1]), None)
                 if band is None:
                     continue
@@ -93,8 +93,8 @@ def main():
                 peaks[g][band].append(p)
 
     THRS = (0.05, 0.1, 0.2, 0.3, 0.5)
-    print("\n2D 検出の当たり率 / 距離は h_px からの近似")
-    print("    帯域      n     peak中央値  " +
+    print("\n2D detection hit rate / range approximated from h_px")
+    print("    band      n     peak median  " +
           "  ".join(f"thr{t:g}" for t in THRS))
     for g in ("veh", "vru"):
         print(f"  [{g}]")

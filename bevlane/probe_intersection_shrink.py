@@ -1,9 +1,9 @@
-"""交差点接近時に近傍 road がしぼむ現象の定量化 (2026-08-22)。
+"""Quantify the near-field road shrinking when approaching an intersection (2026-08-22).
 
-各フレームで (a) 自車近傍 0-20m の road 面積、(b) 前方 30m 以内の
-crosswalk 画素数 (= 交差点への近さの代理) を pred / GT 双方で測り、
-交差点接近と road 面積の関係を見る。pred だけで縮むならモデル側の問題、
-GT でも縮むなら教師/オクルージョン由来。
+Per frame, measure (a) road area within 0-20 m of ego and (b) crosswalk pixels
+within 30 m ahead (proxy for intersection proximity), for both pred and GT, and
+relate them. Shrinking in pred only = model problem; shrinking in GT too =
+label / occlusion origin.
 """
 import argparse, os, sys
 import numpy as np, torch
@@ -29,9 +29,9 @@ cur = m.state_dict()
 m.load_state_dict({k: v for k, v in sd.items()
                    if k in cur and cur[k].shape == v.shape}, strict=False)
 
-# 行: x = 80 - 0.2*row。近傍 0-20m = row 300..400、前方 30m = row 250..400
-NEAR = slice(300, 400)       # 自車前方 0-20 m
-FWD30 = slice(250, 400)      # 前方 0-30 m
+# rows: x = 80 - 0.2*row. near 0-20m = rows 300..400, ahead 30m = rows 250..400
+NEAR = slice(300, 400)       # 0-20 m ahead of ego
+FWD30 = slice(250, 400)      # 0-30 m ahead
 COLS = slice(175, 325)       # |y| <= 15 m
 ROAD = (1, 3, 4, 5)          # road + crosswalk + laneline + stopline
 rows = []
@@ -53,15 +53,15 @@ for s, lst in list(by_scene.items())[:a.scenes]:
         g_cw = int((gt[FWD30, COLS] == 3).sum())
         rows.append((s, fi, p_road, g_road, p_cw, g_cw))
 if not rows:
-    print("データなし"); sys.exit()
+    print("no data"); sys.exit()
 arr = np.array([[r[2], r[3], r[4], r[5]] for r in rows], float)
-# 交差点フレーム = GT crosswalk が上位 25%
+# intersection frames = top 25% of GT crosswalk
 thr = np.percentile(arr[:, 3], 75)
 near_ix = arr[:, 3] >= max(thr, 50)
 far_ix = arr[:, 3] < max(thr, 50) * 0.2
-print(f"\n=== {a.tag} 交差点接近時の近傍 road 面積 ({len(rows)} フレーム) ===")
-print(f"交差点フレーム {int(near_ix.sum())} / 非交差点 {int(far_ix.sum())}")
-for nm, msk in (("交差点付近", near_ix), ("直線路", far_ix)):
+print(f"\n=== {a.tag} near-field road area on intersection approach ({len(rows)} frames) ===")
+print(f"intersection frames {int(near_ix.sum())} / non-intersection {int(far_ix.sum())}")
+for nm, msk in (("near ix", near_ix), ("straight", far_ix)):
     if msk.sum() < 3: continue
     p, g = arr[msk, 0].mean(), arr[msk, 1].mean()
     print(f"  {nm:8s} pred road {p:8.0f} px | GT road {g:8.0f} px | "
@@ -69,6 +69,6 @@ for nm, msk in (("交差点付近", near_ix), ("直線路", far_ix)):
 if near_ix.sum() >= 3 and far_ix.sum() >= 3:
     pr = arr[near_ix, 0].mean() / max(arr[far_ix, 0].mean(), 1)
     gr = arr[near_ix, 1].mean() / max(arr[far_ix, 1].mean(), 1)
-    print(f"\n  交差点/直線 の比: pred {pr:.3f} / GT {gr:.3f}")
-    print("  -> pred だけ小さければモデル固有、GT も小さければ教師・遮蔽由来")
+    print(f"\n  intersection/straight ratio: pred {pr:.3f} / GT {gr:.3f}")
+    print("  -> small in pred only = model-specific; small in GT too = label/occlusion origin")
 print("PROBE_IX_DONE")

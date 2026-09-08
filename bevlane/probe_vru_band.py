@@ -1,4 +1,4 @@
-"""VRU (cls GT=2 / pred=1) の距離帯別 recall@score0.25 (paint ゲート判定用)。"""
+"""VRU (cls GT=2 / pred=1) recall@score0.25 per range band (for the paint gate decision)."""
 import argparse, os, sys
 import numpy as np, torch
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -44,7 +44,7 @@ for i in range(0, len(ds), step):
                 if ok: hit[(lo, hi)] += 1
     done += 1
     if done >= a.frames: break
-print(f"=== {a.tag or a.ckpt} VRU recall@0.25 ({done} 枚) ===")
+print(f"=== {a.tag or a.ckpt} VRU recall@0.25 ({done} frames) ===")
 for b in BANDS:
     if gt_n[b]:
         print(f"  {b[0]}-{b[1]}m  n={gt_n[b]:4d}  R={hit[b]/gt_n[b]:.3f}")

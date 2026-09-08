@@ -78,7 +78,7 @@ def frame_stream(roots, stride=4, max_per_scene=0):
                 imgs = np.ascontiguousarray(np.stack(
                     [im[:, :, ::-1].transpose(2, 0, 1) for im in raw])[None])
                 lb = None
-                if os.environ.get("METEOR_LIDAR", "0") == "1":   # 較正にも実 LiDAR を供給 (零較正は範囲崩壊)
+                if os.environ.get("METEOR_LIDAR", "0") == "1":   # feed real LiDAR to calibration too (zero calibration collapses the range)
                     _lp = f.get("lidar_bev") or f"lidar_bev/{int(fi):04d}.npz"
                     try:
                         lb = np.load(os.path.join(root, s, _lp))["lb"].astype(np.float32)[None]
@@ -90,10 +90,10 @@ def frame_stream(roots, stride=4, max_per_scene=0):
                     break
 
 
-# 2026-08-22: 較正方式による差を測れるようにする。TensorRT には
-# EntropyCalibrator2 (既定, KL 最小化で外れ値を切る) / MinMaxCalibrator
-# (最大値をそのまま使う) / LegacyCalibrator がある。v98 以降の INT8 で
-# ego が凍結する件が較正方式に依存するかを切り分けるため選べるようにした。
+# 2026-08-22: make the difference between calibration methods measurable. TensorRT
+# offers EntropyCalibrator2 (default, clips outliers by KL minimization) / MinMaxCalibrator
+# (uses the raw max) / LegacyCalibrator. Made selectable to isolate whether the
+# INT8 ego freeze seen from v98 onwards depends on the calibration method.
 CALIB_BASE = {
     "entropy2": trt.IInt8EntropyCalibrator2,
     "minmax": trt.IInt8MinMaxCalibrator,
@@ -116,12 +116,12 @@ class RealFrameCalibrator(_BASE):
         self.done = 0
         self.cache = cache
         self.scene = None
-        # hist_bev の dtype 変換バッファ (2026-08-26 の較正汚染修正)。
-        # 被ビルド網は ONNX 宣言どおり hist_bev を fp32 で読むが、伴走
-        # エンジンのバッファは fp16。ポインタ直渡しは fp16 ビット列の
-        # fp32 誤解釈で ~1e9 のゴミになり、hist 系のスケールが 5e7 倍
-        # 汚染されていた (v124 の delta-stat が初の INT8 実害。旧世代は
-        # tfuse 系が常に fp16-keep でスケール未使用のため潜伏)。
+        # dtype conversion buffer for hist_bev (2026-08-26 calibration contamination fix).
+        # The network being built reads hist_bev as fp32 per the ONNX declaration, but
+        # the companion engine's buffer is fp16. Passing the pointer directly misreads
+        # the fp16 bit pattern as fp32, yielding ~1e9 garbage, and the hist scales were
+        # contaminated 5e7x (v124's delta-stat was the first INT8 case that bit us; older
+        # generations stayed latent since tfuse was always fp16-keep and never used the scale).
         self._h16 = None
 
     def get_batch_size(self):
@@ -143,7 +143,7 @@ class RealFrameCalibrator(_BASE):
         self.done += 1
         if self.done % 8 == 0:
             print(f"[calib] {self.done}/{self.n}", flush=True)
-        # 伴走の fp16 hist_bev を fp32 へ変換して専用バッファから供給する
+        # convert the companion's fp16 hist_bev to fp32 and serve it from a dedicated buffer
         if "hist_bev" in self.rt.dev and \
                 self.rt.host["hist_bev"].dtype == np.float16:
             if self._h16 is None:
@@ -159,14 +159,14 @@ class RealFrameCalibrator(_BASE):
             self.rt.stream.synchronize()
         ptrs = []
         for nm in names:
-            # --split-hist で焼いた ONNX は hist_bev0/1/2 の 3 入力を持つ。
-            # 伴走エンジン (分割前) の hist_bev は 3 スロットが連続して
-            # 並んでいるので、そのオフセットを渡せば中身は完全に同じ。
+            # ONNX baked with --split-hist has three inputs hist_bev0/1/2.
+            # The companion (pre-split) engine's hist_bev holds the 3 slots
+            # contiguously, so passing that offset yields identical contents.
             if nm.startswith("hist_bev") and nm not in self.rt.dev \
                     and "hist_bev" in self.rt.dev:
                 i = int(nm[len("hist_bev"):])
                 _sh = self.rt.shapes["hist_bev"]
-                _stride = int(np.prod(_sh[2:])) * 4      # 変換後 fp32
+                _stride = int(np.prod(_sh[2:])) * 4      # fp32 after conversion
                 ptrs.append(int(self._dev32) + i * _stride)
                 continue
             if nm == "hist_bev" and self._h16 is not None:
@@ -188,10 +188,10 @@ class RealFrameCalibrator(_BASE):
 
 def build(args):
     logger = trt.Logger(trt.Logger.WARNING)
-    # リフトプラグインは ONNX を parse する前に登録しておく必要がある。
-    # 2026-08-15: ctypes.CDLL だけでは IPluginV3 の creator が parser から
-    # 見えず「Plugin not found」で落ちた (trtexec の --staticPlugins 相当は
-    # plugin_registry.load_library)。
+    # The lift plugin must be registered before the ONNX is parsed.
+    # 2026-08-15: with ctypes.CDLL alone the IPluginV3 creator was invisible to
+    # the parser and it failed with "Plugin not found" (the equivalent of
+    # trtexec's --staticPlugins is plugin_registry.load_library).
     _so = os.environ.get("METEOR_PLUGIN_SO")
     if _so:
         import ctypes
@@ -199,8 +199,8 @@ def build(args):
         trt.init_libnvinfer_plugins(logger, "")
         try:
             trt.get_plugin_registry().load_library(_so)
-        except Exception as _e:                       # 古い TRT では未提供
-            print(f"[plugin] load_library 不可 ({_e}) -- CDLL のみで続行",
+        except Exception as _e:                       # not available in older TRT
+            print(f"[plugin] load_library unavailable ({_e}) -- continuing with CDLL only",
                   flush=True)
     builder = trt.Builder(logger)
     net = builder.create_network(1 << int(
@@ -217,13 +217,13 @@ def build(args):
     cfg.set_flag(trt.BuilderFlag.FP16)
     cfg.set_flag(trt.BuilderFlag.INT8)
     if args.builder_opt >= 0:
-        # レベル 5 はビルド時間 ~2x だがタクティック探索が深くなり
-        # 実測で数 % 速いエンジンが出ることがある (2026-08-28 レバー5)
+        # Level 5 takes ~2x build time but searches tactics deeper and can
+        # yield an engine measured a few % faster (2026-08-28 lever 5)
         cfg.builder_optimization_level = args.builder_opt
     if args.max_aux_streams >= 0:
-        # CUDA Graph 用: 補助ストリームを制限する。既定エンジン (6 本) を
-        # 単純にストリームキャプチャすると一部処理がグラフ外に残り出力が
-        # 固定される (2026-08-15 実害)。0 に絞ればキャプチャが完全になる。
+        # For CUDA Graph: limit the aux streams. Naively stream-capturing the
+        # default engine (6 streams) leaves some work outside the graph and the
+        # output freezes (bit us 2026-08-15). Capping at 0 makes the capture complete.
         cfg.max_aux_streams = args.max_aux_streams
     if args.sparse:
         cfg.set_flag(trt.BuilderFlag.SPARSE_WEIGHTS)
@@ -325,7 +325,7 @@ if __name__ == "__main__":
     ap.add_argument("--max-aux-streams", type=int, default=-1)
     ap.add_argument("--stride", type=int, default=4)
     ap.add_argument("--builder-opt", type=int, default=-1,
-                    help="builder optimization level (-1=既定, 最大5)")
+                    help="builder optimization level (-1=default, max 5)")
     ap.add_argument("--calib-per-scene", type=int, default=8,
                     help="cap calibration frames per scene to prevent the "
                          "activation ranges being dominated by 2-3 drives")

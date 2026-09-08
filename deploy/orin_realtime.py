@@ -49,13 +49,13 @@ def loader(scenes, root, stride, q_raw, stop, loop, in_slots=None, in_free=None)
             from deploy.t4input import is_t4_scene, load_t4_scene
             _sd = os.path.join(root, s)
             if is_t4_scene(_sd):
-                # 生 t4dataset を変換無しで読む (2026-08-25)。annotation を
-                # その場で解釈し、画像は読み込み時に 768x432 へ縮小する。
+                # Read raw t4dataset without conversion (2026-08-25): interpret
+                # the annotation on the fly and downscale images to 768x432 on load.
                 m, _t4v0, _t4pose = load_t4_scene(_sd, CAMS)
-                _reduced = True     # 2880x1860 のフルデコードは ~1s/フレーム
-                                    # かかる。JPEG の 1/4 縮小デコード
-                                    # (720x465) なら 4-8 倍速く、そこから
-                                    # 768x432 へは僅かな拡大で画質影響は軽微
+                _reduced = True     # a full 2880x1860 decode takes ~1s/frame;
+                                    # the JPEG 1/4 reduced decode (720x465)
+                                    # is 4-8x faster, and the slight upscale
+                                    # from there to 768x432 barely hurts quality
             else:
                 m = json.load(open(os.path.join(_sd, "manifest.json")))
                 _t4v0 = _t4pose = None
@@ -87,7 +87,7 @@ def loader(scenes, root, stride, q_raw, stop, loop, in_slots=None, in_free=None)
                     if im is None:
                         ok = False
                         break
-                    if im.shape[1] != 768:     # 生 t4 -> 学習解像度
+                    if im.shape[1] != 768:     # raw t4 -> training resolution
                         im = cv2.resize(im, (768, 432),
                                         interpolation=cv2.INTER_AREA)
                     raw[c] = im
@@ -95,9 +95,9 @@ def loader(scenes, root, stride, q_raw, stop, loop, in_slots=None, in_free=None)
                     continue
                 # stack here, off the producer's critical path (~8 ms)
                 if in_slots is not None:
-                    # ゼロコピー (2026-09-05): pinned スロットへ直接 CHW を書く。
-                    # producer は rt.infer() にスロットをそのまま渡し、CPU コピー
-                    # (4.6 ms) を省く。スロットは infer() 後に in_free へ戻す。
+                    # Zero-copy (2026-09-05): write CHW directly into a pinned slot.
+                    # The producer hands the slot straight to rt.infer(), skipping the
+                    # CPU copy (4.6 ms). The slot goes back to in_free after infer().
                     si = in_free.get()
                     imgs = in_slots[si]
                     for ci, c in enumerate(CAMS):
@@ -112,7 +112,7 @@ def loader(scenes, root, stride, q_raw, stop, loop, in_slots=None, in_free=None)
                 po = tuple(float(x) for x in poses[f["frame"]]) \
                     if poses is not None and f["frame"] < len(poses) else None
                 lb = None
-                if _LIDAR:                       # METEOR_LIDAR=1: ピラーラスタ [4,400,250] を供給
+                if _LIDAR:                       # METEOR_LIDAR=1: feed the pillar raster [4,400,250]
                     _lp = f.get("lidar_bev") or f"lidar_bev/{int(f['frame']):04d}.npz"
                     try:
                         lb = np.load(os.path.join(_sd, _lp))["lb"].astype(np.float32)[None]
@@ -142,8 +142,8 @@ def producer(rt, q_raw, q, free_slots, stop, in_free=None):
         out = rt.infer(imgs, K[0][None], Tc[0][None], v0=v0, pose=pose,
                        out_slot=slot, lidar_bev=lb)
         if lb is not None:
-            out = dict(out); out["lidar_bev_in"] = lb    # 描画で点群を重畳するため
-        if si is not None:               # H2D は infer() 内で完了済み
+            out = dict(out); out["lidar_bev_in"] = lb    # so rendering can overlay the point cloud
+        if si is not None:               # H2D already completed inside infer()
             in_free.put(si)
         dt = (time.time() - t0) * 1000
         # out holds VIEWS into host slot `slot`; the renderer releases it
@@ -168,30 +168,30 @@ def main():
     a = ap.parse_args()
 
     N_SLOTS = 4
-    # occ は描画に使うのでコピーする (2026-08-16)。残りは未使用なので
-    # ホストへの転送を省く (計算自体はグラフに残っている)。
-    # risk は 2026-08-28 から描画対象 (v128cR 系エンジンが出力を持つ)。
-    # 転送は [1,1,400,250] fp32 = 400KB/frame で無視できる。
+    # occ is used for rendering, so copy it (2026-08-16). The rest is unused,
+    # so skip the host transfer (the compute itself stays in the graph).
+    # risk is rendered since 2026-08-28 (v128cR-line engines emit it);
+    # its transfer is [1,1,400,250] fp32 = 400KB/frame, negligible.
     rt = MeteorRT(a.engine, skip_outputs=(
         "flow", "unk", "pl", "tl", "lg_pts", "lg_meta",
         "lg_adj"), n_out_slots=N_SLOTS)
     # 8-camera engines (r64 line): the model's camera order is the dataset's
     # CAMS, which appends CAM_BACK_NARROW after the 7 the renderer knows.
-    # 2026-08-15: レンダラ側 (R.CAMS) にも同じ一覧を渡す。ここを更新しないと
-    # 描画側は 7 カメラのままで、実際に入力として使っている 8 枚目が
-    # 「(blank)」と表示されてしまう。
+    # 2026-08-15: pass the same list to the renderer (R.CAMS). Without this
+    # update the rendering side stays at 7 cameras and the 8th camera, which
+    # is actually used as input, is displayed as "(blank)".
     global CAMS
     if rt.shapes.get("imgs", (1, 7))[1] == 8 and len(CAMS) == 7:
         CAMS = CAMS + ["CAM_BACK_NARROW"]
         R.CAMS = CAMS
-        # 2026-08-25: タイル描画は CAM_DRAW を見る (8/24 の描画修正で導入)。
-        # R.CAMS だけ更新すると入力は 8 枚なのに 8 枚目のタイルが
-        # 「(blank)」になる (laptop で実害)。
+        # 2026-08-25: tile rendering reads CAM_DRAW (introduced by the 8/24
+        # rendering fix). Updating only R.CAMS leaves the 8th tile "(blank)"
+        # even though 8 images are fed in (bit us in practice on the laptop).
         R.CAM_DRAW = list(CAMS)
         print("[rt] 8-camera engine: loading CAM_BACK_NARROW as camera 8")
-    # BEV の前後範囲はエンジンの出力行数から決める (軽量 600 行 = 後 40 m /
-    # ベースライン 800 行 = 後 80 m)。固定値のままだと 8 カメラ版でも
-    # 後方 40 m で切れて表示される。
+    # Derive the BEV fore/aft extent from the engine's output rows (light
+    # 600 rows = 40 m rear / baseline 800 rows = 80 m rear). With a fixed
+    # value the 8-camera build is also displayed cut off at 40 m rear.
     _lane_shape = rt.shapes.get("lane")
     if _lane_shape is not None:
         R.set_bev_extent(_lane_shape[-2])
@@ -201,9 +201,9 @@ def main():
     from deploy.t4input import is_t4_scene
     _root = a.root.rstrip("/")
     if os.path.isfile(os.path.join(_root, "manifest.json")) or is_t4_scene(_root):
-        # --root がシーンそのもの (t4 なら annotation/sample.json が直下)。
-        # この判定を最優先にしないと、シーン内の tmp/ 等の下位フォルダを
-        # シーン一覧と誤認して落ちる (laptop で実害があった)。
+        # --root is the scene itself (for t4, annotation/sample.json sits directly
+        # under it). Unless this check comes first, subfolders inside the scene
+        # such as tmp/ are mistaken for the scene list and we crash (bit us on the laptop).
         a.root = os.path.dirname(_root) or "."
         scenes = [os.path.basename(_root)]
     else:
@@ -214,14 +214,14 @@ def main():
     q = queue.Queue(maxsize=2)
     stop = threading.Event()
     q_raw = queue.Queue(maxsize=3)
-    # ゼロコピー入力スロット: q_raw 3 + 推論中 1 + 書込中 1 = 5
+    # zero-copy input slots: q_raw 3 + 1 in inference + 1 being written = 5
     _u8 = rt.host["imgs"].dtype == np.uint8
     in_slots = rt.pinned_input_slots(5) if _u8 else None
     in_free = queue.Queue()
     if in_slots is not None:
         for i in range(len(in_slots)):
             in_free.put(i)
-        print("[rt] ゼロコピー入力スロット x5 (pinned)", flush=True)
+        print("[rt] zero-copy input slots x5 (pinned)", flush=True)
     th_l = threading.Thread(target=loader,
                             args=(scenes, a.root, a.stride, q_raw, stop,
                                   a.loop, in_slots, in_free), daemon=True)
@@ -234,8 +234,8 @@ def main():
     vw = None
     if a.out:
         os.makedirs(os.path.dirname(a.out) or ".", exist_ok=True)
-        # 2026-09-06: 書き出し fps は固定 8 だったため動画が実行レートに関係なく
-        # 8 fps 再生になっていた (ユーザー指摘)。METEOR_REC_FPS (既定 10 = 実効レート相当)。
+        # 2026-09-06: the output fps was fixed at 8, so the video played back at
+        # 8 fps regardless of the run rate (user report). METEOR_REC_FPS (default 10 = ~effective rate).
         _rec_fps = float(os.environ.get("METEOR_REC_FPS", "10"))
         vw = cv2.VideoWriter(a.out, cv2.VideoWriter_fourcc(*"mp4v"),
                              _rec_fps, (1920, 1080))
@@ -309,11 +309,11 @@ def main():
                 if vw is not None:
                     vw.write(canvas)
                 if a.display:
-                    # フルスクリーン表示 (2026-08-28)。バックエンドの
-                    # レターボックスを避けるため、キャンバス自体を画面解像度へ
-                    # リサイズしてから表示する (枠なし)。解像度は自動取得、
-                    # 失敗時は METEOR_SCREEN (例 2560x1600)。
-                    # METEOR_FULLSCREEN=0 で従来のウィンドウ表示。
+                    # Fullscreen display (2026-08-28). To avoid the backend's
+                    # letterboxing, resize the canvas itself to the screen
+                    # resolution before showing it (borderless). The resolution is
+                    # auto-detected, falling back to METEOR_SCREEN (e.g. 2560x1600).
+                    # METEOR_FULLSCREEN=0 gives the classic windowed display.
                     if not hasattr(a, "_win"):
                         a._win = True
                         a._scr = None

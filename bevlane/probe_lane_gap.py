@@ -1,15 +1,15 @@
-"""laneline の失点がどこから来ているかを分解する。
+"""Break down where laneline loses its score.
 
-線は幅 1-2 セル (0.2 m/セル) しかないので、1 セルずれるだけで IoU は半減する。
-「形は合っているが位置が微妙にずれている」のか「そもそも出ていない/余計に
-出ている」のかで、打つ手がまったく変わる:
+Lines are only 1-2 cells wide (0.2 m/cell), so a 1-cell shift halves the IoU.
+Whether the shape is right but slightly misplaced, or the line is missing / spurious,
+calls for completely different fixes:
 
-  許容 0 セル IoU が低く、許容 1-2 セルにすると跳ね上がる
-      -> サブセル精度の問題。SDF/オフセット回帰や高解像度ヘッドが効く
-  許容を広げても上がらない
-      -> 検出そのものの問題。特徴量・損失・GT 品質を見る必要がある
+  low IoU at 0-cell tolerance that jumps at 1-2 cells
+      -> sub-cell accuracy problem; SDF/offset regression or a higher-res head helps
+  no gain from widening the tolerance
+      -> detection problem; look at features, loss and GT quality
 
-あわせて再現率と適合率を許容距離別に出し、太さ (面積比) も測る。
+Also reports recall and precision per tolerance, and thickness (area ratio).
 """
 import argparse
 import os
@@ -24,8 +24,8 @@ from bevlane.dataset import BevLaneDataset                        # noqa: E402
 from bevlane.model import MODELS                                  # noqa: E402
 from bevlane.ckpt_load import load_net                            # noqa: E402
 
-LANE = 4                                # laneline のクラス番号
-TOL = [0, 1, 2, 3]                      # 許容セル数 (0.2 m/セル)
+LANE = 4                                # laneline class id
+TOL = [0, 1, 2, 3]                      # tolerance in cells (0.2 m/cell)
 
 
 def main():
@@ -38,7 +38,7 @@ def main():
     ap.add_argument("--scenes", type=int, default=60)
     ap.add_argument("--frames", type=int, default=120)
     ap.add_argument("--bias", type=float, default=0.75,
-                    help="laneline ロジットから引く定数 (較正)")
+                    help="constant subtracted from the laneline logit (calibration)")
     ap.add_argument("--cls", type=int, default=LANE)
     ap.add_argument("--trim-start", type=int, default=3)
     ap.add_argument("--trim-end", type=int, default=10)
@@ -51,8 +51,8 @@ def main():
     m = MODELS[a.model](n_seg=21).cuda().eval()
     load_net(m, a.ckpt)
 
-    tp = {t: 0 for t in TOL}            # 予測のうち GT の許容内にあるもの
-    hit = {t: 0 for t in TOL}           # GT のうち予測の許容内にあるもの
+    tp = {t: 0 for t in TOL}            # predicted cells within tolerance of GT
+    hit = {t: 0 for t in TOL}           # GT cells within tolerance of a prediction
     n_pred = n_gt = 0
     row_gt = row_hit = row_gt_far = row_hit_far = 0
     gap_runs = []
@@ -84,8 +84,8 @@ def main():
                 k = np.ones((2 * t + 1, 2 * t + 1), np.uint8)
                 gd = cv2.dilate(gt, k)
                 pd = cv2.dilate(pr, k)
-            tp[t] += int((pr & gd).sum())      # 予測が GT の許容内
-            hit[t] += int((gt & pd).sum())     # GT が予測の許容内
+            tp[t] += int((pr & gd).sum())      # pred within tolerance of GT
+            hit[t] += int((gt & pd).sum())     # GT within tolerance of pred
             if t == 1:
                 gr = gt.any(1)
                 hr = (gt & pd).any(1)
@@ -103,20 +103,20 @@ def main():
         if done >= a.frames:
             break
 
-    print(f"=== {a.ckpt} (laneline, {done} フレーム, バイアス {a.bias}) ===")
-    print(f"予測セル数 {n_pred}  GT セル数 {n_gt}  "
-          f"面積比 {n_pred / max(n_gt, 1):.2f}")
-    print("許容    適合率(予測がGT近傍)  再現率(GTが予測近傍)  F1")
+    print(f"=== {a.ckpt} (laneline, {done} frames, bias {a.bias}) ===")
+    print(f"pred cells {n_pred}  GT cells {n_gt}  "
+          f"area ratio {n_pred / max(n_gt, 1):.2f}")
+    print("tol     precision(pred near GT)  recall(GT near pred)  F1")
     for t in TOL:
         p = tp[t] / max(n_pred, 1)
         r = hit[t] / max(n_gt, 1)
         f = 2 * p * r / max(p + r, 1e-9)
-        print(f"  {t}セル ({t * 0.2:.1f}m)      {p:5.3f}            "
+        print(f"  {t}cell ({t * 0.2:.1f}m)      {p:5.3f}            "
               f"{r:5.3f}          {f:5.3f}")
     gaps = np.asarray(gap_runs, np.float32) * 0.2
-    print(f"行連続性@0.2m: recall={row_hit / max(row_gt, 1):.3f} "
+    print(f"row continuity@0.2m: recall={row_hit / max(row_gt, 1):.3f} "
           f"far(+30m)={row_hit_far / max(row_gt_far, 1):.3f} "
-          f"欠落run mean/p95/max="
+          f"gap run mean/p95/max="
           f"{(gaps.mean() if len(gaps) else 0):.2f}/"
           f"{(np.percentile(gaps, 95) if len(gaps) else 0):.2f}/"
           f"{(gaps.max() if len(gaps) else 0):.2f}m")

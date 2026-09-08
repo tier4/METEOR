@@ -1,5 +1,5 @@
-"""raw_bev (BEV 特徴) がフレーム間で変化しているかを INT8/fp16 で比較。
-ego 凍結の原因が上流 (特徴) か下流 (ego ヘッド) かを切り分ける。"""
+"""Compare whether raw_bev (BEV features) changes between frames, INT8 vs fp16.
+Tells whether frozen ego originates upstream (features) or downstream (ego head)."""
 import sys, os, json
 sys.path.insert(0, "/home/nvidia/meteor")
 import numpy as np, cv2
@@ -29,8 +29,8 @@ for eng in sys.argv[1].split(","):
         ego = np.asarray(o["ego"], np.float32).reshape(-1)
         db = np.abs(bev - prev_bev).mean() if prev_bev is not None else 0.0
         de = np.abs(ego - prev_ego).mean() if prev_ego is not None else 0.0
-        print(f"  f{fi:03d} occ+traj(std {bev.std():7.4f} 前frame差 {db:7.5f}) "
-              f"ego(std {ego.std():7.4f} 前frame差 {de:7.5f})")
+        print(f"  f{fi:03d} occ+traj(std {bev.std():7.4f} prev-frame diff {db:7.5f}) "
+              f"ego(std {ego.std():7.4f} prev-frame diff {de:7.5f})")
         prev_bev, prev_ego = bev, ego
     del rt
 print("BEV_FROZEN_TEST_DONE")

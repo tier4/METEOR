@@ -1,8 +1,8 @@
-"""しきい値を振って再現率と誤検出数を出す (モデル間の検出性能比較用)。
+"""Sweep the threshold and report recall and false positives (for cross-model detection comparison).
 
-固定しきい値 1 点での検出数比較はモデル間のスコア較正差に汚染される
-(同じ 0.25 でも出方が違う)。曲線で見ないと「劣化したのか、しきい値が
-合っていないだけなのか」が分けられない。
+Comparing detection counts at one fixed threshold is contaminated by score-calibration
+differences between models (the same 0.25 behaves differently). Without the curve
+you cannot separate a real regression from a mis-set threshold.
 """
 import argparse
 import os
@@ -26,11 +26,11 @@ def main():
     ap.add_argument("--scenes", type=int, default=60)
     ap.add_argument("--frames", type=int, default=200)
     ap.add_argument("--range-th", default="",
-                    help="距離別しきい値 例 20:0.25,40:0.18,80:0.12 "
-                         "(距離までの上限:しきい値)")
+                    help="range-dependent thresholds, e.g. 20:0.25,40:0.18,80:0.12 "
+                         "(range upper bound:threshold)")
     ap.add_argument("--zero-cams", default="",
-                    help="指定カメラを黒画像にして寄与を測る "
-                         "(例: CAM_FRONT_NARROW)")
+                    help="black out the given cameras to measure their contribution "
+                         "(e.g. CAM_FRONT_NARROW)")
     ap.add_argument("--tag", default="")
     a = ap.parse_args()
 
@@ -70,7 +70,7 @@ def main():
         ims = b[0][None][:, :a.n_cams].clone()
         for _ci in zc:
             if _ci < ims.shape[1]:
-                ims[:, _ci] = 0                     # そのカメラだけ黒にする
+                ims[:, _ci] = 0                     # black out only that camera
         with torch.no_grad(), torch.autocast("cuda", torch.float16):
             out = m(ims.cuda(),
                     b[1][None][:, :a.n_cams].cuda(),
@@ -83,7 +83,7 @@ def main():
             if ln <= 0 or cls >= 1.5:
                 continue
             r = (xe * xe + ye * ye) ** 0.5
-            # 距離帯別に見るため、前方は 80 m まで拾う
+            # collect up to 80 m ahead for the per-band view
             if 0 < xe <= 80 or (-20 <= xe <= 0 and r <= 50):
                 gts.append((xe, ye, yw))
         ngt += len(gts)
@@ -150,30 +150,30 @@ def main():
             break
 
     if rth:
-        # 距離別しきい値: 低いしきい値で一度デコードし、箱ごとの距離に応じて
-        # 採否を決める。遠方だけスコア基準を緩めたときの再現率と誤検出を見る。
-        print(f"=== {a.tag} 距離別しきい値 {a.range_th} ===")
-        print("  帯別再現率: " + "  ".join(
+        # Range-dependent thresholds: decode once at a low threshold, then accept per box
+        # by range. Shows recall and false positives when only far boxes get a looser score bar.
+        print(f"=== {a.tag} range-dependent thresholds {a.range_th} ===")
+        print("  recall per band: " + "  ".join(
             f"{b[0]}-{b[1]}m {rt_hit[b] / max(band_gt[b], 1):5.3f}"
             for b in BANDS))
-        print(f"  誤検出/フレーム {rt_fp / max(done, 1):5.2f}  "
-              f"全体再現率 {sum(rt_hit.values()) / max(ngt, 1):5.3f}")
-    print(f"=== {a.tag or a.ckpt} ({done} フレーム, GT 車両 {ngt} 箱) ===")
-    print("しきい値  再現率      誤検出/フレーム  yaw中央値")
+        print(f"  FP/frame {rt_fp / max(done, 1):5.2f}  "
+              f"overall recall {sum(rt_hit.values()) / max(ngt, 1):5.3f}")
+    print(f"=== {a.tag or a.ckpt} ({done} frames, {ngt} GT vehicle boxes) ===")
+    print("thr       recall      FP/frame         yaw median")
     for t in ths:
         rc = hit[t] / max(ngt, 1)
         ym = np.median(yaw[t]) if yaw[t] else float("nan")
         print(f"  {t:.2f}   {rc:5.3f} ({hit[t]:4d})   "
-              f"{fp[t] / max(done, 1):5.2f}          {ym:5.1f} 度")
-    print("\n距離帯別の再現率 (GT 箱数)")
-    print("  しきい値 " + "  ".join(f"{b[0]:2d}-{b[1]:2d}m" for b in BANDS))
+              f"{fp[t] / max(done, 1):5.2f}          {ym:5.1f} deg")
+    print("\nrecall per range band (GT box count)")
+    print("  thr      " + "  ".join(f"{b[0]:2d}-{b[1]:2d}m" for b in BANDS))
     for b in BANDS:
         pass
     for t in ths:
         row = "  ".join(f"{band_hit[(b, t)] / max(band_gt[b], 1):6.3f}"
                         for b in BANDS)
         print(f"    {t:.2f}   {row}")
-    print("  GT 箱数 " + "  ".join(f"{band_gt[b]:6d}" for b in BANDS))
+    print("  GT boxes " + "  ".join(f"{band_gt[b]:6d}" for b in BANDS))
 
 
 if __name__ == "__main__":

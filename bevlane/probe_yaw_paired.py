@@ -1,19 +1,19 @@
-"""1 モデル分の yaw 誤差を GT 箱ごとに書き出す (ペア比較用の片側)。
+"""Dump per-GT-box yaw error for one model (one side of a paired comparison).
 
-なぜ 1 プロセス 1 モデルなのか:
-  BEV の後方レンジ (METEOR_BEV_XR) はインポート時に読まれる定数なので、
-  1 プロセスで軽量版 (rear-40) と全域版を同時に正しく構成できない。
-  2026-08-14 の比較はこれを守らず、軽量版を誤ったジオメトリで動かして
-  検出数が 90 個まで落ちた状態の数値を比べていた。
+Why one model per process:
+  the BEV rear range (METEOR_BEV_XR) is a constant read at import time, so one
+  process cannot correctly build both the light (rear-40) and full-range models.
+  The 2026-08-14 comparison ignored this, ran the light model with the wrong
+  geometry, and compared numbers with detections collapsed to 90.
 
-なぜペアにするのか:
-  yaw 誤差はリコールに強く汚染される。検出が易しい箱 (正対・近距離) しか
-  出せないモデルは平均 yaw 誤差が小さく出る。フェーズ A 2.7 度 (121 箱) と
-  フェーズ B 7.4 度 (832 箱) はこの汚染そのもの。両モデルが検出できた
-  同一 GT 箱だけを突き合わせて初めて姿勢精度の比較になる。
+Why paired:
+  yaw error is heavily contaminated by recall. A model that only detects easy boxes
+  (ego-parallel, near) shows a small mean yaw error. Phase A 2.7 deg (121 boxes) vs
+  phase B 7.4 deg (832 boxes) is exactly this contamination. Only the same GT boxes
+  detected by both models give a real heading-accuracy comparison.
 
-出力 npz は (フレーム index, 箱 index) をキーに yaw 誤差を持つ。
-突き合わせは probe_yaw_join.py が行う。
+The output npz holds yaw error keyed by (frame index, box index).
+probe_yaw_join.py does the join.
 """
 import argparse
 import os
@@ -36,7 +36,7 @@ def load_model(ckpt, name):
     keep = {k: v for k, v in sd.items()
             if k in cur and cur[k].shape == v.shape}
     m.load_state_dict(keep, strict=False)
-    print(f"[load] {ckpt}: {len(keep)}/{len(cur)} テンソルを復元", flush=True)
+    print(f"[load] {ckpt}: {len(keep)}/{len(cur)} tensors restored", flush=True)
     return m
 
 
@@ -51,7 +51,7 @@ def main():
     ap.add_argument("--frames", type=int, default=200)
     ap.add_argument("--thresh", type=float, default=0.25)
     ap.add_argument("--match-r", type=float, default=2.0,
-                    help="GT と予測の対応付け半径 [m]")
+                    help="GT-to-prediction matching radius [m]")
     ap.add_argument("--out", required=True)
     a = ap.parse_args()
 
@@ -92,7 +92,7 @@ def main():
                 continue
             de = abs((best[1] - yaw + np.pi) % (2 * np.pi) - np.pi)
             rows.append((i, k, xe, ye, r,
-                         min(de, np.pi - de),                 # 180 度対称
+                         min(de, np.pi - de),                 # 180-degree symmetry
                          abs((np.degrees(yaw) + 90) % 180 - 90)))
         done += 1
         if done >= a.frames:
@@ -100,7 +100,7 @@ def main():
 
     arr = np.array(rows, dtype=np.float64) if rows else np.zeros((0, 7))
     np.savez(a.out, rows=arr)
-    print(f"[out] {a.out}: {len(arr)} 箱を検出 ({done} フレーム)", flush=True)
+    print(f"[out] {a.out}: {len(arr)} boxes detected ({done} frames)", flush=True)
 
 
 if __name__ == "__main__":

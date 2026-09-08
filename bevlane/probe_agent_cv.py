@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
-"""エージェント軌跡の物理ベースライン (2026-08-27)。
+"""Physics baselines for agent trajectories (2026-08-27).
 
-モデルの agentADE 2.14m (veh 2.45 / vru 1.95) がどれだけ「学習の成果」かを
-判定する。GT だけから 2 つの基線を計算する:
-  zero      : 変位 0 を予測 (全員停止と仮定)
-  oracle-CV : 最初の 0.5s 変位を速度とみなし等速外挿 (観測誤差ゼロの
-              等速モデル = CV 系の上限)
-モデルがこの oracle-CV に迫れていなければ、ヘッドは実質「等速」しか
-学べておらず、構造レバー (履歴・相互作用・CV 残差化) が必要と判定する。
+Judge how much of the model's agentADE 2.14 m (veh 2.45 / vru 1.95) is actually
+learned. Two baselines computed from GT alone:
+  zero      : predict zero displacement (everyone stationary)
+  oracle-CV : take the first 0.5 s displacement as velocity and extrapolate at
+              constant velocity (zero observation error = upper bound of CV models)
+If the model does not approach oracle-CV, the head has effectively learned only
+constant velocity and a structural lever (history, interaction, CV residual) is needed.
 """
 import argparse
 import math
@@ -43,8 +43,8 @@ for i in range(len(ds)):
     b = ds[i]
     if b is None:
         continue
-    # with_agenttraj は末尾 4 テンソル (boxes[64,6], count, traj[64,6,2],
-    # tvalid[64,6]) を連続で返す (dataset.py の順序に一致させる)
+    # with_agenttraj returns 4 trailing tensors (boxes[64,6], count, traj[64,6,2],
+    # tvalid[64,6]) in a row (matches the order in dataset.py)
     tensors = [t for t in b if torch.is_tensor(t)]
     tj = None
     for j in range(len(tensors) - 3):
@@ -62,14 +62,14 @@ for i in range(len(ds)):
         v = tv[k] if tv is not None else torch.ones(6)
         if v.sum() == 0:
             continue
-        g = tj[k]                                   # [6,2] 変位 (累積)
+        g = tj[k]                                   # [6,2] displacement (cumulative)
         cls = "veh" if float(bx[k, 0]) < 1.5 else "vru"
         disp3 = float(g[5].norm())
         moving = disp3 > 1.0
-        # zero 基線
+        # zero baseline
         dz = g.norm(dim=1)
         add(f"zero_{cls}", (dz * v).sum() / v.sum())
-        # oracle-CV: v = g[0] (最初の 0.5s), pred_k = v*(k+1)
+        # oracle-CV: v = g[0] (first 0.5s), pred_k = v*(k+1)
         steps = torch.arange(1, 7).view(6, 1).float()
         pcv = g[0].view(1, 2) * steps
         dcv = (pcv - g).norm(dim=1)
