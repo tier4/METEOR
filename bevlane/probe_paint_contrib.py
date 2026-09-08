@@ -1,0 +1,92 @@
+#!/usr/bin/env python3
+"""paint 系の枝が「本当に使われているか」を寄与率で測る。
+
+ゼロ初期化 1x1 射影の注入は機能保存で安全だが、**学習がその枝を使わない**
+まま重みをゼロ付近に置くことがある。v103 の paint-seg がまさにそれで、
+ctx 出力に対する加算の大きさは 0.06% しかなく、枝を捨てても検出 recall は
+小数点以下 3 桁まで同一だった。以後、注入系レバーは必ずこれで生存確認する。
+
+寄与率 = |注入分| 平均 / |ctx 出力| 平均。
+"""
+import argparse
+import os
+import sys
+
+import numpy as np
+import torch
+import torch.nn.functional as F
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from bevlane.dataset import BevLaneDataset          # noqa: E402
+from bevlane.model import MODELS                    # noqa: E402
+from bevlane.ckpt_load import load_net              # noqa: E402
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--ckpt", required=True)
+    ap.add_argument("--list", default="val.lst")
+    ap.add_argument("--scenes", type=int, default=6)
+    ap.add_argument("--per-scene", type=int, default=4)
+    ap.add_argument("--root", default="out/bevlane")
+    a = ap.parse_args()
+
+    dev = "cuda" if torch.cuda.is_available() else "cpu"
+    net = MODELS["v52"](n_seg=21).to(dev).eval()
+    load_net(net, a.ckpt)
+
+    acc = {"ctx": [], "seg": [], "det": []}
+
+    def probe(_m, _i, _o):
+        d_seg = d_det = None
+        if hasattr(net, "paint_proj") and getattr(net, "_paint_buf", None) is not None:
+            pb = net._paint_buf.float().softmax(1)[:, net._paint_cls]
+            if pb.shape[-2:] != _o.shape[-2:]:
+                pb = F.interpolate(pb, size=_o.shape[-2:], mode="bilinear",
+                                   align_corners=False)
+            d_seg = net.paint_proj(pb.to(_o.dtype))
+        if hasattr(net, "paint_det_proj"):
+            f = getattr(net, "_last_f", None)
+            if f is not None and f.shape[0] == _o.shape[0]:
+                hm = net.hm2d_head(net.det2d_stem(f))
+                p = hm.sigmoid()[:, net._paint_det_cls].to(_o.dtype)
+                if p.shape[-2:] != _o.shape[-2:]:
+                    p = F.interpolate(p, size=_o.shape[-2:], mode="bilinear",
+                                      align_corners=False)
+                d_det = net.paint_det_proj(p)
+        base = _o
+        for d in (d_seg, d_det):
+            if d is not None:
+                base = base - d
+        acc["ctx"].append(float(base.abs().mean()))
+        if d_seg is not None:
+            acc["seg"].append(float(d_seg.abs().mean()))
+        if d_det is not None:
+            acc["det"].append(float(d_det.abs().mean()))
+
+    net.ctx.register_forward_hook(probe)
+
+    scenes = [l.strip() for l in open(a.list) if l.strip()][:a.scenes]
+    ds = BevLaneDataset(a.root, scenes, gt_key="gt_cons",
+                        max_per_scene=a.per_scene, n_cams=8)
+    for i in range(0, len(ds), 2):
+        x = ds[i]
+        if x is None:
+            continue
+        with torch.no_grad(), torch.autocast("cuda", torch.float16):
+            net(x[0][None].to(dev), x[1][None].to(dev), x[2][None].to(dev))
+
+    c = float(np.mean(acc["ctx"])) if acc["ctx"] else float("nan")
+    print(f"\nctx 出力 |x| 平均 = {c:.5f}  (n={len(acc['ctx'])} 回)")
+    for nm, key in (("paint-seg", "seg"), ("paint-det", "det")):
+        if not acc[key]:
+            print(f"  {nm}: 枝なし")
+            continue
+        d = float(np.mean(acc[key]))
+        r = d / c * 100
+        verdict = "生存" if r >= 1.0 else "**死んでいる (1% 未満)**"
+        print(f"  {nm}: 加算 |d| 平均 {d:.5f} -> 寄与率 {r:.2f} %  {verdict}")
+
+
+if __name__ == "__main__":
+    main()
