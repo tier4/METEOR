@@ -37,7 +37,11 @@ def _occ_ground(occ_pred):
     the r27 GT cleanup targets; the guard must not consume it."""
     if occ_pred is None:
         return None
-    blk = np.isin(occ_pred, STATIC_OCC).any(0)
+    # 2026-08-20: 幻影 VETO の実測全件が z ビン 12-15 (地上 3.8-5.4 m) の
+    # building ボクセルだった (路面上空の幻視/高架構造)。ガードが見るべきは
+    # 車両が通過する高さ窓だけ: z ビン 3..9 (路面 +0.2〜+3.0 m)。上空の
+    # ボクセルは実在 (門型標識・高架) でも衝突対象ではない。
+    blk = np.isin(occ_pred[3:10], STATIC_OCC).any(0)
     blk[86:101, 96:105] = False          # x in (0,5.6], |y|<=1.6 m
     return blk
 
@@ -80,17 +84,24 @@ def check_path(path, occ_pred, dets, det_offs, tl_probs, lane_argmax, v0):
     # ---- 1b. static occupancy on the path -------------------------------
     blk = _occ_ground(occ_pred)
     if blk is not None and not events:
+        # 2026-08-20 誤 VETO 対策: 単フレーム 3x3>=3 は夜間の occ 幻影で
+        # 42% のフレームが VETO になっていた (val+curve 112 枚で幻影率 33/33
+        # = 100%)。(a) 3x3>=5 に強化、(b) 同位置 (2m 以内) で 2 フレーム
+        # 連続したときだけ発火する持続確認を追加。
+        _cand = None
         for ti in range(6):
             px, py = float(path[ti, 0]), float(path[ti, 1])
             if px * px + py * py < 2.5 ** 2:  # ego-proximal fragments = FP
                 continue
             r, c = int((40.0 - px) / 0.4), int((40.0 - py) / 0.4)
             if 2 <= r < 198 and 2 <= c < 198 \
-                    and int(blk[r - 1:r + 2, c - 1:c + 2].sum()) >= 3:
-                events.append((f"STATIC obstacle {math.hypot(px, py):.0f}m "
-                               f"t={(ti + 1) * 0.5:.1f}s",
-                               (ti + 1) * 0.5, (px, py)))
+                    and int(blk[r - 1:r + 2, c - 1:c + 2].sum()) >= 5:
+                _cand = ((ti + 1) * 0.5, (px, py))
                 break
+        if _cand is not None:
+            events.append((f"STATIC obstacle "
+                           f"{math.hypot(*_cand[1]):.0f}m "
+                           f"t={_cand[0]:.1f}s", _cand[0], _cand[1]))
 
     # ---- 2. red-light x stop-line gate ----------------------------------
     red = float(tl_probs[3])

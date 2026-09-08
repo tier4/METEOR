@@ -29,7 +29,7 @@ from bevlane.extract_gt import ROOT, load_scene_light  # noqa: E402
 cv2.setNumThreads(1)
 
 PROD = "out/production"
-OUT = "out/bevlane"
+OUT = os.environ.get("METEOR_BEVLANE_OUT", "out/bevlane")
 # fills from vector polygons: (vector class, target id)
 FILLS = [("sidewalk", 2), ("crosswalk", 3)]
 # lines from vector polylines: (vector class, target id, width [m])

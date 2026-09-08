@@ -78,14 +78,12 @@ box(111, 16, 17, 10.5, "Memory queue", "t−0.4 / 1.2 / 2.8 s\nBEVs, ego-warped"
 box(133, 33, 14, 9.5, "FUSED BEV", "96ch · velocity", fc=MEM, fs=10.5, sfs=8.6)
 
 # ---- geometry heads (from RAW BEV) ----
-box(152, 82, 36, 10.5, "BEV lane decoder", "LaneDecED @800×500 · 4.1M",
+box(152, 82, 36, 10.5, "BEV lane seg head", "LaneDecED @800×500 · 4.1M",
     out="→ 9-class lane map 160×100 m", sfs=8.8)
 box(152, 70, 36, 10.5, "3D Box head", "CenterPoint @s2 · 2.1M",
     out="→ oriented boxes: veh + VRU", sfs=8.8)
 box(152, 58, 36, 10.5, "Occupancy + flow", "16z×200×200 · 0.75M",
     out="→ 10-class voxels + velocity", sfs=8.8)
-box(152, 46, 36, 10.5, "Lane-graph decoder", "B1 query decoder (24q, 2L attn)",
-    out="→ vector chains + adjacency", sfs=8.8)
 
 # ---- motion heads (from FUSED BEV) ----
 box(152, 32, 36, 10.5, "E2E head (K=3)", "attn-pool + intent/kin +\nrisk-integral selection (v38)",
@@ -107,7 +105,7 @@ arrow(119, 52, 119, 44.5, lw=1.4)         # RAW -> fuse
 arrow(119, 26.5, 119, 33, lw=1.4)         # queue -> fuse
 arrow(18, 22, 111, 21, lw=1.2)            # pose -> queue
 arrow(128, 38, 133, 38)                   # fuse -> FUSED BEV
-for hy in (87, 75, 63, 51):               # raw BEV -> geometry heads
+for hy in (87, 75, 63):                   # raw BEV -> geometry heads
     arrow(128, 57, 152, hy, col=GREEN, lw=1.3)
 for hy in (37, 25, 13):                   # fused BEV -> motion heads
     arrow(147, 38, 152, hy, col=AMBER, lw=1.3)
@@ -143,8 +141,8 @@ ax.text(23, 0.8, "green text = task outputs — one forward pass produces all tw
         fontsize=10.5, color=GREEN, fontweight="bold")
 
 ax.text(95, 94,
-        "METEOR v29 — 12 tasks · 45.8M params · one static TensorRT engine "
-        "(fp16, ~70 ms / 8-camera frame) · zero human labels, zero human code",
+        "METEOR v52 — 12 tasks · 54M params (refiner incl.) · one static TensorRT engine "
+        "(AGX Orin INT8: 69.6 ms 2:4 sparse / 78.7 ms dense) · zero human labels, zero human code",
         ha="center", fontsize=13.5, fontweight="bold", color=DARK)
 ax.text(95, 29.5,
         "depth gates the IPM: features enter the BEV only where\n"

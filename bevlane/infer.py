@@ -22,7 +22,10 @@ def panel(imgs_raw, gt, pred):
     order = [1, 0, 2, 4, 3, 5]  # FL, FW, FR / BL, BW, BR
     for k, idx in enumerate(order):
         r, c = divmod(k, 3)
-        grid[r * tile_h:(r + 1) * tile_h, c * tile_w:(c + 1) * tile_w] = imgs_raw[idx]
+        if imgs_raw[idx] is None:          # camera the rig does not have
+            continue
+        grid[r * tile_h:(r + 1) * tile_h, c * tile_w:(c + 1) * tile_w] = \
+            cv2.resize(imgs_raw[idx], (tile_w, tile_h))
     bev_h = tile_h * 2
     gt_v = cv2.resize(PALETTE[gt][:, :, ::-1], (bev_h, bev_h),
                       interpolation=cv2.INTER_NEAREST)
@@ -61,7 +64,9 @@ def main():
                            Tc[None].to(args.device))
         pred = logits.argmax(1)[0].cpu().numpy().astype(np.uint8)
         s, f = ds.items[i]
-        raws = [cv2.imread(os.path.join(args.root, s, f["imgs"][c])) for c in CAMS]
+        # a 7-camera recording (x2gen2) has no CAM_BACK_NARROW entry
+        raws = [cv2.imread(os.path.join(args.root, s, f["imgs"][c]))
+                if c in f["imgs"] else None for c in CAMS]
         img = panel(raws, gt.numpy().astype(np.uint8), pred)
         name = f"{args.scene.split('+0900_')[-1]}_{f['frame']:04d}.jpg"
         cv2.imwrite(os.path.join(args.out, name), img)

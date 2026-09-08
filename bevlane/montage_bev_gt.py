@@ -88,7 +88,7 @@ def main():
                     rh = int(rw * 432 / 768)
                     frame[40:40 + rh, 10:10 + rw] = cv2.resize(img, (rw, rh))
             frame[30:30 + BH2, VW - BW2 - 10:VW - 10] = bev
-            tag = "DTSET" if s.startswith("6yb") else "aisin"
+            tag = "batchB" if s.startswith("6yb") else "batchA"
             cv2.putText(frame, f"[{si+1}/{len(scenes)}] {tag}  {s[-40:]}",
                         (10, 22), cv2.FONT_HERSHEY_SIMPLEX, 0.55,
                         (0, 255, 0), 1, cv2.LINE_AA)

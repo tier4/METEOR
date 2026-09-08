@@ -2,7 +2,7 @@
 """Ego-relevant traffic-light state GT from CoMET TLR autolabels.
 
 CoMET's TLR subnet writes green/yellow/red bboxes (+prob) into the per-image
-fastlabel JSONs. This stage reduces them to ONE whole-image label per frame —
+2D annotation JSONs of the dataset (directory `fastlabel/`). This stage reduces them to ONE whole-image label per frame —
 the state of the traffic light the EGO vehicle should obey:
 
   ego-relevance heuristic:
@@ -36,7 +36,7 @@ COLORS = {"green": 1, "yellow": 2, "red": 3}
 
 
 def frame_label(raw_dir, stem_by_cam):
-    """-> (label, conf) for one frame from its front-camera fastlabel JSONs."""
+    """-> (label, conf) for one frame from its front-camera 2D annotation JSONs."""
     best = (0, 0.0, 0.0)                       # (label, area_rank, prob)
     for cam, central in (("CAM_FRONT_NARROW", False), ("CAM_FRONT_WIDE", True)):
         stem = stem_by_cam.get(cam)
@@ -78,7 +78,7 @@ def process_scene(args):
         man = json.load(open(mf))
         raw_dir = os.path.join(ROOT, scene)
         if not os.path.isdir(os.path.join(raw_dir, "fastlabel")):
-            return f"[skip] {scene}: no fastlabel dir"
+            return f"[skip] {scene}: no 2D annotation (fastlabel/) dir"
         F = 1 + max(fr["frame"] for fr in man["frames"])
         lab = np.zeros(F, np.uint8)
         cf = np.zeros(F, np.float32)

@@ -64,7 +64,7 @@ Cityscapes-like palette). Key recipe points:
 
 ## 2D boxes (10 classes)
 
-Taxonomy from `fastlabel_2510_instance.csv`. `object_ann` boxes scaled into the
+Taxonomy from `comlops-instance-2510.csv`. `object_ann` boxes scaled into the
 768×432 cache, area-sorted, **KMAX = 96 per camera** (a KMAX of 32 silently
 dropped 29 % of the annotations in crowded scenes — exactly the small objects:
 cones, traffic lights, distant unknowns).

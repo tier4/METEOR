@@ -8,7 +8,7 @@ overlay video). No training code, no GT, no PyTorch at inference time.
 
     python3 deploy/infer_t4dataset.py \
         --engine out/meteor_v29_fp16.engine \
-        --scene /data1/dataset/DTSET/<batch>/<scene> \
+        --scene /path/to/t4dataset/<scene> \
         --out out/t4_infer --video out/t4_infer.mp4
 
 Outputs per frame (out/<scene>/NNNN.npz):
@@ -92,7 +92,7 @@ def build_engine_from_onnx(onnx_path, compat=False):
     """--onnx convenience: build (or reuse) a cached fp16 engine next to
     the ONNX file, using the TensorRT Python API directly (no trtexec).
     compat=True builds a version/hardware-compatible engine (runs on newer
-    TensorRT and any Ampere+ GPU, e.g. build on L40S -> deploy on Orin) at
+    TensorRT and any Ampere+ GPU, e.g. build on a workstation -> deploy on Orin) at
     some throughput cost; cached separately as *_compat.engine."""
     suff = "_fp16_compat.engine" if compat else "_fp16.engine"
     eng = os.path.splitext(onnx_path)[0] + suff
@@ -303,7 +303,7 @@ def run_scene(args, root, rt=None, vw=None):
             out["ego"] = run_scene._ego_hold
 
         boxes = decode_boxes(out["hm"], out["reg"], out.get("stationary"),
-                             thresh=args.thresh)
+                             thresh=args.thresh, traj=out.get("traj"))
         # attach the winning-mode 3 s speed for each box
         traj = out["traj"]
         for b in boxes:

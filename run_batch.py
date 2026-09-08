@@ -9,7 +9,7 @@ import cv2
 from autolabel_bev import process_scene
 
 ROOT = os.environ.get("BEVLANE_ROOT",
-                      "/data1/dataset/aisin/converted_valid_delay")
+                      "data/t4dataset")
 
 
 def main():

@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Per-camera 10-class 2D bounding-box GT from object_ann.
 
-Class taxonomy comes from fastlabel_2510_instance.csv (id 0..9; colour =
+Class taxonomy comes from comlops-instance-2510.csv (id 0..9; colour =
 first row per id). Boxes are stored in cached-image coordinates (768x432)
 as bbox2d/<fi>.npz: boxes float32 [8, KMAX, 5] = (cls, cx, cy, w, h) padded,
 counts uint8 [8]; manifest frames gain a "bbox2d" key. Cheap (JSON only,
@@ -26,7 +26,7 @@ from bevlane.extract_seg2d import CAMS  # noqa: E402
 N_DET10 = 10
 KMAX = 96
 _CSV = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-                    "fastlabel_2510_instance.csv")
+                    "comlops-instance-2510.csv")
 
 
 def _load_taxonomy():

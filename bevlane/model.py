@@ -6,8 +6,17 @@ cameras, and decoded by a small BEV U-Net into semantic logits.
 """
 import math
 
+import os
 import torch
 import torch.nn as nn
+
+# 推論グラフ最適化 (2026-08-19, export 時のみ METEOR_EXPORT_FAST=1 で有効):
+#   1) seg2d の nan_to_num を省略 (学習時の fp16 発散対策。固定重みの推論では
+#      NaN は発生せず、Orin 実測で Isnan/Select 鎖が 4.0 ms を消費していた)
+#   2) 時系列ワープ有効判定の abs-sum を 96ch -> 16ch に簡約 (実測 4.0 ms)。
+#      ゼロ埋めスロット/ワープ外の検出という目的には十分。
+# どちらも採否は「出力一致 + パス/det 指標不変」のゲートで判定する。
+_EXPORT_FAST = os.environ.get("METEOR_EXPORT_FAST", "0") == "1"
 import torch.nn.functional as F
 import torchvision
 
@@ -16,8 +25,58 @@ FEAT_GRID = 200        # legacy square feature grid (0.3 m)
 BEV_SIZE = 400         # legacy square output grid (0.15 m)
 BEV_HALF = 30.0
 # rectangular long-range BEV (v3s/v8): +-80 m fwd, +-50 m lateral @ 0.2 m
-BEV_XH, BEV_YH, BEV_RES = 80.0, 50.0, 0.2
-BEV_H, BEV_W = int(2 * BEV_XH / BEV_RES), int(2 * BEV_YH / BEV_RES)  # 800x500
+# Overridable so the cost of a smaller BEV can be PRICED before a round is spent
+# on it. Latency does not care whether the rows removed are at the front or the
+# rear -- 500 rows is 500 rows -- so a symmetric shrink measures exactly what an
+# asymmetric "keep 80 m ahead, cut the rear to 20 m" grid would cost, and it
+# needs no dataset or loss changes to measure. Everything below derives from
+# these, including DET_H/DET_W.
+BEV_XF = float(os.environ.get("METEOR_BEV_XF", "80.0"))   # forward extent [m]
+BEV_XR = float(os.environ.get("METEOR_BEV_XR", "80.0"))   # rear extent [m]
+BEV_YH = float(os.environ.get("METEOR_BEV_YH", "50.0"))
+# BEV feature channel width: the ctx conv's out_channels and therefore the
+# width of the post-lift BEV feature, the temporal history slots and every
+# BEV-side head input. Overridable so the R6 "ctx 96 -> 64" latency axis can
+# be built without touching code (METEOR_BEV_CH=64).
+BEV_CH = int(os.environ.get("METEOR_BEV_CH", "96"))
+BEV_RES = 0.2
+# Row 0 is the far FRONT, so BEV_XH means "where the grid starts" everywhere it
+# is used and stays the forward extent when the rear is truncated.
+BEV_XH = BEV_XF
+BEV_H = int((BEV_XF + BEV_XR) / BEV_RES)
+BEV_W = int(2 * BEV_YH / BEV_RES)                          # 800x500 by default
+
+
+def crop_rows(t, h):
+    """Crop a BEV-space raster's rows to h. Row 0 is the far front everywhere.
+
+    Optional INPUT rasters (lidar_bev, sdmap) arrive from the label factory on
+    the full-length grid regardless of what the network was built for, so a
+    rear-truncated network has to take the front h rows of them. Cropping is
+    correct rather than resampling because row 0 and the resolution are shared:
+    the rows that remain are the same ground cells they always were.
+    """
+    if t is None or not torch.is_tensor(t) or t.shape[-2] <= h:
+        return t
+    return t[..., :h, :]
+
+
+def bev_rows(x_hi, x_lo, h=None):
+    """Row slice covering forward distance x_hi..x_lo, clamped to the grid.
+
+    Several heads crop a fixed metric window out of the BEV feature, and they
+    used to do it with absolute row numbers baked for the 800-row grid
+    (occ 200:600 = +-40 m, risk 200:600, lane-graph 100:450 = +60..-10 m).
+    Those numbers are silently wrong the moment the grid changes length -- on a
+    rear-truncated 500-row grid, 200:600 runs off the end and the head would
+    quietly receive a shorter, differently-centred window. Derive them from the
+    geometry instead.
+    """
+    h = BEV_H if h is None else h
+    res = (BEV_XF + BEV_XR) / h
+    r0 = max(0, int(round((BEV_XF - x_hi) / res)))
+    r1 = min(h, int(round((BEV_XF - x_lo) / res)))
+    return r0, max(r1, r0 + 1)
 
 
 def make_bev_points_rect(device):
@@ -158,6 +217,9 @@ class LSSDepthNet(nn.Module):
     """
     D = 48
     D_MIN, D_STEP = 2.0, 1.0     # bins: 2 .. 50 m
+
+    def _d2b(self, x):
+        return (x - self.D_MIN) / self.D_STEP
     FH, FW = 36, 64              # stride-8 feature grid for 512x288
 
     def __init__(self, n_cams=6, feat_ch=128, ctx_ch=80):
@@ -238,7 +300,7 @@ class LSSDepthNet(nn.Module):
 
     def depth_loss(self, dlog, depth_gt):
         """CE over depth bins where GT valid. depth_gt [B,N,FH,FW] metres."""
-        tgt = ((depth_gt - self.D_MIN) / self.D_STEP).round().long()
+        tgt = self._d2b(depth_gt).round().long()
         valid = (depth_gt > 0.5) & (tgt >= 0) & (tgt < self.D)
         tgt = tgt.clamp(0, self.D - 1)
         tgt[~valid] = -1
@@ -297,7 +359,30 @@ class DepthGatedIPMNet(nn.Module):
     D = 64
     D_MIN, D_STEP = 1.0, 1.25      # bins 1.0 .. 79.75 m; last bin = sky/far
 
-    def __init__(self, n_cams=6, feat_ch=160, ctx_ch=96):
+    # D5 (2026-08-29): 対数ビン対応。enable_depth_logbins() が DEPTH_CENTERS
+    # を張ると、以下のヘルパ経由の全経路 (損失・リフト可視率・期待深度・
+    # LiDAR ブレンド) が対数間隔で動く。未設定なら従来式とビット同値。
+    def _d2b(self, x):
+        """metric 深度 -> 連続 bin 座標。"""
+        c = getattr(self, "DEPTH_CENTERS", None)
+        if c is None:
+            return (x - self.D_MIN) / self.D_STEP
+        c = c.to(device=x.device, dtype=x.dtype)
+        i = torch.bucketize(x.detach(), c).clamp(1, self.D - 1)
+        lo = c[i - 1]
+        hi = c[i]
+        return (i - 1).to(x.dtype) + ((x - lo) / (hi - lo)).clamp(0, 1)
+
+    def _dbins(self, device=None, dtype=None):
+        c = getattr(self, "DEPTH_CENTERS", None)
+        if c is None:
+            c = self.D_MIN + torch.arange(self.D).float() * self.D_STEP
+        if device is not None:
+            c = c.to(device=device, dtype=dtype if dtype is not None
+                     else c.dtype)
+        return c
+
+    def __init__(self, n_cams=6, feat_ch=160, ctx_ch=BEV_CH):
         super().__init__()
         rn = torchvision.models.resnet34(weights="IMAGENET1K_V1")
         self.stem = nn.Sequential(rn.conv1, rn.bn1, rn.relu, rn.maxpool)
@@ -361,7 +446,7 @@ class DepthGatedIPMNet(nn.Module):
         ctx_s = F.grid_sample(ctx, grid, align_corners=False).squeeze(-1)
         prob_s = F.grid_sample(dprob, grid, align_corners=False).squeeze(-1)
         # soft visibility: linear interp of P(depth == cell ray distance)
-        b = ((dist - self.D_MIN) / self.D_STEP).clamp(0, self.D - 1 - 1e-4)
+        b = self._d2b(dist).clamp(0, self.D - 1 - 1e-4)
         b0 = b.floor().long()
         fr = (b - b0.float()).unsqueeze(1)
         w0 = torch.gather(prob_s, 1, b0.unsqueeze(1))
@@ -375,7 +460,7 @@ class DepthGatedIPMNet(nn.Module):
         return self.dec(bev), dlog.view(B, N, self.D, fh, fw)
 
     def depth_loss(self, dlog, depth_gt):
-        tgt = ((depth_gt - self.D_MIN) / self.D_STEP).round().long()
+        tgt = self._d2b(depth_gt).round().long()
         valid = (depth_gt > 0.1) & (tgt >= 0)
         tgt = tgt.clamp(0, self.D - 1)
         tgt[~valid] = -1
@@ -397,7 +482,27 @@ class DepthSegIPMNet(nn.Module):
     D = 64
     D_MIN, D_STEP = 1.0, 1.25
 
-    def __init__(self, n_cams=8, feat_ch=160, ctx_ch=96, n_seg=N_SEG):
+    # D5: 対数ビン対応ヘルパ (DepthGatedIPMNet と同一実装)
+    def _d2b(self, x):
+        c = getattr(self, "DEPTH_CENTERS", None)
+        if c is None:
+            return (x - self.D_MIN) / self.D_STEP
+        c = c.to(device=x.device, dtype=x.dtype)
+        i = torch.bucketize(x.detach(), c).clamp(1, self.D - 1)
+        lo = c[i - 1]
+        hi = c[i]
+        return (i - 1).to(x.dtype) + ((x - lo) / (hi - lo)).clamp(0, 1)
+
+    def _dbins(self, device=None, dtype=None):
+        c = getattr(self, "DEPTH_CENTERS", None)
+        if c is None:
+            c = self.D_MIN + torch.arange(self.D).float() * self.D_STEP
+        if device is not None:
+            c = c.to(device=device, dtype=dtype if dtype is not None
+                     else c.dtype)
+        return c
+
+    def __init__(self, n_cams=8, feat_ch=160, ctx_ch=BEV_CH, n_seg=N_SEG):
         super().__init__()
         rn = torchvision.models.resnet34(weights="IMAGENET1K_V1")
         self.stem = nn.Sequential(rn.conv1, rn.bn1, rn.relu, rn.maxpool)
@@ -447,6 +552,17 @@ class DepthSegIPMNet(nn.Module):
             x2 = self.layer2(x1)
             x3 = self.layer3(x2)
             x4 = self.layer4(x3)
+        # FUSE_STRIDE=8 (R7 解像度軸): x2 入力を stride-8 で融合する。特徴
+        # グリッドは x1@stride4 と同じ 108x192 になり、lat2/3/4 の入力
+        # チャンネルも既存のまま = 成熟した重みを丸ごと引き継げる。
+        # クラス属性で切り替えるのは、image_feats を丸ごと上書きすると
+        # 上位クラスが積んだ副作用 (_last_f / tl_stem 残差) が消えるため。
+        if getattr(self, "FUSE_STRIDE", 4) == 8:
+            sz = x2.shape[-2:]
+            up = lambda t: F.interpolate(t, size=sz, mode="bilinear",
+                                         align_corners=False)
+            f = self.lat2(x2) + up(self.lat3(x3)) + up(self.lat4(x4))
+            return self.fuse(f)
         sz = x1.shape[-2:]
         up = lambda t: F.interpolate(t, size=sz, mode="bilinear", align_corners=False)
         f = self.lat1(x1) + up(self.lat2(x2)) + up(self.lat3(x3)) + up(self.lat4(x4))
@@ -455,7 +571,24 @@ class DepthSegIPMNet(nn.Module):
     def forward(self, imgs, K, T_cam_ego):
         B, N, _, H, W = imgs.shape
         f = self.image_feats(imgs)                     # [BN,C,H/4,W/4]
-        seg2d = self.seg_head(f)                        # [BN,n_seg,H/4,W/4]
+        # Clamped. The 2D seg logits are the one thing that goes non-finite in
+        # these rounds: r59 discarded 0 % of steps up to 9k, 5 % to 12k and
+        # 29 % by 13.5k, every one of them reported as out[2] alone with the BEV
+        # outputs clean, and r53/r56/r57 showed the same climb. In fp16 a logit
+        # only has to pass 65504 to become inf, and CE saturates long before
+        # +-30, so this changes nothing about what the loss sees while removing
+        # the failure -- and since clamp has zero gradient outside the range it
+        # also stops the head being pushed further out once it gets there.
+        # clamp だけでは NaN が素通しする (clamp(nan)=nan)。fp16 で head 内部が
+        # 一度 inf になると BN の (x-mean)/sqrt(var) で NaN が生まれ、
+        # 出力段の clamp では消せない。2026-08-17: nan_to_num を前置し、
+        # out[2] 由来の SKIP (r59 で 29%, r72 で 148 回, r73 で 16 回) を断つ。
+        if _EXPORT_FAST:
+            seg2d = self.seg_head(f).clamp(-30.0, 30.0)
+        else:
+            seg2d = torch.nan_to_num(self.seg_head(f), nan=0.0,
+                                     posinf=30.0, neginf=-30.0
+                                     ).clamp(-30.0, 30.0)                        # [BN,n_seg,H/4,W/4]
         dlog = self.depth_head(self.depth_up(f))       # [BN,D,H/2,W/2]
         dprob = dlog.softmax(1)
         ctx = self.ctx(f)
@@ -479,7 +612,7 @@ class DepthSegIPMNet(nn.Module):
         grid = torch.stack([gu, gv], -1).unsqueeze(2)
         ctx_s = F.grid_sample(ctx, grid, align_corners=False).squeeze(-1)
         prob_s = F.grid_sample(dprob, grid, align_corners=False).squeeze(-1)
-        b = ((dist - self.D_MIN) / self.D_STEP).clamp(0, self.D - 1 - 1e-4)
+        b = self._d2b(dist).clamp(0, self.D - 1 - 1e-4)
         b0 = b.floor().long()
         fr = (b - b0.float()).unsqueeze(1)
         w0 = torch.gather(prob_s, 1, b0.unsqueeze(1))
@@ -495,7 +628,7 @@ class DepthSegIPMNet(nn.Module):
                 seg2d.view(B, N, seg2d.shape[1], sh, sw))
 
     def depth_loss(self, dlog, depth_gt):
-        tgt = ((depth_gt - self.D_MIN) / self.D_STEP).round().long()
+        tgt = self._d2b(depth_gt).round().long()
         valid = (depth_gt > 0.1) & (tgt >= 0)
         tgt = tgt.clamp(0, self.D - 1)
         tgt[~valid] = -1
@@ -565,10 +698,20 @@ class DepthSegIPMNetV14(DepthSegIPMNetS4):
             ConvBlock(256, 192), ConvBlock(192, 128),
             nn.Conv2d(128, self.D, 1))
 
-    def depth_loss(self, dlog, depth_gt):
+    def depth_loss(self, dlog, depth_gt, ent_w=0.0, far_w=0.0, band_bal=0.0):
+        """深度 CE + 鋭化項 (2026-08-21 追加の ent_w / far_w)。
+
+        実測: 30-60 m 帯で深度分布の最大確率が 0.07-0.085、エントロピー
+        3.44-3.62 (64 ビン一様は 4.16) = 約 ±17 m に滲んでいる。リフトは
+        この分布に従って BEV セルへ特徴を配るので、遠方物体の証拠が
+        薄く塗り広げられ、ヒートマップのピークが立たない (cam-only の
+        veh recall 20-40m が 0.50 で頭打ちになる直接の原因)。
+        ent_w: 分布のエントロピーを罰して鋭くする。
+        far_w: 遠方画素の CE 重みを上げる (LiDAR 点は近傍に偏るため)。
+        """
         logits = dlog.flatten(0, 1)                       # [BN,D,h,w]
         gt = depth_gt.flatten(0, 1)                       # [BN,h,w]
-        tgt = ((gt - self.D_MIN) / self.D_STEP).round().long()
+        tgt = self._d2b(gt).round().long()
         valid = (gt > 0.1) & (tgt >= 0) & (tgt < self.D)
         tgt = tgt.clamp(0, self.D - 1)
         tgt[~valid] = -1
@@ -585,20 +728,59 @@ class DepthSegIPMNetV14(DepthSegIPMNetS4):
         g[:, 1:, :] = torch.maximum(g[:, 1:, :], gy)
         g[:, :-1, :] = torch.maximum(g[:, :-1, :], gy)
         wpx = 1.0 + 2.0 * (g / 3.0).clamp(max=1.0)
+        # カメラ別の重み (2026-08-17 登録): METEOR_DEPTH_CAM_W="6:3,7:3" の形式。
+        # 深度 CE は全カメラ・全画素の等価平均なので、8 台中 2 台の望遠 (特に
+        # BACK_NARROW) への圧力が路面画素に埋もれる。教師は箱と整合している
+        # (probe_depthgt_align: 整合率 71%) のにモデル側バイアスが +2.3->+2.66 m
+        # と学習で縮まなかったのはこのため。既定は未設定 = 従来と完全同一。
+        _spec = os.environ.get("METEOR_DEPTH_CAM_W", "")
+        if _spec:
+            _N = depth_gt.shape[1]
+            _wc = torch.ones(_N, device=logits.device, dtype=wpx.dtype)
+            for _part in _spec.split(","):
+                _i, _w = _part.split(":")
+                if 0 <= int(_i) < _N:
+                    _wc[int(_i)] = float(_w)
+            _B = depth_gt.shape[0]
+            wpx = wpx * _wc.repeat(_B).view(-1, 1, 1)
+        # 鋭化を狙う場合は label smoothing を外す (平滑化と目的が逆)
+        _ls = 0.0 if ent_w > 0 else 0.05
         ce_px = F.cross_entropy(logits, tgt, ignore_index=-1,
-                                label_smoothing=0.05, reduction="none")
+                                label_smoothing=_ls, reduction="none")
+        if far_w > 0:
+            wpx = wpx * (1.0 + far_w * (gt / 60.0).clamp(0.0, 1.0))
+        if band_bal > 0:
+            # 距離帯の逆頻度重み (2026-08-22)。実測で深度 GT の有効画素は
+            # 0-10m が 58.9%、40-60m は合計 4.6% しかない (13 倍の不均衡)。
+            # far_w は最大でも 2 倍にしかならず釣り合わないので、10m 帯ごとに
+            # 「その帯の画素数の逆数」で正規化して各帯の寄与を揃える。
+            # バッチ自身のヒストグラムから作るので外部テーブルは不要。
+            _bi = (gt / 10.0).clamp(0, 7).long()
+            _cnt = torch.bincount(_bi[valid].flatten(), minlength=8).float()
+            _inv = valid.sum().float() / (8.0 * _cnt.clamp(min=1.0))
+            _inv = _inv.clamp(0.2, 10.0)
+            _inv = 1.0 + band_bal * (_inv - 1.0)      # band_bal=1 で完全均等
+            # 平均重みを 1 に正規化する。これをしないと「配分を変える」と
+            # 「深度損失の係数を上げる」が同時に起きて A/B の変数が 2 つに
+            # なる (band_bal=1 で損失が 2.3 倍になっていた)。
+            _mean = (_cnt * _inv).sum() / valid.sum().clamp(min=1).float()
+            _inv = _inv / _mean.clamp(min=1e-6)
+            wpx = wpx * _inv[_bi]
         ce = (ce_px * wpx)[valid].mean() if valid.any() \
             else logits.sum() * 0.0
         # L1 on expected depth (metres) -> metric accuracy, sharper distributions
         prob = logits.softmax(1)
-        bins = (torch.arange(self.D, device=logits.device, dtype=prob.dtype)
-                * self.D_STEP + self.D_MIN).view(1, -1, 1, 1)
+        bins = self._dbins(logits.device, prob.dtype).view(1, -1, 1, 1)
         exp_d = (prob * bins).sum(1)
         if valid.any():
             l1 = (exp_d - gt).abs()[valid].mean()
         else:
             l1 = exp_d.sum() * 0
-        return ce + 0.1 * l1
+        out = ce + 0.1 * l1
+        if ent_w > 0 and valid.any():
+            _e = -(prob.clamp_min(1e-6) * prob.clamp_min(1e-6).log()).sum(1)
+            out = out + ent_w * _e[valid].mean()
+        return out
 
 
 N_BOX = 3    # 0 bg, 1 vehicle, 2 VRU (camera-visible 3D boxes on BEV)
@@ -621,7 +803,24 @@ class DepthSegIPMNetV15(DepthSegIPMNetV14):
     def forward(self, imgs, K, T_cam_ego):
         B, N, _, H, W = imgs.shape
         f = self.image_feats(imgs)
-        seg2d = self.seg_head(f)
+        # Clamped. The 2D seg logits are the one thing that goes non-finite in
+        # these rounds: r59 discarded 0 % of steps up to 9k, 5 % to 12k and
+        # 29 % by 13.5k, every one of them reported as out[2] alone with the BEV
+        # outputs clean, and r53/r56/r57 showed the same climb. In fp16 a logit
+        # only has to pass 65504 to become inf, and CE saturates long before
+        # +-30, so this changes nothing about what the loss sees while removing
+        # the failure -- and since clamp has zero gradient outside the range it
+        # also stops the head being pushed further out once it gets there.
+        # clamp だけでは NaN が素通しする (clamp(nan)=nan)。fp16 で head 内部が
+        # 一度 inf になると BN の (x-mean)/sqrt(var) で NaN が生まれ、
+        # 出力段の clamp では消せない。2026-08-17: nan_to_num を前置し、
+        # out[2] 由来の SKIP (r59 で 29%, r72 で 148 回, r73 で 16 回) を断つ。
+        if _EXPORT_FAST:
+            seg2d = self.seg_head(f).clamp(-30.0, 30.0)
+        else:
+            seg2d = torch.nan_to_num(self.seg_head(f), nan=0.0,
+                                     posinf=30.0, neginf=-30.0
+                                     ).clamp(-30.0, 30.0)
         dlog = self.depth_head(self.depth_up(f))
         dprob = dlog.softmax(1)
         ctx = self.ctx(f)
@@ -644,7 +843,7 @@ class DepthSegIPMNetV15(DepthSegIPMNetV14):
         grid = torch.stack([gu, gv], -1).unsqueeze(2)
         ctx_s = F.grid_sample(ctx, grid, align_corners=False).squeeze(-1)
         prob_s = F.grid_sample(dprob, grid, align_corners=False).squeeze(-1)
-        b = ((dist - self.D_MIN) / self.D_STEP).clamp(0, self.D - 1 - 1e-4)
+        b = self._d2b(dist).clamp(0, self.D - 1 - 1e-4)
         b0 = b.floor().long()
         fr = (b - b0.float()).unsqueeze(1)
         w0 = torch.gather(prob_s, 1, b0.unsqueeze(1))
@@ -692,14 +891,178 @@ class DepthSegIPMNetV16(DepthSegIPMNetV14):
     def __init__(self, *a, **k):
         super().__init__(*a, **k)
         self.det_stem = nn.Sequential(
-            nn.Conv2d(96, 128, 3, stride=DET_S, padding=1, bias=False),
+            nn.Conv2d(BEV_CH, 128, 3, stride=DET_S, padding=1, bias=False),
             nn.BatchNorm2d(128), nn.ReLU(inplace=True),
             ConvBlock(128, 128))
         self.hm_head = nn.Conv2d(128, 2, 1)
         self.reg_head = nn.Conv2d(128, 6, 1)
         nn.init.constant_(self.hm_head.bias, -2.19)   # focal init (p~0.1)
 
+    def bake_frustum(self, K, T_cam_ego, H, W):
+        """Freeze the per-camera visible-cell lists for ONE rig calibration.
+
+        `nonzero` is data-dependent and cannot be exported to ONNX, so the
+        deployment graph needs the index lists as CONSTANTS. K / T_cam_ego are
+        fixed for a vehicle, so baking them is legitimate -- but the resulting
+        graph is then valid for THAT rig only, which is why it is opt-in and
+        recorded on the module.
+        """
+        B_N = K.reshape(-1, 3, 3).shape[0]
+        pts = self.bev_pts
+        G2 = pts.shape[0]
+        pc = torch.matmul(T_cam_ego.reshape(B_N, 4, 4),
+                          pts.t().unsqueeze(0).expand(B_N, 4, G2))
+        x, y, z = pc[:, 0], pc[:, 1], pc[:, 2]
+        Kf = K.reshape(B_N, 3, 3)
+        zc = z.clamp(min=0.5)
+        u = Kf[:, 0, 0].unsqueeze(-1) * x / zc + Kf[:, 0, 2].unsqueeze(-1)
+        v = Kf[:, 1, 1].unsqueeze(-1) * y / zc + Kf[:, 1, 2].unsqueeze(-1)
+        dist = torch.sqrt(x * x + y * y + z * z)
+        valid = ((z > 0.5) & (u >= 0) & (u < W) & (v >= 0) & (v < H)
+                 & (dist < 90.0))
+        self._fr_static = []
+        for i in range(B_N):
+            ii = valid[i].nonzero(as_tuple=True)[0].contiguous()
+            self.register_buffer(f"fr_idx_{i}", ii, persistent=False)
+            self._fr_static.append(ii)
+        self.frustum_lift = True
+        n = sum(int(t.numel()) for t in self._fr_static)
+        print(f"[frustum] baked {B_N} cameras, {n} of {B_N * G2} "
+              f"(camera, cell) pairs kept = {100 * n / (B_N * G2):.1f}%",
+              flush=True)
+        return self._fr_static
+
+    def bake_gather(self):
+        """Invert the baked frustum lists into a per-cell gather table.
+
+        Measured on the AGX Orin (32 GB devkit, TensorRT 10.16): the slowest
+        layers of both engines are the lift's Scatter nodes -- index_add_ turns
+        into ScatterND with atomic collisions wherever two cameras write one
+        cell, and on a 204 GB/s part that is the single largest block (the
+        Myelin lift cluster is ~53 % of base, ~51 % of light). The same sum
+        can be read instead of written: concatenate every camera's weighted
+        pair outputs into one flat buffer and let EACH CELL gather its own
+        contributors from a static table. Same maths, addition order aside;
+        atomics gone; reads coalesced.
+
+        Requires bake_frustum first (the table inverts those lists). Like the
+        frustum, the table is valid for ONE rig only.
+        """
+        st = getattr(self, "_fr_static", None)
+        assert st is not None, "bake_frustum を先に呼ぶこと"
+        G2 = self.bev_pts.shape[0]
+        owners = [[] for _ in range(G2)]
+        off = 0
+        for ii in st:                       # pair k of camera i -> flat off+k
+            for k, cell in enumerate(ii.tolist()):
+                owners[cell].append(off + k)
+            off += int(ii.numel())
+        kmax = max((len(o) for o in owners), default=1)
+        tab = torch.full((G2, kmax), off, dtype=torch.long)   # off = pad slot
+        for c, o in enumerate(owners):
+            for j, p in enumerate(o):
+                tab[c, j] = p
+        # register_buffer after .cuda() leaves the buffer on CPU; place it
+        # where the frustum lists already live
+        tab = tab.to(st[0].device if len(st) else "cpu")
+        self.register_buffer("gather_tab", tab, persistent=False)
+        self._gather_pairs = off
+        self.gather_lift = True
+        n = sum(len(o) for o in owners)
+        print(f"[gather] {G2} cells, kmax={kmax}, pairs={off} "
+              f"(mean {n / G2:.2f}/cell)", flush=True)
+
+    def _project_bev_frustum_gather(self, dprob, ctx, K, T_cam_ego,
+                                    B, N, H, W):
+        """Gather-form lift: identical numbers to the scatter form up to
+        addition order (verified against it before deployment)."""
+        Cc = ctx.shape[1]
+        pts = self.bev_pts
+        G2 = pts.shape[0]
+        pc = torch.matmul(T_cam_ego.reshape(B * N, 4, 4),
+                          pts.t().unsqueeze(0).expand(B * N, 4, G2))
+        x, y, z = pc[:, 0], pc[:, 1], pc[:, 2]
+        Kf = K.reshape(B * N, 3, 3)
+        zc = z.clamp(min=0.5)
+        u = Kf[:, 0, 0].unsqueeze(-1) * x / zc + Kf[:, 0, 2].unsqueeze(-1)
+        v = Kf[:, 1, 1].unsqueeze(-1) * y / zc + Kf[:, 1, 2].unsqueeze(-1)
+        dist = torch.sqrt(x * x + y * y + z * z)
+        gu = (u / (W - 1) * 2 - 1).clamp(-2, 2)
+        gv = (v / (H - 1) * 2 - 1).clamp(-2, 2)
+        grid = torch.stack([gu, gv], -1)
+        vals, wgts = [], []
+        for i in range(B * N):
+            ii = self._fr_static[i]
+            if ii.numel() == 0:
+                continue
+            g = grid[i].index_select(0, ii).view(1, -1, 1, 2).to(ctx.dtype)
+            cs = F.grid_sample(ctx[i:i + 1], g,
+                               align_corners=False).squeeze(-1)
+            ps = F.grid_sample(dprob[i:i + 1], g,
+                               align_corners=False).squeeze(-1)
+            d_ = dist[i].index_select(0, ii)
+            b_ = self._d2b(d_).clamp(0, self.D - 1 - 1e-4)
+            b0 = b_.floor().long()
+            fr = (b_ - b0.float()).view(1, 1, -1).to(ps.dtype)
+            w = (torch.gather(ps, 1, b0.view(1, 1, -1)) * (1 - fr)
+                 + torch.gather(ps, 1, (b0 + 1).clamp(max=self.D - 1)
+                                .view(1, 1, -1)) * fr) + 0.05
+            vals.append((cs * w)[0])
+            wgts.append(w[0])
+        val = torch.cat(vals, 1)                       # [Cc, P]
+        wgt = torch.cat(wgts, 1)                       # [1, P]
+        # pad slot P: zero contribution
+        val = torch.cat([val, val.new_zeros(Cc, 1)], 1)
+        wgt = torch.cat([wgt, wgt.new_zeros(1, 1)], 1)
+        tab = self.gather_tab.reshape(-1)              # [G2*kmax]
+        num = val.index_select(1, tab).view(Cc, G2, -1).sum(-1)
+        den = wgt.index_select(1, tab).view(1, G2, -1).sum(-1)
+        return (num / den.clamp(min=1e-4)).view(B, Cc, BEV_H, BEV_W)
+
+    def _frustum_idx(self, valid, key):
+        st = getattr(self, "_fr_static", None)
+        if st is not None:
+            return st
+        """Per-camera list of BEV cells that camera can actually see.
+
+        Depends only on K / T_cam_ego, which are constant for a rig, so the
+        lists are cached and computed once per calibration.
+        """
+        cache = getattr(self, "_fr_cache", None)
+        if cache is None:
+            cache = self._fr_cache = {}
+        hit = cache.get(key)
+        if hit is not None:
+            return hit
+        idx = [valid[i].nonzero(as_tuple=True)[0].contiguous()
+               for i in range(valid.shape[0])]
+        if len(cache) > 8:
+            cache.clear()
+        cache[key] = idx
+        return idx
+
     def project_bev(self, dprob, ctx, K, T_cam_ego, B, N, H, W):
+        """Depth-gated lift of image features into the BEV grid.
+
+        The dense form samples EVERY camera at EVERY BEV cell and throws the
+        misses away with a mask. Measured on a real rig: only 22.6 % of the
+        (camera, cell) pairs are inside an image (721,761 of 3,200,000), so
+        77 % of the sampling and the reduction is discarded work. With
+        `frustum_lift` the cells are gathered per camera first, which is
+        mathematically the SAME computation -- verified fp32-exact against the
+        dense path, fp16 within one ULP (max 9.8e-4) -- and needs no retraining.
+        11.6 -> 3.4 ms on the workstation GPU.
+
+        Kept off during training: the augmentation changes T_cam_ego per sample
+        so the index cache would thrash, and the dense path is already the
+        gradient-tested one.
+        """
+        if getattr(self, "frustum_lift", False) and not self.training:
+            if getattr(self, "gather_lift", False):
+                return self._project_bev_frustum_gather(
+                    dprob, ctx, K, T_cam_ego, B, N, H, W)
+            return self._project_bev_frustum(dprob, ctx, K, T_cam_ego,
+                                             B, N, H, W)
         Cc = ctx.shape[1]
         pts = self.bev_pts
         G2 = pts.shape[0]
@@ -719,7 +1082,7 @@ class DepthSegIPMNetV16(DepthSegIPMNetV14):
         grid = torch.stack([gu, gv], -1).unsqueeze(2)
         ctx_s = F.grid_sample(ctx, grid, align_corners=False).squeeze(-1)
         prob_s = F.grid_sample(dprob, grid, align_corners=False).squeeze(-1)
-        b = ((dist - self.D_MIN) / self.D_STEP).clamp(0, self.D - 1 - 1e-4)
+        b = self._d2b(dist).clamp(0, self.D - 1 - 1e-4)
         b0 = b.floor().long()
         fr = (b - b0.float()).unsqueeze(1)
         w0 = torch.gather(prob_s, 1, b0.unsqueeze(1))
@@ -729,6 +1092,48 @@ class DepthSegIPMNetV16(DepthSegIPMNetV14):
         num = (ctx_s.view(B, N, Cc, G2) * wgt.view(B, N, 1, G2)).sum(1)
         den = wgt.view(B, N, 1, G2).sum(1).clamp(min=1e-4)
         return (num / den).view(B, Cc, BEV_H, BEV_W)
+
+    def _project_bev_frustum(self, dprob, ctx, K, T_cam_ego, B, N, H, W):
+        Cc = ctx.shape[1]
+        pts = self.bev_pts
+        G2 = pts.shape[0]
+        pc = torch.matmul(T_cam_ego.reshape(B * N, 4, 4),
+                          pts.t().unsqueeze(0).expand(B * N, 4, G2))
+        x, y, z = pc[:, 0], pc[:, 1], pc[:, 2]
+        Kf = K.reshape(B * N, 3, 3)
+        zc = z.clamp(min=0.5)
+        u = Kf[:, 0, 0].unsqueeze(-1) * x / zc + Kf[:, 0, 2].unsqueeze(-1)
+        v = Kf[:, 1, 1].unsqueeze(-1) * y / zc + Kf[:, 1, 2].unsqueeze(-1)
+        dist = torch.sqrt(x * x + y * y + z * z)
+        valid = ((z > 0.5) & (u >= 0) & (u < W) & (v >= 0) & (v < H)
+                 & (dist < 90.0))
+        gu = (u / (W - 1) * 2 - 1).clamp(-2, 2)
+        gv = (v / (H - 1) * 2 - 1).clamp(-2, 2)
+        grid = torch.stack([gu, gv], -1)
+        key = (int(K.data_ptr()), int(T_cam_ego.data_ptr()), B * N, H, W,
+               float(K.reshape(-1)[0]), float(T_cam_ego.reshape(-1)[3]))
+        idx = self._frustum_idx(valid, key)
+        num = torch.zeros(B, Cc, G2, device=ctx.device, dtype=ctx.dtype)
+        den = torch.zeros(B, 1, G2, device=ctx.device, dtype=ctx.dtype)
+        for i in range(B * N):
+            ii = idx[i]
+            if ii.numel() == 0:
+                continue
+            g = grid[i].index_select(0, ii).view(1, -1, 1, 2).to(ctx.dtype)
+            cs = F.grid_sample(ctx[i:i + 1], g,
+                               align_corners=False).squeeze(-1)
+            ps = F.grid_sample(dprob[i:i + 1], g,
+                               align_corners=False).squeeze(-1)
+            d_ = dist[i].index_select(0, ii)
+            b_ = self._d2b(d_).clamp(0, self.D - 1 - 1e-4)
+            b0 = b_.floor().long()
+            fr = (b_ - b0.float()).view(1, 1, -1).to(ps.dtype)
+            w = (torch.gather(ps, 1, b0.view(1, 1, -1)) * (1 - fr)
+                 + torch.gather(ps, 1, (b0 + 1).clamp(max=self.D - 1)
+                                .view(1, 1, -1)) * fr) + 0.05
+            num[i // N].index_add_(1, ii, (cs * w)[0].to(num.dtype))
+            den[i // N].index_add_(1, ii, w[0].to(den.dtype))
+        return (num / den.clamp(min=1e-4)).view(B, Cc, BEV_H, BEV_W)
 
     def compute_bev(self, imgs, K, T_cam_ego):
         """Images -> raw (pre-fusion) BEV feature; used for the temporal
@@ -746,6 +1151,241 @@ class DepthSegIPMNetV16(DepthSegIPMNetV14):
     def bev_extra(self, bev):
         return bev                      # v32 adds the LiDAR pillar residual
 
+    def enable_paint_seg(self, classes):
+        """PointPainting (2026-08-17): seg2d の確率をリフト前の ctx に注入する。
+
+        歩行者は 30 m で幅 1.4 特徴画素だが高さは 4 画素あり、2D セグは
+        その縦の柱を使って画素単位で塗れる。BEV への持ち上げは足跡 1 セルに
+        潰すため縦の証拠が消える -- 塗った確率をリフトで運べば BEV セルに
+        「ここは歩行者/車」の明示的な証拠が届く。
+
+        連結ではなく 1x1 ゼロ初期化射影の加算にする理由:
+          - ctx のチャネル数 (96) は hist_bev や時間融合など下流全体に波及
+            するので、幅を変えると機能保存にならず配布(リフトプラグインの
+            Cc=96)も壊れる。加算なら開始時は現行と完全同一。
+          - painter (seg_head) は detach し、自身の 2D セグ損失だけで学習させる。
+        """
+        self._paint_cls = [int(c) for c in classes]
+        _convs = [mm for mm in self.ctx.modules()
+                  if isinstance(mm, nn.Conv2d)]
+        cc = _convs[-1].out_channels
+        self.paint_proj = nn.Conv2d(len(self._paint_cls), cc, 1)
+        nn.init.zeros_(self.paint_proj.weight)
+        nn.init.zeros_(self.paint_proj.bias)
+        # モデルが既に GPU 上にあるとき、新設の conv が CPU に残ると DDP が
+        # 「cpu と cuda が混在」で落ちる (v91 で実際に発生)
+        self.paint_proj = self.paint_proj.to(next(self.parameters()).device)
+
+        def _stash(_m, _i, _o):
+            self._paint_buf = _o
+
+        def _mix(_m, _i, _o):
+            pb = getattr(self, "_paint_buf", None)
+            if pb is None:
+                return _o
+            pb = pb.float() if _EXPORT_FAST else torch.nan_to_num(
+                pb.float(), nan=0.0, posinf=30.0,
+                                  neginf=-30.0)
+            pb = pb.softmax(1)[:, self._paint_cls].detach().to(_o.dtype)
+            if pb.shape[-2:] != _o.shape[-2:]:
+                pb = F.interpolate(pb, size=_o.shape[-2:], mode="bilinear",
+                                   align_corners=False)
+            if pb.shape[0] != _o.shape[0]:
+                if os.environ.get("METEOR_PAINT_DEBUG"):
+                    print(f"[paint] バッチ不一致 {pb.shape} 対 {_o.shape}")
+                return _o
+            _d = self.paint_proj(pb)
+            if os.environ.get("METEOR_PAINT_DEBUG"):
+                print(f"[paint] pb={tuple(pb.shape)} 加算ノルム={float(_d.abs().mean()):.5f}")
+            return _o + _d
+
+        self._paint_buf = None
+        self.seg_head.register_forward_hook(_stash)
+        self.ctx.register_forward_hook(_mix)
+
+    def convert_ego_pool(self, hw, mean=None, var=None, verbose=True):
+        """ego の大域平均プーリングを INT8 に耐える形へ置き換える (2026-08-24)。
+
+        **なぜ必要か** (Orin 実測): INT8 は値を 127 段階でしか表せず、目盛りの
+        間隔はそのテンソルの最大値で決まる。プーリング**手前**の特徴マップは
+        0-19.3 に散らばるので目盛りは 0.155。ところが 400 セルを平均すると
+        出力は 0-0.29 の狭い範囲に集まる (66 分の 1)。TensorRT は平均
+        プーリングの出力に**入力と同じ目盛りを流用する**ため、出力は 127 段階
+        のうち約 2 段階しか使えない。フレーム間の変化 0.0102 は 0.065 段階 =
+        四捨五入で完全に消える。だから真っ黒でも乱数でも ego 出力がビット一致
+        する「凍結」が起きていた。occ/traj/seg/det が無事なのは、空間ヘッドは
+        セルの値を直接読むから (ego だけが大域平均を取る唯一のヘッド)。
+
+        **対策**: 平均を「深さ方向畳み込み + BatchNorm」に置き換える。
+        畳み込みは INT32 で累算してから**自前の較正済み目盛り**で測り直すので
+        流用が起きない。さらに BN がチャネル毎に平均と分散を揃えるため、
+        一部の高水準チャネルが目盛りを独占しなくなる。
+
+        実測 (変動 / 1 段階): 現行 0.065 -> conv 化 4.41 -> conv+BN 23.51。
+
+        **機能保存**: 畳み込みの重みを 1/(h*w) で初期化し、BN の統計を実測値
+        (mean/var) にしたうえで、ego_mlp の第 1 層を W'=W*sigma, b'=b+W@mu と
+        補正するので、**変換直後の出力は変換前と一致する**。
+        """
+        seq = self.ego_stem
+        idx = [i for i, m in enumerate(seq)
+               if isinstance(m, nn.AdaptiveAvgPool2d)]
+        if not idx:
+            if verbose:
+                print("[ego-pool] AdaptiveAvgPool が無い (変換済み?)", flush=True)
+            return False
+        i = idx[-1]
+        c = None
+        for m in list(seq)[:i][::-1]:
+            if isinstance(m, nn.Conv2d):
+                c = m.out_channels
+                break
+            if isinstance(m, nn.BatchNorm2d):
+                c = m.num_features
+                break
+        assert c is not None, "プール直前のチャネル数が取れない"
+        h, w = int(hw[0]), int(hw[1])
+        dev = next(self.parameters()).device
+        # BatchNorm は使わない: 出力が 1x1 なのでバッチ内 1 チャネルあたり
+        # 標本が batch 数しか無く統計が取れない (batch=1 では例外になる)。
+        # 正規化は定数なので **畳み込みの重みとバイアスに畳み込める**:
+        #   出力 = (平均 - mu) / sigma
+        #        = sum(x) * 1/(h*w*sigma)  +  (-mu/sigma)
+        # 1 層で済み、TensorRT はこの conv 出力に自前の較正スケールを付ける。
+        # 重み自体は学習可能なので、以後の微調整で自由に動く。
+        conv = nn.Conv2d(c, c, kernel_size=(h, w), groups=c, bias=True)
+        with torch.no_grad():
+            _mu = torch.zeros(c) if mean is None else torch.as_tensor(mean).float()
+            _va = torch.ones(c) if var is None else torch.as_tensor(var).float()
+            _sig = _va.clamp(min=1e-8).sqrt()
+            conv.weight.copy_((1.0 / (h * w * _sig)).view(c, 1, 1, 1)
+                              .expand(c, 1, h, w).contiguous())
+            conv.bias.copy_(-_mu / _sig)
+            # ego_mlp の第 1 層で正規化を打ち消す (機能保存)
+            lin = None
+            for m in self.ego_mlp:
+                if isinstance(m, nn.Linear):
+                    lin = m
+                    break
+            if lin is not None:
+                W = lin.weight[:, :c]
+                lin.bias.add_(W @ _mu.to(W.device))
+                lin.weight[:, :c] = W * _sig.to(W.device)
+        seq[i] = conv.to(dev)
+        self.to(dev)
+        if verbose:
+            print(f"[ego-pool] 大域平均 ({h}x{w}) を depthwise conv + BN に置換 "
+                  f"(ch {c}, 機能保存)", flush=True)
+        return True
+
+    def enable_pact(self, patterns, alpha_init=None, verbose=True):
+        """PACT (2026-08-23): 指定 ReLU を「学習可能な上限つき ReLU」に置換。
+
+        INT8 で ego が凍結する原因を実測で特定した結果: ego の直前にある
+        時間融合の ReLU が **外れ値比 48 倍** (tfuse3.3.5 は max 136.9 に対し
+        p99.9 が 2.86) だった。per-tensor の INT8 スケールは max で決まるので、
+        信号の 99.9% が 127 段階のうち 3 段階に潰れる。ego 出力が定数化する
+        一方で std だけ大きく見える現象と整合する。較正方式を 3 種
+        (entropy2 / MinMax / legacy) 試して ego 出力が小数第 5 位まで
+        一致したのは、スケールの選び方ではなく **活性の分布自体** が
+        原因だから。
+
+        ReLU6 (固定値 6) は使えない: 同じネットの中に p99.9 が 27 の層
+        (pl_head) と 2.9 の層 (tfuse) が同居しており、一律に切ると正常な
+        信号を壊す。よって層ごとに学習可能な上限 alpha を持たせる。
+
+        alpha は **実測 max x 1.10 で初期化する**ので、開始時点の出力は
+        素の ReLU と完全に一致する (機能保存)。そこから L1 の減衰
+        (--pact-w) で押し下げ、外れ値だけを刈る。
+
+        推論時は定数の Clip 1 個に落ちるので **レイテンシ増はゼロ**
+        (前段の conv+BN に融合される)。QAT と違い ONNX のグラフ構造も
+        量子化方式も変えないので、MeteorLift プラグイン経路のカーネル選択に
+        影響しない。
+        """
+        import fnmatch as _fn
+        init = dict(alpha_init or {})
+        tgt = [t.strip() for t in (patterns.split(",")
+                                   if isinstance(patterns, str) else patterns)]
+
+        def _match(n):
+            return any(n.startswith(t) or _fn.fnmatch(n, t) for t in tgt)
+
+        made = []
+        for mn, mod in list(self.named_modules()):
+            for cn, ch in list(mod.named_children()):
+                if not isinstance(ch, nn.ReLU):
+                    continue
+                full = f"{mn}.{cn}" if mn else cn
+                if not _match(full):
+                    continue
+                a0 = float(init.get(full, 64.0))
+                setattr(mod, cn, PACTReLU(a0, inplace=ch.inplace))
+                made.append((full, a0))
+        self._pact_names = [m[0] for m in made]
+        dev = next(self.parameters()).device
+        self.to(dev)
+        if verbose:
+            print(f"[pact] {len(made)} 層を上限つき ReLU に置換 "
+                  f"(alpha は実測 max の安全率つきで初期化 = 機能保存)", flush=True)
+            for n_, a_ in made:
+                print(f"[pact]   {n_:<22} alpha_init {a_:8.2f}", flush=True)
+        return made
+
+    def pact_penalty(self):
+        """alpha の L1。これで上限を押し下げ、外れ値だけを刈る。"""
+        acc = None
+        for m in self.modules():
+            if isinstance(m, PACTReLU):
+                v = m.alpha.abs()
+                acc = v if acc is None else acc + v
+        return acc if acc is not None else torch.zeros((), device=next(
+            self.parameters()).device)
+
+    def enable_paint_det(self, classes):
+        """paint-det (2026-08-22): 2D 検出ヒートマップをリフト前の ctx へ注入。
+
+        深度分布の鋭化は 30-60m で飽和し (ent_w 0.02 と 0.1 で最大確率
+        0.090/0.091、目標 0.15 に届かず)、cam-only の遠方 veh recall は
+        0.50 で頭打ち。一方 2D 画像では遠方車両は見えており、2D det の
+        ヒートマップはピークが立つ。その「ここに車がいる」証拠をリフトで
+        BEV セルへ届ける。paint-seg と同じくゼロ初期化 1x1 射影の加算なので
+        導入時点の出力は完全に不変 (BEV 幅 96ch もリフトプラグインも不変)。
+
+        det2d は本来 forward の最後で _last_f から計算されるが、ctx より
+        前に計算しても等価なので、ここで前倒しして結果をキャッシュし、
+        後段の det2d_forward がそれを再利用する (計算は 1 回だけ)。
+        """
+        self._paint_det_cls = [int(c) for c in classes]
+        _convs = [mm for mm in self.ctx.modules()
+                  if isinstance(mm, nn.Conv2d)]
+        cc = _convs[-1].out_channels
+        self.paint_det_proj = nn.Conv2d(len(self._paint_det_cls), cc, 1)
+        nn.init.zeros_(self.paint_det_proj.weight)
+        nn.init.zeros_(self.paint_det_proj.bias)
+        self.paint_det_proj = self.paint_det_proj.to(
+            next(self.parameters()).device)
+
+        def _mix_det(_m, _i, _o):
+            f = getattr(self, "_last_f", None)
+            if f is None or f.shape[0] != _o.shape[0]:
+                return _o
+            d = self.det2d_stem(f)
+            hm = self.hm2d_head(d)
+            self._det2d_cache = (d, hm)          # 後段で再利用
+            p = hm.sigmoid()[:, self._paint_det_cls].detach().to(_o.dtype)
+            if p.shape[-2:] != _o.shape[-2:]:
+                p = F.interpolate(p, size=_o.shape[-2:], mode="bilinear",
+                                  align_corners=False)
+            _d = self.paint_det_proj(p)
+            if os.environ.get("METEOR_PAINT_DEBUG"):
+                print(f"[paint-det] p={tuple(p.shape)} "
+                      f"加算ノルム={float(_d.abs().mean()):.5f}")
+            return _o + _d
+
+        self._det2d_cache = None
+        self.ctx.register_forward_hook(_mix_det)
+
     def temporal_fuse(self, bev):
         return bev                      # identity below v22
 
@@ -762,7 +1402,24 @@ class DepthSegIPMNetV16(DepthSegIPMNetV14):
         B, N, _, H, W = imgs.shape
         f = self.image_feats(imgs)
         self._f_s4 = f                 # v27 TL head reads the front cameras
-        seg2d = self.seg_head(f)
+        # Clamped. The 2D seg logits are the one thing that goes non-finite in
+        # these rounds: r59 discarded 0 % of steps up to 9k, 5 % to 12k and
+        # 29 % by 13.5k, every one of them reported as out[2] alone with the BEV
+        # outputs clean, and r53/r56/r57 showed the same climb. In fp16 a logit
+        # only has to pass 65504 to become inf, and CE saturates long before
+        # +-30, so this changes nothing about what the loss sees while removing
+        # the failure -- and since clamp has zero gradient outside the range it
+        # also stops the head being pushed further out once it gets there.
+        # clamp だけでは NaN が素通しする (clamp(nan)=nan)。fp16 で head 内部が
+        # 一度 inf になると BN の (x-mean)/sqrt(var) で NaN が生まれ、
+        # 出力段の clamp では消せない。2026-08-17: nan_to_num を前置し、
+        # out[2] 由来の SKIP (r59 で 29%, r72 で 148 回, r73 で 16 回) を断つ。
+        if _EXPORT_FAST:
+            seg2d = self.seg_head(f).clamp(-30.0, 30.0)
+        else:
+            seg2d = torch.nan_to_num(self.seg_head(f), nan=0.0,
+                                     posinf=30.0, neginf=-30.0
+                                     ).clamp(-30.0, 30.0)
         dlog = self.depth_head(self.depth_up(f))
         dprob = self.sharpen_dprob(dlog.softmax(1))
         ctx = self.ctx(f)
@@ -771,19 +1428,49 @@ class DepthSegIPMNetV16(DepthSegIPMNetV14):
         self._last_bev = bev
         bev = self.temporal_fuse(bev)
         self._fused_bev = bev          # consumed by ego / occ / traj heads
+        # Optional lane SDF auxiliary (enable_lane_sdf). Prediction is stashed
+        # on the module rather than appended to the output tuple: the tuple is
+        # positional with 19 consumers and a probe must not renumber them.
+        if getattr(self, "lane_sdf", None) is not None:
+            # the head is float32 and this point is reached both inside and
+            # outside autocast (temporal-history passes disable it); cast the
+            # input to the head's own dtype so both paths work
+            _w = self.lane_sdf[0].weight
+            # Lane geometry is a static task and must use the same RAW BEV as
+            # the segmentation decoder. The temporally fused BEV contains
+            # warp residuals/moving-object ghosts and is reserved for motion.
+            self._lane_sdf_pred = self.lane_sdf(
+                self.lane_input().to(_w.dtype))
+
         det = self.det_stem(self.det_input())
+        dd = getattr(self, "det_deep", None)
+        if dd is not None:
+            det = det + dd(det.to(dd[0].weight.dtype)).to(det.dtype)
         self._det_feat = det
         lane_bev = self.lane_input()
         fh2, fw2 = dlog.shape[-2:]
         sh, sw = seg2d.shape[-2:]
         rg_out = self.reg_head(det)
         self._det_reg = rg_out          # v33 traj head reads sin/cos yaw
-        return (self.dec(lane_bev), dlog.view(B, N, self.D, fh2, fw2),
+        return (self._seg_with_lane(lane_bev),
+                dlog.view(B, N, self.D, fh2, fw2),
                 seg2d.view(B, N, seg2d.shape[1], sh, sw),
                 self.hm_head(det), rg_out)
 
+    def _seg_with_lane(self, lane_bev):
+        seg = self.dec(lane_bev)
+        sd = getattr(self, "seg_deep", None)
+        if sd is not None:
+            seg = seg + sd(lane_bev.to(sd[0].weight.dtype)).to(seg.dtype)
+        br = getattr(self, "lane_branch", None)
+        if br is None:
+            return seg
+        res = br(lane_bev.to(br[0].weight.dtype)).to(seg.dtype)
+        return torch.cat([seg[:, :4], seg[:, 4:7] + res, seg[:, 7:]], 1)
+
     @staticmethod
-    def build_det_targets(boxes, nbox, device, dtype=torch.float32):
+    def build_det_targets(boxes, nbox, device, dtype=torch.float32,
+                          gt_w=None):
         """boxes [B,Kmax,6] (cls,xe,ye,l,w,yaw), nbox [B] -> (hm_t, reg_t, m_t).
 
         hm_t [B,2,h,w] Gaussian center heatmaps; reg_t [B,6,h,w]; m_t [B,1,h,w]
@@ -803,8 +1490,23 @@ class DepthSegIPMNetV16(DepthSegIPMNetV14):
         for bi in range(B):
             for k in range(int(nbox[bi])):
                 cls, xe, ye, l, w, yaw = boxes[bi, k].tolist()
-                r = (80.0 - xe) / DET_RES
-                c = (50.0 - ye) / DET_RES
+                # Per-GT confidence from LiDAR support. Measured on val: a GT
+                # vehicle box carries 857 LiDAR points at 0-20 m, 232 at 20-40,
+                # 59 at 40-60 and 24 at 60-80, where 13 % of the boxes have
+                # none at all. Restricting the evaluation to boxes with >= 40
+                # points lifts 40-60 m recall from 0.34 to 0.44, so a large
+                # part of what looks like a miss is a box the sensors never
+                # actually saw. Training on those as hard positives teaches the
+                # detector to fire where there is no evidence, which is where
+                # the far-range precision goes (0.86 at 20-40 m, 0.56 at
+                # 40-60 m). gw scales the peak of the Gaussian, so an
+                # unsupported box neither demands a detection nor counts as
+                # background.
+                gw = 1.0 if gt_w is None else float(gt_w[bi, k])
+                if gw <= 0.0:
+                    continue
+                r = (BEV_XF - xe) / DET_RES
+                c = (BEV_YH - ye) / DET_RES
                 ri, ci = int(r), int(c)
                 if not (0 <= ri < DET_H and 0 <= ci < DET_W):
                     continue
@@ -812,7 +1514,7 @@ class DepthSegIPMNetV16(DepthSegIPMNetV14):
                 g = torch.exp(-(((ys - r) ** 2).view(-1, 1)
                                 + ((xs - c) ** 2).view(1, -1)) / (2 * rad ** 2))
                 ch = 0 if cls < 1.5 else 1
-                hm[bi, ch] = torch.maximum(hm[bi, ch], g)
+                hm[bi, ch] = torch.maximum(hm[bi, ch], g * gw)
                 ll, lw = math.log(max(l, .1)), math.log(max(w, .1))
                 sy, cy = math.sin(yaw), math.cos(yaw)
                 # crossing vehicles (lateral yaw) are rare and their yaw
@@ -836,9 +1538,9 @@ class DepthSegIPMNetV16(DepthSegIPMNetV14):
             msk[bi, 0, ri, ci] = wy
         return hm, reg, msk
 
-    def boxdet_loss(self, hm, reg, boxes, nbox):
+    def boxdet_loss(self, hm, reg, boxes, nbox, gt_w=None, corner_w=0.0):
         hm_t, reg_t, m = self.build_det_targets(boxes, nbox, hm.device,
-                                                torch.float32)
+                                                torch.float32, gt_w=gt_w)
         p = hm.float().sigmoid().clamp(1e-4, 1 - 1e-4)
         pos = (hm_t > 0.99).float()
         neg_w = (1 - hm_t) ** 4
@@ -848,15 +1550,17 @@ class DepthSegIPMNetV16(DepthSegIPMNetV14):
                 or self._det_posw.device != hm.device:
             rr = torch.arange(DET_H, device=hm.device).view(-1, 1)
             cc = torch.arange(DET_W, device=hm.device).view(1, -1)
-            xe = 80.0 - rr * DET_RES
-            ye = 50.0 - cc * DET_RES
+            xe = BEV_XF - rr * DET_RES
+            ye = BEV_YH - cc * DET_RES
             r = (xe ** 2 + ye ** 2).sqrt()
             # near-range recall boost, per class: the veh boost is softened
             # (x3 overfired -> near duplicate/phantom FPs); VRU keeps x3
             near_veh = 1.0 + 0.25 * (r < 20.0).float() + 0.25 * (r < 12.0).float()
             near_vru = 1.0 + (r < 20.0).float() + (r < 12.0).float()
             near = torch.stack([near_veh, near_vru])
-            cw = torch.tensor([2.0, 5.0], device=hm.device).view(2, 1, 1)
+            # v131' (2026-08-28): VRU クラス重みをフラグ化 (既定 5.0 = 従来値)
+            cw = torch.tensor([2.0, float(getattr(self, "VRU_CW", 5.0))],
+                              device=hm.device).view(2, 1, 1)
             # far positives are unresolvable at 768x432 (a 60 m pedestrian is
             # ~10 px); full-weight unlearnable positives push the focal loss
             # to suppress confidence everywhere -> damp them instead.
@@ -881,17 +1585,82 @@ class DepthSegIPMNetV16(DepthSegIPMNetV14):
             # laterally distant objects are out of scope -> nearly ignore
             damp = damp * torch.where(ye.abs() > 15.0, 0.2, 1.0)
             self._det_posw = (near * cw * damp).unsqueeze(0)
+        _neg = (1 - pos) * neg_w
+        if getattr(self, "_det_sup_km", None) is not None:
+            _neg = _neg * self._det_sup_km      # 窓外の負例も無監督に
         floss = -(pos * self._det_posw * (1 - p) ** 2 * p.log()
-                  + (1 - pos) * neg_w * p ** 2 * (1 - p).log()).sum() \
+                  + _neg * p ** 2 * (1 - p).log()).sum() \
             / (pos * self._det_posw).sum().clamp(min=1)
         # yaw channels (sin/cos) x3: orientation error is the weakest output
         if getattr(self, "_reg_cw", None) is None \
                 or self._reg_cw.device != hm.device:
             self._reg_cw = torch.tensor([1., 1., 1., 1., 3., 3.],
                                         device=hm.device).view(1, 6, 1, 1)
-        rloss = (torch.abs(reg.float() - reg_t) * m * self._reg_cw).sum() \
+        # yaw-balance (v68+ 事前登録): 予測が軸平行モードに崩壊した実測
+        # (斜めGT 15-75deg で誤差 31-43deg) への的絞りレバー。GT の斜め度で
+        # yaw チャネル (4:6) の重みを持ち上げる。
+        #
+        # 2026-08-15 修正: 重みが sin(2*yaw)^2 = (2 sin cos)^2 だったため、
+        # 真横 (yaw=90deg, sin=1 cos=0) で 0 になり、自車と平行な車 (0deg) と
+        # 同じ「重み無し」扱いになっていた。ペア比較 (両モデルが検出できた
+        # 共通 801 箱) で軽量版の yaw 誤差中央値は 0-15deg 帯 2.1deg に対し
+        # 75-90deg 帯 39.4deg と、まさに重みが消える帯で最大に壊れている。
+        # 単調な sin^2 に直す (0deg -> 0, 45deg -> 0.5, 90deg -> 1.0)。
+        # これは「斜めほど重く」という登録済みの意図どおりの形であり、
+        # レバー自体は METEOR_YAW_BALANCE_W>0 のときだけ効く (既定は無効)。
+        # 形の指数は METEOR_YAW_BALANCE_P で選ぶ (既定 2 = sin^2)。
+        # p=1 の |sin| は 15-45deg 帯にも効くが正対帯への影響が大きい。
+        # どちらが良いかは実測で決める (out/probe_yawlever*.log)。
+        # 2026-08-15 追加: METEOR_YAW_BALANCE_SAT=<度> を指定すると、その角度
+        # 以上の斜めを一律で最大重みにする飽和形になる。v76 (p=1, w=2) の
+        # 本走行で真横 34.3->6.5 度と直った一方、15-45 度が 35.5->47.4 度へ
+        # 悪化した。|sin| は 90 度に重みが集中し 15-45 度に薄い (15 度で 0.26)
+        # ため。飽和形なら斜めの全帯を同じ重さで扱える。
+        ybw = float(os.environ.get("METEOR_YAW_BALANCE_W", "0"))
+        ybp = float(os.environ.get("METEOR_YAW_BALANCE_P", "2"))
+        ybs = float(os.environ.get("METEOR_YAW_BALANCE_SAT", "0"))
+        _yw = 1.0
+        if ybw > 0:
+            if ybs > 0:
+                _s = math.sin(math.radians(ybs))
+                obl = (reg_t[:, 4:5].abs() / _s).clamp(max=1.0)
+            else:
+                obl = reg_t[:, 4:5].abs() ** ybp       # |sin(yaw)|^p
+            _yw = torch.ones_like(reg_t)
+            _yw[:, 4:6] = 1.0 + ybw * obl.expand(-1, 2, -1, -1)
+        rloss = (torch.abs(reg.float() - reg_t) * m * _yw * self._reg_cw).sum() \
             / m.sum().clamp(min=1) / 10
-        return floss + rloss
+        corner_loss = reg.float().sum() * 0.0
+        if corner_w > 0:
+            # Joint metric-space geometry constraint. Independent encoded L1
+            # terms can trade a centre error against size/yaw and still look
+            # cheap; matching all four physical corners couples those errors.
+            # It is training-only and adds no operation to the exported graph.
+            bi, ri, ci = (m[:, 0] > 0).nonzero(as_tuple=True)
+            if bi.numel():
+                pr = reg.float()[bi, :, ri, ci]
+                tr = reg_t[bi, :, ri, ci]
+
+                def _corners(v):
+                    centre = torch.stack([
+                        (ri.float() + v[:, 0]) * DET_RES,
+                        (ci.float() + v[:, 1]) * DET_RES], dim=-1)
+                    length = v[:, 2].clamp(-4.0, 5.0).exp()
+                    width = v[:, 3].clamp(-4.0, 5.0).exp()
+                    norm = (v[:, 4].square() + v[:, 5].square()
+                            ).clamp_min(1e-6).sqrt()
+                    sn, cs = v[:, 4] / norm, v[:, 5] / norm
+                    signs = v.new_tensor([[1., 1.], [1., -1.],
+                                          [-1., -1.], [-1., 1.]])
+                    lx = length[:, None] * signs[None, :, 0] * 0.5
+                    ly = width[:, None] * signs[None, :, 1] * 0.5
+                    dx = lx * cs[:, None] - ly * sn[:, None]
+                    dy = lx * sn[:, None] + ly * cs[:, None]
+                    return centre[:, None, :] + torch.stack([dx, dy], -1)
+
+                corner_loss = F.smooth_l1_loss(
+                    _corners(pr), _corners(tr), beta=0.25)
+        return floss + rloss + float(corner_w) * corner_loss
 
     @staticmethod
     def decode_boxes(hm, reg, thresh=0.3, topk=64):
@@ -917,8 +1686,8 @@ class DepthSegIPMNetV16(DepthSegIPMNetV14):
                 o = reg[bi, :, rr, cc]
                 r = ri[j] + o[0]
                 c = ci[j] + o[1]
-                xe = 80.0 - float(r) * DET_RES
-                ye = 50.0 - float(c) * DET_RES
+                xe = BEV_XF - float(r) * DET_RES
+                ye = BEV_YH - float(c) * DET_RES
                 l = float(o[2].exp())
                 w = float(o[3].exp())
                 yaw = float(torch.atan2(o[4], o[5]))
@@ -928,7 +1697,41 @@ class DepthSegIPMNetV16(DepthSegIPMNetV14):
 
 
 DET2D_S = 4                    # 2D det grid stride on the cached image (108x192)
-N_DET2D = 10                   # fastlabel 10-class instance taxonomy
+class PACTReLU(nn.Module):
+    """上限が学習可能な ReLU。y = clamp(x, 0, alpha)。
+
+    学習時は 0.5*(|x| - |x-a| + a) の形で書く (これは clamp と数値的に
+    同一で、x > a の領域から alpha へ勾配が流れる = PACT の要点)。
+    推論時は定数の clamp にするので ONNX には Clip が 1 個出るだけ。
+    """
+
+    def __init__(self, alpha_init=64.0, inplace=True):
+        super().__init__()
+        self.alpha = nn.Parameter(torch.tensor(float(alpha_init)))
+        self.inplace = bool(inplace)
+
+    def forward(self, x):
+        # 値は必ず hardtanh の in-place 1 発で作る。置換元の ReLU が
+        # inplace=True なので、非 in-place にすると別名参照の見え方が変わり
+        # 補助ヘッドで相対 5-7% ずれる (実測)。hardtanh + inplace なら
+        # 素の ReLU と **ビット一致** することを確認済み。
+        # ONNX には Clip が 1 個出るだけなので TensorRT が前段の conv+BN に
+        # 融合する = 推論コストはゼロ。
+        a = self.alpha.abs().clamp(min=1e-3)
+        if self.training:
+            # alpha へ勾配を流す (PACT): 上限に当たった画素で d/da = 1。
+            # 値は 0 を足すだけなので数値は hardtanh と完全に同じ。
+            with torch.no_grad():
+                clipped = (x > a).to(x.dtype)
+            y = F.hardtanh(x, 0.0, float(a), inplace=self.inplace)
+            return y + (a.to(x.dtype) - float(a)) * clipped
+        return F.hardtanh(x, 0.0, float(a), inplace=self.inplace)
+
+    def extra_repr(self):
+        return f"alpha={float(self.alpha):.3f}"
+
+
+N_DET2D = 10                   # 10-class 2D instance taxonomy (comlops-instance-2510.csv)
 
 
 class DepthSegIPMNetV17(DepthSegIPMNetV16):
@@ -952,8 +1755,13 @@ class DepthSegIPMNetV17(DepthSegIPMNetV16):
         return out + self.det2d_forward(self._last_f, B, N)
 
     def det2d_forward(self, f, B, N):
-        d = self.det2d_stem(f)
-        hm2d = self.hm2d_head(d)
+        _c = getattr(self, "_det2d_cache", None)
+        if _c is not None:               # paint-det が前倒し計算済み
+            d, hm2d = _c
+            self._det2d_cache = None
+        else:
+            d = self.det2d_stem(f)
+            hm2d = self.hm2d_head(d)
         reg2d = self.reg2d_head(d)
         fh, fw = hm2d.shape[-2:]
         return (hm2d.view(B, N, N_DET2D, fh, fw),
@@ -1060,7 +1868,7 @@ class DepthSegIPMNetV18(DepthSegIPMNetV17):
     def __init__(self, *a, **k):
         super().__init__(*a, **k)
         self.ego_stem = nn.Sequential(
-            nn.Conv2d(96, 64, 3, stride=4, padding=1, bias=False),
+            nn.Conv2d(BEV_CH, 64, 3, stride=4, padding=1, bias=False),
             nn.BatchNorm2d(64), nn.ReLU(inplace=True),      # 200x125
             ConvBlock(64, 96),
             nn.Conv2d(96, 96, 3, stride=2, padding=1, bias=False),
@@ -1166,7 +1974,7 @@ class DepthSegIPMNetV19(DepthSegIPMNetV18):
             nn.init.constant_(m.bias, -2.19)
         # E2E: deeper pyramid + wider MLP (most important task)
         self.ego_stem = nn.Sequential(
-            nn.Conv2d(96, 128, 3, stride=4, padding=1, bias=False),
+            nn.Conv2d(BEV_CH, 128, 3, stride=4, padding=1, bias=False),
             nn.BatchNorm2d(128), nn.ReLU(inplace=True),     # 200x125
             ConvBlock(128, 128),
             nn.Conv2d(128, 192, 3, stride=2, padding=1, bias=False),
@@ -1185,14 +1993,23 @@ class DepthSegIPMNetV19(DepthSegIPMNetV18):
             nn.Linear(256, EGO_OUT))
 
     def det2d_forward(self, f, B, N):
-        d4 = self.det2d_stem(f)
+        # paint-det が有効なときは s4 段 (det2d_stem + hm2d_head) をリフト前に
+        # 計算済み。同じ f から出るので等価であり、ここで再利用して二重計算を
+        # 避ける (キャッシュは 1 回で使い切る)。
+        _c = getattr(self, "_det2d_cache", None)
+        if _c is not None and _c[0].shape[0] == f.shape[0]:
+            d4, _hm4 = _c
+            self._det2d_cache = None
+        else:
+            d4, _hm4 = self.det2d_stem(f), None
         d8 = self.det2d_d8(d4)
         d16 = self.det2d_d16(d8)
         hms, regs = [], []
-        for d, hh, rr in ((d4, self.hm2d_head, self.reg2d_head),
-                          (d8, self.hm2d_head8, self.reg2d_head8),
-                          (d16, self.hm2d_head16, self.reg2d_head16)):
-            hm = hh(d)
+        for _si, (d, hh, rr) in enumerate((
+                (d4, self.hm2d_head, self.reg2d_head),
+                (d8, self.hm2d_head8, self.reg2d_head8),
+                (d16, self.hm2d_head16, self.reg2d_head16))):
+            hm = _hm4 if (_si == 0 and _hm4 is not None) else hh(d)
             rg = rr(d)
             fh, fw = hm.shape[-2:]
             hms.append(hm.view(B, N, N_DET2D, fh, fw))
@@ -1277,14 +2094,15 @@ class DepthSegIPMNetV20(DepthSegIPMNetV19):
     def __init__(self, *a, **k):
         super().__init__(*a, **k)
         self.occ_stem = nn.Sequential(
-            nn.Conv2d(96, 128, 3, stride=2, padding=1, bias=False),
+            nn.Conv2d(BEV_CH, 128, 3, stride=2, padding=1, bias=False),
             nn.BatchNorm2d(128), nn.ReLU(inplace=True),
             ConvBlock(128, 192))
         self.occ_head = nn.Conv2d(192, OCC_Z * OCC_C, 1)
 
     def forward(self, imgs, K, T_cam_ego, v0=None):
         out = super().forward(imgs, K, T_cam_ego, v0)
-        crop = self.occ_input()[:, :, 200:600, 50:450]
+        _r0, _r1 = bev_rows(40.0, -40.0)
+        crop = self.occ_input()[:, :, _r0:_r1, 50:450]
         of = self.occ_stem(crop)
         self._occ_feat = of                    # v29 flow head reads this
         o = self.occ_head(of)
@@ -1362,8 +2180,8 @@ class DepthSegIPMNetV21(DepthSegIPMNetV20):
                 cls, xe, ye = boxes[bi, k, 0], boxes[bi, k, 1], boxes[bi, k, 2]
                 if boxes[bi, k, 3] <= 0:
                     continue
-                ri = int((80.0 - float(xe)) / DET_RES)
-                ci = int((50.0 - float(ye)) / DET_RES)
+                ri = int((BEV_XF - float(xe)) / DET_RES)
+                ci = int((BEV_YH - float(ye)) / DET_RES)
                 if not (0 <= ri < DET_H and 0 <= ci < DET_W):
                     continue
                 w = 2.5 if float(cls) >= 1.5 else 1.0      # VRU emphasis
@@ -1385,6 +2203,327 @@ class DepthSegIPMNetV21(DepthSegIPMNetV20):
         if m.sum() == 0:
             return tr_pred.sum() * 0.0
         return (torch.abs(tr_pred.float() - t) * m).sum() / m.sum()
+
+
+def enable_lane_branch(net, ch=64):
+    """Dedicated decoder branch for the THIN classes (laneline / stopline /
+    road_edge), residual on the shared 9-class logits.
+
+    Why now: the Orin profile removed the cost objection -- every head together
+    is ~18 ms, dec+seg 7.3, and this branch prices at 1-2 ms. What it buys that
+    loss reweighting could not (four attempts, refuted by the gradient probe):
+    the thin classes currently ride a decoder whose BatchNorm statistics and
+    gradient budget are dominated by road/sidewalk, and their decision boundary
+    sits inside a 9-way softmax where road competes at every lane pixel. A
+    separate branch gives the thin classes their own normalisation statistics
+    and their own capacity.
+
+    The last conv is ZERO-INITIALISED: at attach time the network's function is
+    bit-identical, so it can be dropped onto a trained checkpoint and measured
+    as a pure residual. The 9-class output interface is unchanged -- the branch
+    ADDS to channels 4..6 -- so every existing metric, demo and export reads it
+    with no change.
+    """
+    import torch.nn as nn
+    dev = next(net.parameters()).device
+    net.lane_branch = nn.Sequential(
+        nn.Conv2d(BEV_CH, ch, 3, padding=1, bias=False), nn.BatchNorm2d(ch),
+        nn.ReLU(inplace=True),
+        nn.Conv2d(ch, ch, 3, padding=1, bias=False), nn.BatchNorm2d(ch),
+        nn.ReLU(inplace=True),
+        nn.Conv2d(ch, 3, 1)).to(dev)
+    nn.init.zeros_(net.lane_branch[-1].weight)
+    nn.init.zeros_(net.lane_branch[-1].bias)
+    return net
+
+
+class QuantRobustStatHead(nn.Module):
+    """Function-preserving, bounded reparameterisation of a binary 1x1 head.
+
+    For z=w*x+b, relu(z)-relu(-z)=z. Clamping both positive branches to
+    ``cap`` bounds the deployed logit to +/-cap and gives TensorRT a compact,
+    head-specific activation range instead of letting an implicit INT8 fusion
+    collapse the one-channel output to zero.
+    """
+    def __init__(self, old, cap=8.0):
+        super().__init__()
+        self.cap = float(cap)
+        self.proj = nn.Conv2d(old.in_channels, 2, 1, bias=True)
+        self.out = nn.Conv2d(2, 1, 1, bias=False)
+        with torch.no_grad():
+            self.proj.weight[0].copy_(old.weight[0])
+            self.proj.weight[1].copy_(-old.weight[0])
+            b = old.bias[0] if old.bias is not None else old.weight.new_zeros(())
+            self.proj.bias[0].copy_(b)
+            self.proj.bias[1].copy_(-b)
+            self.out.weight.zero_()
+            self.out.weight[0, 0, 0, 0] = 1.0
+            self.out.weight[0, 1, 0, 0] = -1.0
+
+    def forward(self, x):
+        p = self.proj(x).clamp(0.0, self.cap)
+        return self.out(p)
+
+
+
+def enable_kinematic_anchor(net):
+    """v139: ego waypoint に等速直進項 g_t*[v0*t,0] をゲート付きで加算する。
+    ゼロ初期化で関数保存。学習後は近距離の速度バイアスを構造的に除去する。"""
+    import torch.nn as nn
+    if getattr(net, "kin_gate", None) is not None:
+        return net
+    dev = next(net.parameters()).device
+    net.kin_gate = nn.Parameter(torch.zeros(6, device=dev))
+    return net
+
+def enable_semantic_ego(net, ch=64):
+    """ego の INT8 耐性化 (2026-08-25): ego_stem の入力を「意味出力」に変える。
+
+    根本原因 (実測): ego は融合 BEV の生特徴を大域平均で読む。INT8 では
+    (1) 平均後の値が入力スケールの流用で潰れ (真っ黒でも乱数でも出力が
+    ビット一致)、(2) 上流 tfuse 帯の微細信号も破壊される。層精度・較正・
+    PACT・conv 化のすべてが不合格で、fp16-keep 65 層 (+18.6ms) が唯一の
+    回避策だった。
+    対処: ego が読む量を **INT8 で健全と実証済みのテンソル** に変える ---
+    seg ロジット (9ch)・det ヒートマップ (2ch)・占有の接地面 (合計 14ch 程度)。
+    これらは意味の決定境界を持つためダイナミックレンジが大きく、量子化に
+    構造的に強い (occ/traj/seg/det が INT8 で健全な理由そのもの)。
+    旧 ego_stem/ego_mlp は残し、出力に**ゼロ初期化の残差**として加算する
+    (導入時点は機能保存。学習が意味経路へ重みを移せば、fp16-keep から
+    tfuse/ego を外しても E2E が生きる)。"""
+    if getattr(net, "sem_ego", None) is not None:
+        return net
+    dev = next(net.parameters()).device
+    # 入力: seg 9 (800x500 を 2x 平均して det 格子へ) + det hm 2 = 11ch
+    # (occ は BEV と座標範囲が異なるため使わない)
+    net.sem_ego = nn.Sequential(
+        nn.Conv2d(11, ch, 3, stride=4, padding=1, bias=False),
+        nn.BatchNorm2d(ch), nn.ReLU(inplace=True),
+        nn.Conv2d(ch, ch, 3, stride=2, padding=1, bias=False),
+        nn.BatchNorm2d(ch), nn.ReLU(inplace=True),
+        nn.Conv2d(ch, ch, 3, stride=2, padding=1, bias=False),
+        nn.BatchNorm2d(ch), nn.ReLU(inplace=True),
+        nn.AdaptiveAvgPool2d((5, 4)), nn.Flatten(),
+        nn.Linear(ch * 20, 256), nn.ReLU(inplace=True),
+        nn.Linear(256, net.ego_mlp[-1].out_features)).to(dev)
+    nn.init.zeros_(net.sem_ego[-1].weight)
+    nn.init.zeros_(net.sem_ego[-1].bias)
+    return net
+
+
+def enable_delta_stat(net, ch=48):
+    """停止判定の時間差分ヘッド (2026-08-25)。
+
+    根本原因 (実測): stat_head2 が頼る微細な見えの差は INT8 バックボーンの
+    深部で破壊され、ヘッド近傍の対処 5 種 (margin / 有界ヘッド後付け /
+    有界ヘッド学習+拡張keep / traj 由来 / トラッキング=忠実代替) すべてが
+    ゲート不合格だった。
+    対処: 差分 |bev - warp(prev_bev)| を明示的にテンソルにし、そこから
+    停止判定を出す。静止物体は差分 ~0、移動物体は差分大 --- 量子化スケールが
+    動き信号そのもので決まるため、微小信号の目盛り消失が構造的に起きない。
+    ワープは時間融合の実装 (配備済み) を流用。追加計算は pool + 小 conv 3 層。
+    旧 stat_head2 は残す (fp16 実行では従来どおり比較できる)。"""
+    if getattr(net, "delta_stat", None) is not None:
+        return net
+    dev = next(net.parameters()).device
+    net.delta_stat = nn.Sequential(
+        nn.AvgPool2d(2),                       # 800x500 -> 400x250 (det 格子)
+        nn.Conv2d(BEV_CH, ch, 3, padding=1, bias=False),
+        nn.BatchNorm2d(ch), nn.ReLU(inplace=True),
+        nn.Conv2d(ch, ch, 3, padding=1, bias=False),
+        nn.BatchNorm2d(ch), nn.ReLU(inplace=True),
+        nn.Conv2d(ch, 1, 1)).to(dev)
+    nn.init.zeros_(net.delta_stat[-1].bias)
+    # out[10] を上書きされる stat_head2 は勾配を受けない。DDP は登録済みの
+    # 全 requires_grad パラメータに勾配を要求するので、凍結しないと step2 の
+    # reducer 再構築で落ちる (v124 初回起動で実害)。重みは fp16 比較用に残す。
+    for _p in net.stat_head2.parameters():
+        _p.requires_grad_(False)
+    return net
+
+
+def enable_depth_slim(net, scale=0.75, widths=None):
+    """深度ヘッドの幅を縮める (Orin 100ms 台帳のレバー3, 2026-08-27)。
+
+    v125fp のプロファイルで深度ヘッド (conv 5 本) が 12.8 ms と最大の単一
+    ブロック。幅 256/256/192/128 を scale 倍 (8 の倍数へ丸め) にした新しい
+    ヘッドへ置き換える。重みは新規初期化 — LiDAR 由来の深度 GT 監督が
+    強いので蒸留は使わず、ラウンド内で学習し直す。
+    widths を渡した場合はそれをそのまま使う (チェックポイント自動検出用)。"""
+    old = net.depth_head
+    ch = old[0][0].in_channels
+    D = old[-1].out_channels
+    if widths is None:
+        widths = tuple(max(8, int(round(w * scale / 8)) * 8)
+                       for w in (256, 256, 192, 128))
+    dev = old[-1].weight.device
+    net.depth_head = nn.Sequential(
+        ConvBlock(ch, widths[0]), ConvBlock(widths[0], widths[1]),
+        ConvBlock(widths[1], widths[2]), ConvBlock(widths[2], widths[3]),
+        nn.Conv2d(widths[3], D, 1)).to(dev)
+    return net
+
+
+def enable_traj_flow(net, ch=256):
+    """他車軌跡ヘッドへ flow 場を接続 (A レバー A1, 2026-08-27)。
+
+    実測 (probe_agent_cvflow): flow の向きは 11.3° と traj ヘッド (27°) より
+    大幅に良いのに、traj ヘッドは flow を読んでいない。flow (out[13],
+    ±40m クロップの occ 格子) を det/traj 格子へ再配置し、ゼロ初期化 1x1 の
+    残差として traj 特徴にのみ加算する (stat_head2 の入力は変えない)。
+    detach 供給なので flow ヘッド自身の学習は汚さない。A2 (--flow-w 1.0) は
+    flowerr 2.69m≈基準 2.64m で棄却 — 速度は損失重み律速ではない。"""
+    if getattr(net, "traj_flow", None) is not None:
+        return net
+    dev = next(net.parameters()).device
+    net.traj_flow = nn.Conv2d(2, ch, 1).to(dev)
+    nn.init.zeros_(net.traj_flow.weight)
+    nn.init.zeros_(net.traj_flow.bias)
+    return net
+
+
+def enable_det_temporal(net, ch=64):
+    """D7 (2026-08-28): 3D 検出 hm へ時間特徴のゼロ初期化残差。
+
+    遠方 recall と VRU は容量(D1)・露出(D2'/pV2)・重み(D3/pV1) の全レバーで
+    動かず、残る仮説は「単フレームの証拠不足」。unk_head2 が時間特徴化で
+    0.4m コーンを検出できるようになった前例と同型の接ぎ木。"""
+    if getattr(net, "det_tmp", None) is not None:
+        return net
+    dev = next(net.parameters()).device
+    net.det_tmp = nn.Sequential(
+        nn.Conv2d(256, ch, 3, padding=1), nn.ReLU(inplace=True),
+        nn.Conv2d(ch, 2, 1)).to(dev)
+    nn.init.zeros_(net.det_tmp[-1].weight)
+    nn.init.zeros_(net.det_tmp[-1].bias)
+    return net
+
+
+def enable_traj_cv(net):
+    """A6 (2026-08-28): 他車軌跡を CV(v̂)+残差 に再パラメータ化。
+
+    実測: agentADE 2.13m は oracle-CV 0.88m に大差負け = ヘッドが速度を
+    因数分解できていない。ゼロ初期化の速度予測 v̂ [2ch] を足し、
+    各モード k の waypoint に v̂*t_i を加算する (導入時は機能保存)。
+    残差学習で v̂ に運動が寄れば CV 構造が内在化される。"""
+    if getattr(net, "traj_vel", None) is not None:
+        return net
+    dev = next(net.parameters()).device
+    net.traj_vel = nn.Conv2d(256, 2, 1).to(dev)
+    nn.init.zeros_(net.traj_vel.weight)
+    nn.init.zeros_(net.traj_vel.bias)
+    return net
+
+
+def enable_depth_logbins(net):
+    """D5 (2026-08-29): 深度ビンを対数間隔化 (geomspace 1.0..79.75m x64)。
+    遠方 recall の真因 (距離での深度証拠の質) への構造レバー。
+    注意: 配備時はリフトプラグインのテーブル再生成が必要。"""
+    import math
+    ds = torch.exp(torch.linspace(math.log(1.0), math.log(79.75), 64))
+    try:
+        ds = ds.to(next(net.parameters()).device)
+    except StopIteration:
+        pass
+    net.register_buffer("DEPTH_CENTERS", ds, persistent=False)
+    return net
+
+
+def enable_mode_scorer(net, ch=64):
+    """E3 (2026-08-29): 経路条件付きモード選択スコアラ。
+
+    実測: 選択ロス +0.15m は soft CE (tau 0.2/0.4) でも risk 積分でも回収
+    できず、「候補を識別する入力の欠如」が律速。各候補の waypoint 位置で
+    BEV 時間特徴を双線形サンプルし、小 MLP のスコアをモード logit へ
+    ゼロ初期化残差として加算する (導入時は機能保存)。"""
+    if getattr(net, "mode_scorer", None) is not None:
+        return net
+    dev = next(net.parameters()).device
+    net.mode_scorer = nn.Sequential(
+        nn.Linear(256, ch), nn.ReLU(inplace=True),
+        nn.Linear(ch, 1)).to(dev)
+    nn.init.zeros_(net.mode_scorer[-1].weight)
+    nn.init.zeros_(net.mode_scorer[-1].bias)
+    return net
+
+
+def enable_quant_stat_head(net, cap=8.0):
+    """Replace stat_head2 with its bounded, INT8-robust equivalent."""
+    if isinstance(net.stat_head2, QuantRobustStatHead):
+        return net
+    old = net.stat_head2
+    dev, dtype = old.weight.device, old.weight.dtype
+    net.stat_head2 = QuantRobustStatHead(old, cap=cap).to(device=dev,
+                                                              dtype=dtype)
+    return net
+
+
+def enable_seg_deep(net, ch=None, n=3):
+    """Deepen the BEV Seg head: an n-block residual tower on the fused BEV
+    feature, added to ALL 9 class logits (lane_branch covers only the thin 3).
+
+    Rationale, measured not argued: the Orin profile prices every head
+    together at ~18 ms of a 69-76 ms engine -- head capacity is nearly free
+    at inference -- while the lane_branch probe showed BEV-side decoder
+    capacity IS a binding constraint (+9 % stopline for 1-2 ms). Same
+    zero-init-last-conv contract: attach to a trained checkpoint is
+    function-preserving; measure as a pure residual. Call BEFORE DDP."""
+    import torch.nn as nn
+    dev = next(net.parameters()).device
+    c = ch or BEV_CH
+    blocks = []
+    for i in range(n):
+        blocks += [nn.Conv2d(BEV_CH if i == 0 else c, c, 3, padding=1,
+                             bias=False), nn.BatchNorm2d(c),
+                   nn.ReLU(inplace=True)]
+    blocks += [nn.Conv2d(c, N_CLASSES, 1)]
+    net.seg_deep = nn.Sequential(*blocks).to(dev)
+    nn.init.zeros_(net.seg_deep[-1].weight)
+    nn.init.zeros_(net.seg_deep[-1].bias)
+    return net
+
+
+def enable_det_deep(net, n=3):
+    """Deepen the 3D detection trunk: an n-block zero-init residual tower on
+    the det_stem features, so hm_head / reg_head (and the traj head, which
+    reads the same features) see a richer representation. Detection runs at
+    300x250 -- a quarter of the seg grid -- so each block prices well under
+    1 ms on the Orin. Call BEFORE DDP."""
+    import torch.nn as nn
+    dev = next(net.parameters()).device
+    c = net.hm_head[0].in_channels if hasattr(net.hm_head, "__getitem__")         else 128
+    blocks = []
+    for _ in range(n):
+        blocks += [nn.Conv2d(c, c, 3, padding=1, bias=False),
+                   nn.BatchNorm2d(c), nn.ReLU(inplace=True)]
+    blocks += [nn.Conv2d(c, c, 1)]
+    net.det_deep = nn.Sequential(*blocks).to(dev)
+    nn.init.zeros_(net.det_deep[-1].weight)
+    nn.init.zeros_(net.det_deep[-1].bias)
+    return net
+
+
+def enable_lane_sdf(net, ch=48):
+    """Attach the lane signed-distance auxiliary head (probe, flag-gated).
+
+    Why this and not another loss reweighting: laneline IoU has been pinned at
+    0.09-0.13 for many rounds, the gradient probe showed every seg loss already
+    pushes the ring thinner, and the identified ceiling is SUB-CELL LABEL
+    JITTER -- a 0.2 m raster of a ~0.6 m line whose position noise is about
+    half a cell (docs/MILESTONES.md M5). Per-cell CE on a jittered label learns
+    the jitter. Regressing the DISTANCE FIELD to the nearest lane cell is
+    smooth under that jitter, so across many scenes the regression target
+    averages to the mean lane position -- sub-cell denoising on the model side,
+    without waiting for the GT factory re-run.
+
+    Call BEFORE the DDP wrap (it adds parameters)."""
+    import torch.nn as nn
+    dev = next(net.parameters()).device
+    net.lane_sdf = nn.Sequential(
+        nn.Conv2d(BEV_CH, ch, 3, padding=1), nn.ReLU(inplace=True),
+        nn.Conv2d(ch, 1, 1)).to(dev)
+    net._lane_sdf_pred = None
+    return net
 
 
 def make_warp_theta(rel):
@@ -1422,8 +2561,8 @@ class DepthSegIPMNetV22(DepthSegIPMNetV21):
     def __init__(self, *a, **k):
         super().__init__(*a, **k)
         self.tfuse = nn.Sequential(
-            nn.Conv2d(192, 96, 1, bias=False), nn.BatchNorm2d(96),
-            nn.ReLU(inplace=True), ConvBlock(96, 96))
+            nn.Conv2d(2 * BEV_CH, BEV_CH, 1, bias=False), nn.BatchNorm2d(BEV_CH),
+            nn.ReLU(inplace=True), ConvBlock(BEV_CH, BEV_CH))
         self._prev = (None, None)
 
     def forward(self, imgs, K, T_cam_ego, v0=None, prev_bev=None,
@@ -1448,22 +2587,27 @@ class LaneDecED(nn.Module):
     """Encoder-decoder BEV lane decoder: params at s2/s4 of the BEV, thin
     structures preserved by a full-resolution skip. ~4.1M params at ~0.8x
     the FLOPs of the flat full-res stack it replaces."""
-    def __init__(self, cin, n_cls):
+    def __init__(self, cin, n_cls, w=1.0):
+        """`w` scales every internal width. w=0.5 is 1.06M params instead of
+        4.10M and 3.28 ms instead of 7.72 ms at 800x500 (measured, fp16):
+        9 output classes did not need 320 channels at s4. Only BEV seg is
+        affected -- the shared BEV feature `cin` is untouched."""
         super().__init__()
-        self.skip = ConvBlock(cin, 64)
+        c0, c1, c2 = (max(8, int(round(c * w))) for c in (64, 192, 320))
+        self.skip = ConvBlock(cin, c0)
         self.d1 = nn.Sequential(
-            nn.Conv2d(cin, 192, 3, stride=2, padding=1, bias=False),
-            nn.BatchNorm2d(192), nn.ReLU(inplace=True), ConvBlock(192, 192))
+            nn.Conv2d(cin, c1, 3, stride=2, padding=1, bias=False),
+            nn.BatchNorm2d(c1), nn.ReLU(inplace=True), ConvBlock(c1, c1))
         self.d2 = nn.Sequential(
-            nn.Conv2d(192, 320, 3, stride=2, padding=1, bias=False),
-            nn.BatchNorm2d(320), nn.ReLU(inplace=True), ConvBlock(320, 320))
-        self.u1 = nn.Conv2d(320, 192, 1)
-        self.m1 = ConvBlock(192, 192)
-        self.u2 = nn.Conv2d(192, 64, 1)
+            nn.Conv2d(c1, c2, 3, stride=2, padding=1, bias=False),
+            nn.BatchNorm2d(c2), nn.ReLU(inplace=True), ConvBlock(c2, c2))
+        self.u1 = nn.Conv2d(c2, c1, 1)
+        self.m1 = ConvBlock(c1, c1)
+        self.u2 = nn.Conv2d(c1, c0, 1)
         self.out = nn.Sequential(
-            nn.Conv2d(64, 64, 3, padding=1, bias=False),
-            nn.BatchNorm2d(64), nn.ReLU(inplace=True),
-            nn.Conv2d(64, n_cls, 1))
+            nn.Conv2d(c0, c0, 3, padding=1, bias=False),
+            nn.BatchNorm2d(c0), nn.ReLU(inplace=True),
+            nn.Conv2d(c0, n_cls, 1))
 
     def forward(self, x):
         s = self.skip(x)
@@ -1488,7 +2632,7 @@ class DepthSegIPMNetV23(DepthSegIPMNetV22):
     def __init__(self, *a, **k):
         super().__init__(*a, **k)
         n_cls = self.dec[-1].out_channels
-        self.dec = LaneDecED(96, n_cls)
+        self.dec = LaneDecED(BEV_CH, n_cls)
         # stronger det stem: old (conv s2 96->128 + ConvBlock) + s4 tower
         self.det_d8 = nn.Sequential(
             nn.Conv2d(128, 256, 3, stride=2, padding=1, bias=False),
@@ -1542,7 +2686,7 @@ class DepthSegIPMNetV25(DepthSegIPMNetV24):
     def __init__(self, *a, **k):
         super().__init__(*a, **k)
         self.traj_stem = nn.Sequential(
-            nn.Conv2d(96, 128, 3, stride=2, padding=1, bias=False),
+            nn.Conv2d(BEV_CH, 128, 3, stride=2, padding=1, bias=False),
             nn.BatchNorm2d(128), nn.ReLU(inplace=True), ConvBlock(128, 128))
         self.traj_head = nn.Conv2d(256, TRAJ_H * 2, 1)   # +det feat (class)
 
@@ -1583,8 +2727,14 @@ class DepthSegIPMNetV26(DepthSegIPMNetV25):
         return out + (self.stat_head(self._det_feat),)
 
     @staticmethod
-    def stat_loss(stat, boxes, nbox, traj, tvalid):
-        """BCE at GT centres; label = stationary (|d3s| < 0.5 m)."""
+    def stat_loss(stat, boxes, nbox, traj, tvalid, margin=0.0):
+        """Signed-margin logistic loss at unambiguous GT vehicle centres.
+
+        ``margin=0`` is exactly BCE-with-logits.  A positive margin requires
+        stationary logits above +margin and moving logits below -margin,
+        preserving decision threshold zero while widening the separation that
+        INT8 quantisation needs.  Creep (0.35--0.8 m at 3 s) is ignored.
+        """
         B = boxes.shape[0]
         num = stat.sum() * 0.0
         den = 0
@@ -1599,9 +2749,10 @@ class DepthSegIPMNetV26(DepthSegIPMNetV25):
                 d3 = float(traj[b, k, 5].norm())
                 if 0.35 < d3 < 0.8:      # ambiguous creep band -> no label
                     continue
-                lbl = torch.tensor(float(d3 <= 0.35), device=stat.device)
-                num = num + F.binary_cross_entropy_with_logits(
-                    stat[b, 0, ri, ci].float().clamp(-15, 15), lbl)
+                lbl = float(d3 <= 0.35)
+                z = stat[b, 0, ri, ci].float().clamp(-15, 15)
+                signed = z if lbl > 0.5 else -z
+                num = num + F.softplus(float(margin) - signed)
                 den += 1
         return num / max(den, 1)
 
@@ -1660,13 +2811,14 @@ class DepthSegIPMNetV28(DepthSegIPMNetV27):
     def __init__(self, *a, **k):
         super().__init__(*a, **k)
         self.risk_head = nn.Sequential(
-            ConvBlock(96, 64), ConvBlock(64, 64), nn.Conv2d(64, 1, 1))
+            ConvBlock(BEV_CH, 64), ConvBlock(64, 64), nn.Conv2d(64, 1, 1))
         nn.init.constant_(self.risk_head[-1].bias, -2.0)   # start near 0 risk
 
     def forward(self, imgs, K, T_cam_ego, v0=None, prev_bev=None,
                 warp_theta=None):
         out = super().forward(imgs, K, T_cam_ego, v0, prev_bev, warp_theta)
-        crop = self._fused_bev[:, :, 200:600, 125:375]     # +-40 x +-25 m
+        _r0, _r1 = bev_rows(40.0, -40.0)       # +-40 x +-25 m
+        crop = self._fused_bev[:, :, _r0:_r1, 125:375]
         return out + (self.risk_head(crop),)
 
     @staticmethod
@@ -1690,7 +2842,7 @@ LG_M, LG_P = 24, 12            # lane-graph slots / points per chain
 class DepthSegIPMNetV29(DepthSegIPMNetV28):
     """v29 (DESIGN_v29): multimodal trajectories (K=3, winner-takes-all),
     3-slot temporal memory queue, vector lane-graph slot decoder, occupancy
-    flow. forward(imgs, K, T, v0, hist_bev [B,3,96,800,500],
+    flow. forward(imgs, K, T, v0, hist_bev [B,3,BEV_CH,800,500],
     hist_theta [B,3,2,3]) -> v28 outputs (with wider ego/traj) +
     (flow [B,2,200,200], lg_pts [B,24,12,2], lg_meta [B,24,4],
      lg_adj [B,24,24])."""
@@ -1702,14 +2854,15 @@ class DepthSegIPMNetV29(DepthSegIPMNetV28):
         # 2. temporal memory queue replaces the single-frame tfuse
         del self.tfuse
         self.tfuse3 = nn.Sequential(
-            nn.Conv2d(96 * (1 + HIST_N), 96, 1, bias=False),
-            nn.BatchNorm2d(96), nn.ReLU(inplace=True), ConvBlock(96, 96))
+            nn.Conv2d(BEV_CH * (1 + HIST_N), BEV_CH, 1, bias=False),
+            nn.BatchNorm2d(BEV_CH), nn.ReLU(inplace=True),
+            ConvBlock(BEV_CH, BEV_CH))
         last_bn = self.tfuse3[-1][-2]
         nn.init.zeros_(last_bn.weight)
         nn.init.zeros_(last_bn.bias)
         # 3. lane-graph slot decoder on the RAW BEV ROI (x -10..60, |y|<=25)
         self.lg_tower = nn.Sequential(
-            nn.Conv2d(96, 128, 3, stride=2, padding=1, bias=False),
+            nn.Conv2d(BEV_CH, 128, 3, stride=2, padding=1, bias=False),
             nn.BatchNorm2d(128), nn.ReLU(inplace=True), ConvBlock(128, 128),
             nn.Conv2d(128, 128, 3, stride=2, padding=1, bias=False),
             nn.BatchNorm2d(128), nn.ReLU(inplace=True), ConvBlock(128, 128))
@@ -1762,7 +2915,8 @@ class DepthSegIPMNetV29(DepthSegIPMNetV28):
         # detached: the lane-graph loss is large early and its gradients
         # through the shared raw BEV wrecked every other task in r20 --
         # the slot decoder learns on frozen features, interference-free
-        roi = self._last_bev.detach()[:, :, 100:450, 125:375]
+        _r0, _r1 = bev_rows(60.0, -10.0)
+        roi = self._last_bev.detach()[:, :, _r0:_r1, 125:375]
         f = self.lg_tower(roi)
         B = f.shape[0]
         emb = F.grid_sample(f, self.lg_grid.expand(B, -1, -1, -1),
@@ -1795,7 +2949,12 @@ class DepthSegIPMNetV29(DepthSegIPMNetV28):
         if tw is not None:                      # v36: near horizons weighted
             err = err * tw.to(err.device).view(1, 1, 6, 1)
         lw = getattr(self, "EGO_LONG_W", 1.0)
-        wp_ek = (lw * err[..., 0] + 4.0 * err[..., 1]).mean(2) / 2.5  # [B,K]
+        # normalise by the weight sum so changing the long/lat RATIO does
+        # not change the loss MAGNITUDE -- otherwise raising lw silently
+        # rescales E2E against the other 25 tasks. (lw=2 gives 6/2.4=2.5,
+        # exactly the constant this replaced.)
+        _n = (lw + 4.0) / 2.4
+        wp_ek = (lw * err[..., 0] + 4.0 * err[..., 1]).mean(2) / _n
         best = wp_ek.detach().argmin(1)
         # MODE BINDING. v44 adds MODE_BOOST to the commanded mode's logit and
         # claimed the switch was "guaranteed by construction". It was not:
@@ -1813,6 +2972,18 @@ class DepthSegIPMNetV29(DepthSegIPMNetV28):
         e = self.EPS_WTA
         wp_e = ((1.0 - e) * wp_ek.gather(1, best[:, None])
                 + e * wp_ek.mean(1, keepdim=True))
+        # Endpoint term, on the SELECTED candidate only, added on top of the
+        # per-step loss rather than redistributing it. Measured on val with the
+        # profile above: the first five steps track the log to 0.047-0.111 m of
+        # lateral error while the last is off by 0.538 m, and on turning frames
+        # (GT lateral > 2 m) the first 2.5 s are accurate to 0.64 m while the
+        # endpoint misses by 3.75 m -- the "path bends only at the tip" the
+        # demo shows.
+        fde_w = getattr(self, "EGO_FDE_W", 0.0)
+        if fde_w:
+            f_err = err[:, :, -1]                      # [B,K,2], tw applied
+            f_ek = (lw * f_err[..., 0] + 4.0 * f_err[..., 1]) / _n
+            wp_e = wp_e + fde_w * f_ek.gather(1, best[:, None])
         mlog = ego[:, 12 * Kn:12 * Kn + Kn]
         # Train the SELECTOR on the RAW logits. forward() already added
         # MODE_BOOST to mlog, so a CE against `best` on the boosted logits
@@ -1821,8 +2992,34 @@ class DepthSegIPMNetV29(DepthSegIPMNetV28):
         mb = getattr(self, "MODE_BOOST", 0.0)
         if intent is not None and mb:
             mlog = mlog - mb * intent.to(mlog.dtype)
-        ce = F.cross_entropy(mlog, best, reduction="none")[:, None]
+        # SOFT selector target. The hard argmin is a coin flip most of the
+        # time: measured on r61 best_e2e over 720 val frames, the gap between
+        # the best and second-best candidate has a MEDIAN of 0.231 m, 43.6 % of
+        # frames are inside 0.20 m and 96.4 % inside 0.50 m. Teaching cross
+        # entropy that one of two near-identical paths is "the" answer is
+        # teaching noise, and the selector shows it: it picks the best mode on
+        # 37 % of frames against a 33 % chance baseline, and the 0.171 m it
+        # loses to the oracle is 28 % of the whole ADE.
+        #
+        # softmax(-error / tau) says instead "prefer the winner in proportion to
+        # how much better it actually is", so a 0.01 m win contributes almost
+        # nothing and a 0.5 m win is nearly one-hot. No sample is discarded.
+        # A driving COMMAND still overrides completely -- that binding was
+        # deliberate (docs/FIX_COMMAND_BINDING.md) and is not what is broken.
+        tau = getattr(self, "EGO_CE_TAU", 0.0)
+        if tau > 0:
+            with torch.no_grad():
+                soft = F.softmax(-wp_ek.detach().float() / tau, dim=1)
+                if intent is not None:
+                    soft = torch.where(cmd[:, None],
+                                       intent.to(soft.dtype), soft)
+            ce = -(soft * F.log_softmax(mlog.float(), 1)).sum(1)[:, None]
+        else:
+            ce = F.cross_entropy(mlog, best, reduction="none")[:, None]
         cw = 1.0 + gt[:, 11:12].abs().clamp(max=6.0) / 1.5
+        _sw = getattr(self, "EGO_SPEED_W", 0.0)
+        if _sw > 0:   # v139b: 高速フレーム (ego 教師の少数派) の重み押し上げ
+            cw = cw * (1.0 + gt[:, 12:13].abs() / _sw).clamp(max=4.0)
         nw = (cw * valid).sum().clamp(min=1)
         wl = (wp_e * cw * valid).sum() / nw
         cl = (ce * valid).sum() / n * getattr(self, "EGO_CE_MULT", 1.0)
@@ -1880,8 +3077,12 @@ class DepthSegIPMNetV29(DepthSegIPMNetV28):
         import cv2
         import numpy as np
         B = flow.shape[0]
-        tgt = np.zeros((B, 2, 200, 200), np.float32)
-        msk = np.zeros((B, 1, 200, 200), np.float32)
+        # The occupancy/flow window is +-40 m at 0.4 m -> 200x200, but a
+        # rear-truncated grid gives the head fewer rows (the crop is clamped in
+        # bev_rows), so build the target at whatever the prediction actually is.
+        FH, FW = int(flow.shape[-2]), int(flow.shape[-1])
+        tgt = np.zeros((B, 2, FH, FW), np.float32)
+        msk = np.zeros((B, 1, FH, FW), np.float32)
         bx = boxes.detach().cpu().numpy()
         tj = traj.detach().cpu().numpy()
         tv = tvalid.detach().cpu().numpy()
@@ -1900,7 +3101,7 @@ class DepthSegIPMNetV29(DepthSegIPMNetV28):
                     px = xe + lx * c - wy * s
                     py = ye + lx * s + wy * c
                     pts.append([int((40 - py) / 0.4), int((40 - px) / 0.4)])
-                mm = np.zeros((200, 200), np.uint8)
+                mm = np.zeros((FH, FW), np.uint8)
                 cv2.fillPoly(mm, [np.array(pts, np.int32).reshape(-1, 1, 2)], 1)
                 tgt[b, 0][mm > 0] = vx
                 tgt[b, 1][mm > 0] = vy
@@ -1934,7 +3135,19 @@ class DepthSegIPMNetV29(DepthSegIPMNetV28):
             d1 = (p.unsqueeze(1) - g.unsqueeze(0)).abs().mean((2, 3))
             d2 = (p.unsqueeze(1) - g.flip(1).unsqueeze(0)).abs().mean((2, 3))
             cost = torch.minimum(d1, d2)                     # [M,n]
-            ri, ci = linear_sum_assignment(cost.detach().cpu().numpy())
+            # The assignment is done on CPU by scipy, which raises on a NaN or
+            # inf instead of returning a bad match -- and that kills the whole
+            # round. A non-finite cost means the lane-graph head produced
+            # non-finite points this step (fp16 overflow while a warm-started
+            # head settles: r51 died here on step 1). Fall back to a
+            # gradient-preserving zero for this sample; the caller's non-finite
+            # loss guard handles anything worse.
+            if not bool(torch.isfinite(cost.detach()).all()):
+                total = total + cost.nan_to_num(0.0, 0.0, 0.0).sum() * 0.0
+                nb += 1
+                continue
+            ri, ci = linear_sum_assignment(cost.detach().cpu()
+                                           .numpy())
             ri = torch.as_tensor(ri, device=pts.device)
             ci = torch.as_tensor(ci, device=pts.device)
             total = total + cost[ri, ci].mean()
@@ -1967,13 +3180,14 @@ class DepthSegIPMNetV30(DepthSegIPMNetV29):
         # fused-BEV smear, and predictions collapsed to the ego-forward
         # majority prior (measured: oncoming heading flips, worst at launch).
         self.traj_stem = nn.Sequential(
-            nn.Conv2d(192, 128, 3, stride=2, padding=1, bias=False),
+            nn.Conv2d(2 * BEV_CH, 128, 3, stride=2, padding=1, bias=False),
             nn.BatchNorm2d(128), nn.ReLU(inplace=True), ConvBlock(128, 128))
 
     def traj_feat(self):
         # zero residual when the slot is missing (all-zero warped feature),
         # otherwise "everything just appeared" reads as fake motion
-        valid = (self._warped0.abs().sum(1, keepdim=True) > 0).to(
+        _w0 = self._warped0[:, :16] if _EXPORT_FAST else self._warped0
+        valid = (_w0.abs().sum(1, keepdim=True) > 0).to(
             self._last_bev.dtype)
         mot = (self._last_bev - self._warped0) * valid
         self._tf = torch.cat(
@@ -2027,8 +3241,8 @@ class DepthSegIPMNetV30(DepthSegIPMNetV29):
             ni = (int(n[b]) >> 8) & 0xFF
             for k in range(nv + ni):
                 xe, ye = float(centers[b, k, 0]), float(centers[b, k, 1])
-                r = (80.0 - xe) / DET_RES
-                c = (50.0 - ye) / DET_RES
+                r = (BEV_XF - xe) / DET_RES
+                c = (BEV_YH - ye) / DET_RES
                 if not (0 <= r < DET_H and 0 <= c < DET_W):
                     continue
                 if k >= nv:                     # occluded -> ignore disk
@@ -2088,12 +3302,11 @@ class DepthSegIPMNetV31(DepthSegIPMNetV30):
             dprob.dtype)
         if d.shape[-2:] != (fh, fw):
             d = F.interpolate(d, (fh, fw), mode="nearest")
-        m = ((d > self.D_MIN) & (d < self.D_MIN + self.D_STEP * (self.D - 2))
-             ).to(dprob.dtype)
-        bins = (self.D_MIN + torch.arange(
-            self.D, device=dprob.device, dtype=dprob.dtype)
-            * self.D_STEP).view(1, D, 1, 1)
-        tri = (1.0 - (d - bins).abs() / self.D_STEP).clamp(min=0)
+        _c = self._dbins(dprob.device, dprob.dtype)
+        m = ((d > _c[0]) & (d < _c[-2])).to(dprob.dtype)
+        bins = _c.view(1, D, 1, 1)
+        _w = torch.gradient(_c)[0].clamp(min=1e-3).view(1, D, 1, 1)
+        tri = (1.0 - (d - bins).abs() / _w).clamp(min=0)
         a = torch.sigmoid(self.lid_alpha) * m
         return (1.0 - a) * dprob + a * tri
 
@@ -2131,8 +3344,8 @@ class DepthSegIPMNetV32(DepthSegIPMNetV31):
         super().__init__(*a, **k)
         self.lidar_stem = nn.Sequential(
             nn.Conv2d(4, 64, 3, padding=1), nn.ReLU(inplace=True),
-            nn.Conv2d(64, 96, 3, padding=1), nn.ReLU(inplace=True),
-            nn.Conv2d(96, 96, 1))
+            nn.Conv2d(64, BEV_CH, 3, padding=1), nn.ReLU(inplace=True),
+            nn.Conv2d(BEV_CH, BEV_CH, 1))
         nn.init.zeros_(self.lidar_stem[-1].weight)
         nn.init.zeros_(self.lidar_stem[-1].bias)
         self._lidar_bev = None
@@ -2244,14 +3457,14 @@ class DepthSegIPMNetV35(DepthSegIPMNetV34):
             for p_ in mod_.parameters():
                 p_.requires_grad_(False)
         # B2
-        self.tgate = nn.Conv2d(96 * 4, 4, 1)
+        self.tgate = nn.Conv2d(BEV_CH * 4, 4, 1)
         nn.init.zeros_(self.tgate.weight); nn.init.zeros_(self.tgate.bias)
         # B1
         self.lgq = nn.Embedding(LG_M, 256)
         dl = nn.TransformerDecoderLayer(256, 4, 512, batch_first=True,
                                         dropout=0.0)
         self.lgdec = nn.TransformerDecoder(dl, 2)
-        self.lg_in = nn.Conv2d(96, 256, 1)
+        self.lg_in = nn.Conv2d(BEV_CH, 256, 1)
         self.lg_pts2 = nn.Linear(256, LG_P * 2)
         nn.init.normal_(self.lg_pts2.weight, std=1e-3)
         with torch.no_grad():
@@ -2260,9 +3473,9 @@ class DepthSegIPMNetV35(DepthSegIPMNetV34):
             self.lg_pts2.bias.copy_((b / 30.0).reshape(-1))
         self.lg_meta2 = nn.Linear(256, 4)
         # B3
-        self.ego_q = nn.Embedding(3, 96)
-        self.ego_attn = nn.MultiheadAttention(96, 4, batch_first=True)
-        self.ego_delta = nn.Linear(3 * 96, 12 * EGO_K + EGO_K + 3)
+        self.ego_q = nn.Embedding(3, BEV_CH)
+        self.ego_attn = nn.MultiheadAttention(BEV_CH, 4, batch_first=True)
+        self.ego_delta = nn.Linear(3 * BEV_CH, 12 * EGO_K + EGO_K + 3)
         nn.init.zeros_(self.ego_delta.weight); nn.init.zeros_(self.ego_delta.bias)
         # B4 lite
         self.agent_q = nn.Embedding(4, 128)
@@ -2282,6 +3495,7 @@ class DepthSegIPMNetV35(DepthSegIPMNetV34):
                 cat.append(F.grid_sample(hb[:, i].to(bev.dtype), grid,
                                          align_corners=False))
         self._warped0 = cat[1]
+        self._prefuse_bev = bev                        # delta-stat が読む
         g = self.tgate(torch.cat(cat, 1)).softmax(1)   # [B,4,H,W]
         cat = [c * (4.0 * g[:, i:i + 1]) for i, c in enumerate(cat)]
         return bev + self.tfuse3(torch.cat(cat, 1))
@@ -2297,17 +3511,90 @@ class DepthSegIPMNetV35(DepthSegIPMNetV34):
         qa, _ = self.ego_attn(self.ego_q.weight.unsqueeze(0).expand(B, -1, -1),
                               tok, tok)
         out[7] = out[7] + self.ego_delta(qa.flatten(1))
+        if getattr(self, "sem_ego", None) is not None:
+            # 意味出力 (INT8 健全) から ego 残差。detach で painter 側と同じく
+            # 意味ヘッドの学習を汚さない。
+            _sem = torch.cat([
+                F.avg_pool2d(out[0].detach().float().softmax(1), 2),  # seg 9ch @400x250
+                out[3].detach().float().sigmoid()], 1)                # hm 2ch @400x250
+            out[7] = out[7] + self.sem_ego(_sem.to(out[7].dtype))
+        if getattr(self, "kin_gate", None) is not None and v0 is not None:
+            # v139 運動学アンカー (2026-09-02): 全 K モードの waypoint に
+            # g_t * [v0*t, 0] を加算。g_t (6 個) はゼロ初期化 = 導入時関数保存。
+            # 根拠: 0.5s 目 waypoint の縦バイアスが v0 に比例 (8-15 m/s で −10%)。
+            _t = torch.arange(1, 7, device=out[7].device, dtype=torch.float32) * 0.5
+            _cv = (v0.view(-1, 1).float() * (_t * self.kin_gate.float()).view(1, 6))  # [B,6]
+            _e = out[7].float()
+            _wp = _e[:, :12 * EGO_K].view(-1, EGO_K, 6, 2).clone()
+            _wp[..., 0] = _wp[..., 0] + _cv.view(-1, 1, 6)
+            out[7] = torch.cat([_wp.view(-1, 12 * EGO_K), _e[:, 12 * EGO_K:]], 1).to(out[7].dtype)
         # B4 lite: scene interaction token -> traj/stat features rerun
         dt = F.adaptive_avg_pool2d(self._det_feat.detach(), (25, 16))             .flatten(2).transpose(1, 2)                # [B,400,128]
         ag, _ = self.agent_attn(self.agent_q.weight.unsqueeze(0)
                                 .expand(B, -1, -1), dt, dt)
         ctx = self.agent_delta(ag.mean(1)[:, :, None, None])
         tf = self._tf[:, :256] + ctx
+        tfq = tf
+        if getattr(self, "traj_flow", None) is not None:
+            # A1: flow 場 (±40m クロップ, stride2) を traj 格子へ再配置し、
+            # ゼロ初期化 1x1 の残差として traj 入力にのみ加算 (stat は不変)。
+            _fl = out[13].detach().to(tf.dtype)
+            _cv = tf.new_zeros(tf.shape[0], 2, tf.shape[2], tf.shape[3])
+            _fr0, _ = bev_rows(40.0, -40.0)
+            _cv[:, :, _fr0 // 2:_fr0 // 2 + _fl.shape[2],
+                25:25 + _fl.shape[3]] = _fl
+            tfq = tf + self.traj_flow(_cv)
         out[9] = self.traj_head(torch.cat(
-            [tf, self._det_reg[:, 4:6].detach()], 1))
+            [tfq, self._det_reg[:, 4:6].detach()], 1))
+        if getattr(self, "traj_vel", None) is not None:
+            # A6: CV 再パラメータ化 — 各モードの waypoint に v̂*t を加算
+            _v = self.traj_vel(tfq)                       # [B,2,H,W]
+            _o9 = out[9]
+            _t = torch.arange(1, 7, device=_v.device,
+                              dtype=_v.dtype) * 0.5      # 0.5..3.0s
+            # traj GT [6,2] の (dx_i, dy_i) 交互並びに合わせて 12ch を構成
+            _cvk = torch.stack([_v[:, 0] * s for s in _t]
+                               + [_v[:, 1] * s for s in _t], 1)
+            _idx = [i for p_ in range(6) for i in (p_, 6 + p_)]
+            _cvk = _cvk[:, _idx]                          # [B,12,H,W] (x,y)交互
+            for _k in range(EGO_K):
+                _o9 = torch.cat([_o9[:, :_k * 12],
+                                 _o9[:, _k * 12:(_k + 1) * 12] + _cvk,
+                                 _o9[:, (_k + 1) * 12:]], 1)
+            out[9] = _o9
+        if getattr(self, "det_tmp", None) is not None:
+            # D7: hm へ時間特徴残差 (ゼロ初期化)
+            out[3] = out[3] + self.det_tmp(tf)
+        if getattr(self, "mode_scorer", None) is not None:
+            # E3: 各候補経路に沿った特徴でモード logit を補正
+            _p7 = out[7]
+            _B = _p7.shape[0]
+            _wk = _p7[:, :12 * EGO_K].detach().view(_B, EGO_K, 6, 2)
+            # (x 前方, y 左) [m] -> det 格子 (row = (80-x)/0.4, col = (50-y)/0.4)
+            _H2, _W2 = tfq.shape[-2:]
+            _gr = (80.0 - _wk[..., 0]) / 0.4 / max(_H2 - 1, 1) * 2 - 1
+            _gc = (50.0 - _wk[..., 1]) / 0.4 / max(_W2 - 1, 1) * 2 - 1
+            _grid = torch.stack([_gc, _gr], -1).view(_B, EGO_K * 6, 1, 2)
+            _sam = F.grid_sample(tfq.detach(), _grid.to(tfq.dtype),
+                                 align_corners=True)      # [B,256,K*6,1]
+            _sam = _sam.view(_B, 256, EGO_K, 6).mean(-1)  # [B,256,K]
+            _sc = self.mode_scorer(_sam.permute(0, 2, 1)).squeeze(-1)  # [B,K]
+            _o7 = _p7.clone()
+            _o7[:, 12 * EGO_K:12 * EGO_K + EGO_K] = \
+                _p7[:, 12 * EGO_K:12 * EGO_K + EGO_K] + _sc
+            out[7] = _o7
         out[10] = self.stat_head2(tf)
+        if getattr(self, "delta_stat", None) is not None:
+            # 時間差分ヘッド (2026-08-25): 停止判定を |bev - warp(prev_bev)|
+            # から出す。動きの信号がテンソルのレンジそのものになるため、
+            # INT8 の目盛りが動き信号で決まり「大きな DC に乗った微小 AC が
+            # 量子化で消える」構造 (stat_head2 が 5 段の対処すべてで死んだ
+            # 根本原因) が原理的に消える。
+            _d = (self._prefuse_bev - self._warped0).abs()
+            out[10] = self.delta_stat(_d)
         # B1: query-decoder lane graph replaces out[14..16]
-        roi = self._last_bev.detach()[:, :, 100:450, 125:375]
+        _r0, _r1 = bev_rows(60.0, -10.0)
+        roi = self._last_bev.detach()[:, :, _r0:_r1, 125:375]
         mem = F.adaptive_avg_pool2d(self.lg_in(roi), (22, 16))             .flatten(2).transpose(1, 2)                # [B,352,256]
         emb = self.lgdec(self.lgq.weight.unsqueeze(0).expand(B, -1, -1), mem)
         out[14] = self.lg_pts2(emb).view(B, LG_M, LG_P, 2) * 30.0             + self.lg_anchors.view(1, LG_M, 1, 2)
@@ -2330,6 +3617,17 @@ class DepthSegIPMNetV36(DepthSegIPMNetV35):
        the picked mode is 0.76 m -> selection gap 0.24 m).
     3. Time-weighted waypoints: near horizons x1.5 -> ADE-aligned."""
     EGO_CE_MULT = 2.0
+    # Reverted. Flattening this to all-ones (r56) made E2E worse on every
+    # measure -- ADE 1.162 -> 1.367 m, ADEc 1.542 -> 1.819 m, FDE 2.271 ->
+    # 2.577 m on the 240-sample slice, and monotonically worse epoch over epoch
+    # in training val (0.78 / 0.89 / 1.10). The observation that drove it was
+    # right (the +3.0 s point carries the largest error and had the smallest
+    # weight) but the remedy was not: with an absolute-error loss the far point
+    # already owns the largest gradient share by having the largest error, so
+    # flattening let it crowd out the near waypoints that actually steer. This
+    # profile is what keeps that balance. The endpoint gets its own ADDITIVE
+    # term instead (--ego-fde-w), which adds supervision without taking any
+    # away.
     EGO_TW = torch.tensor([1.5, 1.35, 1.2, 1.05, 0.95, 0.9])
 
     def __init__(self, *a, **k):
@@ -2393,12 +3691,19 @@ class DepthSegIPMNetV38(DepthSegIPMNetV37):
     0.43 m longitudinal vs 0.19 m lateral) and an auxiliary speed-profile
     head (per-horizon speed regression on the pooled BEV) shapes the
     representation the planner reads."""
-    EGO_LONG_W = 2.0
+    # 6.0, was 2.0. Measured on 120 val frames: 92 % of ADE is longitudinal
+    # (1.059 m of 1.153) and nearly all of that is a one-sided bias -- the
+    # predicted path is short by 0.127 / 0.311 / 0.546 / 0.737 / 0.895 /
+    # 1.152 m at +0.5 .. +3.0 s, while lateral error is only 0.228 m and has no
+    # such drift. The loss weighted lateral 4.0 against longitudinal 2.0, which
+    # is right about which error is dangerous and wrong about which one is
+    # actually happening: it let a systematic under-travel accumulate unpunished.
+    EGO_LONG_W = 6.0
 
     def __init__(self, *a, **k):
         super().__init__(*a, **k)
         self.risk_gate = nn.Parameter(torch.zeros(1))
-        self.vprof_head = nn.Linear(96, 6)
+        self.vprof_head = nn.Linear(BEV_CH, 6)
         nn.init.zeros_(self.vprof_head.weight)
         nn.init.zeros_(self.vprof_head.bias)
 
@@ -2451,7 +3756,7 @@ class DepthSegIPMNetV39(DepthSegIPMNetV38):
     behaviour at start."""
     def __init__(self, *a, **k):
         super().__init__(*a, **k)
-        self.dec_head = nn.Linear(96, 36)      # [3 modes x (6 phi + 6 v)]
+        self.dec_head = nn.Linear(BEV_CH, 36)  # [3 modes x (6 phi + 6 v)]
         nn.init.zeros_(self.dec_head.weight)
         with torch.no_grad():
             b = torch.zeros(36)
@@ -2557,7 +3862,7 @@ class BEVSegRefiner(nn.Module):
             # encode x/80 in [~-1,1], broadcast across columns so the net
             # knows where the ~50 m dropout boundary sits
             x = (BEV_XH - (torch.arange(h, device=device, dtype=dtype) + 0.5)
-                 * (2 * BEV_XH / h)) / BEV_XH
+                 * ((BEV_XF + BEV_XR) / h)) / BEV_XF
             c = x.view(1, 1, h, 1).expand(1, 1, h, w).contiguous()
             self._rng_cache[key] = c
         return c
@@ -2635,7 +3940,7 @@ class BEVBoxRefiner(nn.Module):
         c = self._rng.get((h, w, device, dtype))
         if c is None:
             x = (BEV_XH - (torch.arange(h, device=device, dtype=dtype) + 0.5)
-                 * (2 * BEV_XH / h)) / BEV_XH
+                 * ((BEV_XF + BEV_XR) / h)) / BEV_XF
             c = x.view(1, 1, h, 1).expand(1, 1, h, w).contiguous()
             self._rng[(h, w, device, dtype)] = c
         return c
@@ -2671,7 +3976,7 @@ class E2ERefiner(nn.Module):
     correction on the waypoints. Zero-init last layer => identity at start,
     so the base planner's ADE is preserved and can only improve."""
 
-    def __init__(self, ego_dim, k=EGO_K, ctx_ch=96, hidden=256, max_res=3.0):
+    def __init__(self, ego_dim, k=EGO_K, ctx_ch=BEV_CH, hidden=256, max_res=3.0):
         super().__init__()
         self.k = k
         self.max_res = max_res           # bound the waypoint correction (m)
@@ -2738,7 +4043,7 @@ class BEVDenseRefiner(nn.Module):
         c = self._rng.get((h, w, device, dtype))
         if c is None:
             x = (BEV_XH - (torch.arange(h, device=device, dtype=dtype) + 0.5)
-                 * (2 * BEV_XH / h)) / BEV_XH
+                 * ((BEV_XF + BEV_XR) / h)) / BEV_XF
             c = x.view(1, 1, h, 1).expand(1, 1, h, w).contiguous()
             self._rng[(h, w, device, dtype)] = c
         return c
@@ -2966,6 +4271,11 @@ class DepthSegIPMNetV40(DepthSegIPMNetV39):
                                    warp_theta, lidar=lidar,
                                    lidar_bev=lidar_bev, kin=kin, intent=intent))
         B = out[0].shape[0]
+        if os.environ.get("METEOR_NOREF") == "1":
+            # diagnostic export switch: price the built-in refiner on the
+            # target device (its fp16-era measurement said latency-free; the
+            # INT8 profile's ~20 ms of elementwise Myelin chains say check)
+            return tuple(out)
         v0r = v0 if v0 is not None else out[0].new_zeros(B)
         r = self.refiner(seg=out[0].float(), hm=out[3].float(),
                          reg=out[4].float(), ego=out[7].float(),
@@ -3027,7 +4337,14 @@ class DepthSegIPMNetV41(DepthSegIPMNetV40):
         up-weights far positives (BOX_FAR_W), so distant vehicles -- small in
         BEV and camera-sparse -- are pushed harder (recall was the weak point).
     """
-    BOX_FAR_W = 2.0                       # extra weight on far-range box GT
+    # 3.0, was 2.0. Measured on val: vehicle recall is 0.564 / 0.402 / 0.356 /
+    # 0.089 over 0-20 / 20-40 / 40-60 / 60-80 m, and the far range is not a
+    # sensing limit -- zeroing the two NARROW cameras drops 40-60 m recall from
+    # 0.34 to 0.04, so those detections come almost entirely from the telephoto
+    # pair and the evidence is there. Restricting the GT to boxes with >= 40
+    # LiDAR points lifts 40-60 m recall to 0.44, i.e. a large share of the
+    # misses are boxes the sensors never saw. What is left is worth pushing on.
+    BOX_FAR_W = 4.0                       # extra weight on far-range box GT
 
     def __init__(self, *a, **k):
         super().__init__(*a, **k)
@@ -3096,7 +4413,7 @@ class DepthSegIPMNetV43(DepthSegIPMNetV42):
     def __init__(self, *a, **k):
         super().__init__(*a, **k)
         self.intent_mlp = nn.Sequential(
-            nn.Linear(96 + 3, 64), nn.ReLU(),
+            nn.Linear(BEV_CH + 3, 64), nn.ReLU(),
             nn.Linear(64, 12 * EGO_K + EGO_K + 3))
         nn.init.zeros_(self.intent_mlp[-1].weight)
         nn.init.zeros_(self.intent_mlp[-1].bias)
@@ -3121,7 +4438,18 @@ class DepthSegIPMNetV43(DepthSegIPMNetV42):
         """Command-consistency hinge: the (softmax-soft) selected mode's
         final lateral displacement must agree with the commanded direction.
         intent [B,3] one-hot (straight,left,right); rows dropped to zero by
-        the training dropout contribute nothing."""
+        the training dropout contribute nothing.
+
+        `margin` is the whole strength of the counterfactual signal and must
+        be set from the acceptance bar, not left at a token value. The hinge
+        is EXACTLY ZERO once the commanded mode reaches `margin` metres in the
+        commanded direction, so margin=1.5 caps the achievable command spread
+        at ~3 m however long it trains -- measured on r48 ep0: spread 1.24 m,
+        sign reversal 20 %/4 % against a 5 m / 60 % bar. Meanwhile the same
+        mode keeps taking waypoint gradients toward the real (opposite)
+        manoeuvre from the 85 % of correctly-commanded rows, so the
+        equilibrium sits at or below the margin. Pass margin >= half the
+        required spread (r48: 3.5)."""
         B = ego_pred.shape[0]
         e = ego_pred.float()
         wp = e[:, :12 * EGO_K].view(B, EGO_K, 6, 2)
@@ -3214,9 +4542,15 @@ class DepthSegIPMNetV45(DepthSegIPMNetV44):
         super().__init__(*a, **k)
         self.quant_noise = 0.0
         self.bev_dropblock = 0.0       # r46: MAE-like BEV block masking
+        self.bev_wedgedrop = 0.0       # 2026-08-30: 角度セクタ欠損の模擬
         self.fuse.register_forward_hook(self._qnoise_hook)
         self.tfuse3.register_forward_hook(self._qnoise_hook)
         self.tfuse3.register_forward_hook(self._dropblock_hook)
+        self.tfuse3.register_forward_hook(self._wedgedrop_hook)
+        self.bev_ringdrop = 0.0        # 2026-08-30: 距離帯リング零化
+        self.bev_chandrop = 0.0        # 2026-08-30: チャネルドロップ
+        self.tfuse3.register_forward_hook(self._ringdrop_hook)
+        self.tfuse3.register_forward_hook(self._chandrop_hook)
 
     def _qnoise_hook(self, module, inp, out):
         if not self.training or self.quant_noise <= 0:
@@ -3248,8 +4582,69 @@ class DepthSegIPMNetV45(DepthSegIPMNetV44):
                 m[b, :, r0:r0 + bh, c0:c0 + bw] = 0
         return out * m if hit else None
 
+    def _wedgedrop_hook(self, module, inp, out):
+        """極座標くさびドロップ (2026-08-30): 自車を原点に 40-90° の角度
+        セクタを BEV 特徴ごと零化し、カメラ 1 本分の視野欠損を特徴レベルで
+        模擬する。入力レベルの cam-drop と違い、塗り込み済み LiDAR 特徴や
+        時間メモリ経由の残存も含めて「その方角が見えない」状態を作る。
+        GT は完全なまま = 周辺文脈と時間記憶からの補完を学習させる。
+        train のみ、サンプル毎確率 = self.bev_wedgedrop。"""
+        if not self.training or getattr(self, "bev_wedgedrop", 0) <= 0:
+            return None
+        B, _, H, W = out.shape
+        dev = out.device
+        ys = torch.arange(H, device=dev, dtype=torch.float32) - (H - 1) / 2
+        xs = torch.arange(W, device=dev, dtype=torch.float32) - (W - 1) / 2
+        ang = torch.atan2(ys[:, None], xs[None, :])          # [-pi, pi]
+        m = torch.ones(B, 1, H, W, device=dev, dtype=out.dtype)
+        hit = False
+        for b in range(B):
+            if torch.rand(()) >= self.bev_wedgedrop:
+                continue
+            hit = True
+            c = (torch.rand(()) * 2 - 1) * torch.pi          # 中心角
+            half = torch.deg2rad(20 + torch.rand(()) * 25)   # 半幅 20-45°
+            d = (ang - c + torch.pi) % (2 * torch.pi) - torch.pi
+            m[b, 0][d.abs() < half] = 0
+        return out * m if hit else None
+
+    def _ringdrop_hook(self, module, inp, out):
+        """距離帯リング零化 (2026-08-30): 自車からの距離 r0..r0+w の帯を
+        BEV 特徴ごと零化。遠方ヘッドに「手前が見えない」補完を、近傍
+        ヘッドに「中間帯の欠損」への頑健性を要求する。GT は完全なまま。
+        train のみ、サンプル毎確率 = self.bev_ringdrop。"""
+        if not self.training or getattr(self, "bev_ringdrop", 0) <= 0:
+            return None
+        B, _, H, W = out.shape
+        dev = out.device
+        ys = torch.arange(H, device=dev, dtype=torch.float32) - (H - 1) / 2
+        xs = torch.arange(W, device=dev, dtype=torch.float32) - (W - 1) / 2
+        rr = torch.sqrt(ys[:, None] ** 2 + xs[None, :] ** 2)
+        rmax = rr.max()
+        m = torch.ones(B, 1, H, W, device=dev, dtype=out.dtype)
+        hit = False
+        for b in range(B):
+            if torch.rand(()) >= self.bev_ringdrop:
+                continue
+            hit = True
+            r0 = torch.rand(()) * rmax * 0.7                 # 内径 0-70%
+            w = (0.08 + torch.rand(()) * 0.12) * rmax        # 幅 8-20%
+            m[b, 0][(rr >= r0) & (rr < r0 + w)] = 0
+        return out * m if hit else None
+
+    def _chandrop_hook(self, module, inp, out):
+        """BEV チャネルドロップ (2026-08-30): tfuse3 出力のチャネルを
+        SpatialDropout 風にサンプル毎へ確率 self.bev_chandrop で零化
+        (面ではなく特徴軸の冗長性を強制)。生存チャネルは 1/(1-p) 補償。"""
+        if not self.training or getattr(self, "bev_chandrop", 0) <= 0:
+            return None
+        p = float(self.bev_chandrop)
+        B, C, _, _ = out.shape
+        keep = (torch.rand(B, C, 1, 1, device=out.device) >= p).to(out.dtype)
+        return out * keep / (1.0 - p)
+
     @staticmethod
-    def stat_loss(stat, boxes, nbox, traj, tvalid):
+    def stat_loss(stat, boxes, nbox, traj, tvalid, margin=0.0):
         """r46 stationary supervision v2: paint the label over the WHOLE
         rotated box footprint on the det grid (v26 used only the centre
         cell -> ~20x sparser signal), keep the 0.35-0.8 m creep dead-band,
@@ -3267,8 +4662,8 @@ class DepthSegIPMNetV45(DepthSegIPMNetV44):
                 xe, ye = float(boxes[b, k, 1]), float(boxes[b, k, 2])
                 l_ = float(boxes[b, k, 3]); w_ = float(boxes[b, k, 4])
                 yaw = float(boxes[b, k, 5]) if boxes.shape[2] > 5 else 0.0
-                rc = (80.0 - xe) / DET_RES
-                cc = (50.0 - ye) / DET_RES
+                rc = (BEV_XF - xe) / DET_RES
+                cc = (BEV_YH - ye) / DET_RES
                 half = max(l_, w_) / (2 * DET_RES) + 1
                 r0, r1 = int(max(0, rc - half)), int(min(DET_H, rc + half + 1))
                 c0, c1 = int(max(0, cc - half)), int(min(DET_W, cc + half + 1))
@@ -3293,7 +4688,14 @@ class DepthSegIPMNetV45(DepthSegIPMNetV44):
         w_pos = min(max(n_neg / max(n_pos, 1.0), 0.5), 4.0)
         w = torch.where(target > 0.5, torch.full_like(target, w_pos),
                         torch.ones_like(target))
-        return F.binary_cross_entropy_with_logits(logits, target, weight=w)
+        loss = F.binary_cross_entropy_with_logits(logits, target, weight=w)
+        if margin > 0:
+            # stationary=+1, moving=-1. BCE gets the class right; this term
+            # additionally keeps correct logits away from the zero threshold,
+            # where one INT8 rounding step can flip the deployed decision.
+            signed = target.mul(2.0).sub(1.0) * logits
+            loss = loss + F.relu(float(margin) - signed).mean()
+        return loss
 
 
 class DepthSegIPMNetV46(DepthSegIPMNetV45):
@@ -3310,8 +4712,8 @@ class DepthSegIPMNetV46(DepthSegIPMNetV45):
         super().__init__(*a, **k)
         self.sdmap_stem = nn.Sequential(
             nn.Conv2d(4, 48, 3, padding=1), nn.ReLU(inplace=True),
-            nn.Conv2d(48, 96, 3, padding=1), nn.ReLU(inplace=True),
-            nn.Conv2d(96, 96, 1))
+            nn.Conv2d(48, BEV_CH, 3, padding=1), nn.ReLU(inplace=True),
+            nn.Conv2d(BEV_CH, BEV_CH, 1))
         nn.init.zeros_(self.sdmap_stem[-1].weight)
         nn.init.zeros_(self.sdmap_stem[-1].bias)
         self._sdmap = None
@@ -3414,10 +4816,10 @@ class DepthSegIPMNetV48(DepthSegIPMNetV47):
     def __init__(self, *a, **k):
         super().__init__(*a, **k)
         self.pl_head = nn.Sequential(
-            nn.Conv2d(96, 96, 3, stride=2, padding=1, bias=False),
-            nn.BatchNorm2d(96), nn.ReLU(inplace=True),
-            ConvBlock(96, 96),
-            nn.Conv2d(96, 4, 1))
+            nn.Conv2d(BEV_CH, BEV_CH, 3, stride=2, padding=1, bias=False),
+            nn.BatchNorm2d(BEV_CH), nn.ReLU(inplace=True),
+            ConvBlock(BEV_CH, BEV_CH),
+            nn.Conv2d(BEV_CH, 4, 1))
         self.pl_feed = False       # inference switch (or pl_feed= per call)
         self.pl_feed_p = 1.0       # train: fraction of eligible samples fed
         self._pl_want = False
@@ -3451,7 +4853,7 @@ class DepthSegIPMNetV48(DepthSegIPMNetV47):
                 if self._lidar_bev is None:
                     self._lidar_bev = pl
                 else:                        # real sweep wins per sample
-                    real = self._lidar_bev.to(pl.dtype)
+                    real = crop_rows(self._lidar_bev, pl.shape[-2]).to(pl.dtype)
                     has = (real.abs().sum((1, 2, 3), keepdim=True) > 0
                            ).to(pl.dtype)
                     self._lidar_bev = real * has + pl * (1 - has)
@@ -3499,6 +4901,752 @@ class DepthSegIPMNetV48(DepthSegIPMNetV47):
         return tuple(out) + (self._pl_raw,)      # out[18] = pseudo-LiDAR
 
 
+SIG_FLOOR = 0.8        # metres; must match RegDepthHead's own lower bound
+
+
+class RegDepthHead(nn.Module):
+    """Regression depth head: 2 channels for the existing seam + a per-pixel
+    kernel width stashed on the side.
+
+    The base forward does `dlog.softmax(1)` and hands the result to the lift, so
+    the head has to keep emitting something softmax-able. Channel 0 after the
+    softmax is read as a normalised depth p in (0,1). The width cannot ride in
+    the same tensor without softmax coupling it to the depth (a confident close
+    range would be forced to a wide kernel), so it is produced by its own 1x1
+    and stashed for project_bev to pick up. One global sigma made the lift smear
+    -- the depth panel of the distilled model reads visibly softer than the
+    64-bin one -- so it is per pixel here.
+    """
+
+    def __init__(self, cin, width=128):
+        super().__init__()
+        self.body = ConvBlock(cin, width)
+        self.mu = nn.Conv2d(width, 2, 1)
+        self.sig = nn.Conv2d(width, 1, 1)
+        nn.init.zeros_(self.sig.weight)
+        nn.init.constant_(self.sig.bias, 0.0)      # sigmoid(0) -> mid range
+        self.sigma_map = None
+
+    def forward(self, x):
+        h = self.body(x)
+        # 0.8 .. 6.8 m, differentiable, always positive. The lower bound was
+        # 0.3 m and r51 spent 2.0 % of its steps skipping a non-finite loss with
+        # NaNs surfacing in the RL reward and the pseudo-LiDAR metric: at 0.3 m
+        # the lift weight exp(-(d-mu)^2 / 2 sigma^2) has a 1/0.18 factor in the
+        # exponent, so a single badly-placed cell overflows fp16 and the whole
+        # step is thrown away. 0.8 m still resolves a lane line at 0.2 m cells.
+        self.sigma_map = SIG_FLOOR + 6.0 * torch.sigmoid(
+            self.sig(h).float())
+        return self.mu(h)
+
+
+class DepthSegIPMNetV50(DepthSegIPMNetV48):
+    """v50: depth as a 0-1 REGRESSION instead of a 64-bin distribution.
+
+    Measured motivation: the depth head is 3.29M parameters and 10.80 ms of the
+    80.6 ms forward (and the top six individual layers of the TensorRT engine),
+    while the lift then samples all 64 channels only to gather two of them.
+    A regression head is 0.33M / 1.20 ms (9x) and the lift samples ONE channel.
+
+    The head keeps the existing seam: it emits 2 channels, the base forward
+    softmaxes them, and channel 0 is read as a normalised depth p in (0,1) ->
+    mu = D_MIN + p * span. The lift weight becomes a Gaussian around mu with a
+    LEARNED width, so the head can still express "far and uncertain" the way the
+    64-bin histogram could.
+
+    It cannot be trained on depth GT alone: the BEV feature it produces feeds
+    all twelve heads, and matching depth error does not mean matching features.
+    bevlane/distill_depth.py trains it to reproduce the frozen model's BEV
+    feature, which is the thing the other heads actually consume.
+    """
+
+    def __init__(self, *a, **k):
+        super().__init__(*a, **k)
+        cin = self.depth_head[0][0].in_channels
+        self.depth_head = RegDepthHead(cin, 128)
+        # Fallback width for checkpoints distilled before the per-pixel sigma
+        # existed. A BUFFER, not a Parameter: once sigma_map is in use nothing
+        # reads it, and a Parameter with no gradient is exactly what DDP refuses
+        # to tolerate (it killed r51 before step 1).
+        self.register_buffer("log_sigma", torch.tensor(0.4055))   # 1.5 m
+        self.depth_regr = True
+
+    def project_bev(self, dprob, ctx, K, T_cam_ego, B, N, H, W):
+        if not getattr(self, "depth_regr", False):
+            return super().project_bev(dprob, ctx, K, T_cam_ego, B, N, H, W)
+        if getattr(self, "frustum_lift", False) and not self.training:
+            # This override used to skip the frustum path entirely, so the v50
+            # engine ran a DENSE lift and came out at 58.2 ms against the
+            # v48+frustum engine's 40.8 ms -- the regression head's saving was
+            # swamped by giving back the 21 ms the frustum restriction had won.
+            return self._project_bev_frustum_regr(dprob, ctx, K, T_cam_ego,
+                                                  B, N, H, W)
+        Cc = ctx.shape[1]
+        pts = self.bev_pts
+        G2 = pts.shape[0]
+        pc = torch.matmul(T_cam_ego.reshape(B * N, 4, 4),
+                          pts.t().unsqueeze(0).expand(B * N, 4, G2))
+        x, y, z = pc[:, 0], pc[:, 1], pc[:, 2]
+        Kf = K.reshape(B * N, 3, 3)
+        zc = z.clamp(min=0.5)
+        u = Kf[:, 0, 0].unsqueeze(-1) * x / zc + Kf[:, 0, 2].unsqueeze(-1)
+        v = Kf[:, 1, 1].unsqueeze(-1) * y / zc + Kf[:, 1, 2].unsqueeze(-1)
+        dist = torch.sqrt(x * x + y * y + z * z)
+        valid = ((z > 0.5) & (u >= 0) & (u < W) & (v >= 0) & (v < H)
+                 & (dist < 90.0))
+        gu = (u / (W - 1) * 2 - 1).clamp(-2, 2)
+        gv = (v / (H - 1) * 2 - 1).clamp(-2, 2)
+        grid = torch.stack([gu, gv], -1).unsqueeze(2)
+        ctx_s = F.grid_sample(ctx, grid, align_corners=False).squeeze(-1)
+        # ONE channel instead of 64
+        p = F.grid_sample(dprob[:, :1], grid,
+                          align_corners=False).squeeze(-1).squeeze(1)
+        span = (self.D - 1) * self.D_STEP
+        mu = self.D_MIN + p * span
+        sm = getattr(self.depth_head, "sigma_map", None)
+        if sm is None:
+            sig = self.log_sigma.exp().clamp(0.3, 20.0).to(mu.dtype)
+        else:                       # per-pixel width, sampled like the depth
+            # grid_sample pads with ZEROS, so every BEV cell that projects
+            # outside its camera reads sigma = 0, and 2*sigma*sigma = 0 turns
+            # the exponent into 0/0 -> NaN whenever dist happens to equal mu to
+            # fp16 resolution. Those cells are masked out a line later, but
+            # 0 * NaN is NaN, so the mask cannot clean it: one such cell NaNs
+            # the whole BEV feature through the encoder's convolutions and BN,
+            # and the step is discarded. That was 2 % of every step of r51 and
+            # r52 (measured: "lift: wgt 2/6400000 non-finite" with ctx, mu and
+            # sig all clean). Raising the head's own floor did nothing because
+            # the zero comes from the padding, not from the head.
+            sig = F.grid_sample(sm.to(ctx.dtype), grid,
+                                align_corners=False).squeeze(-1).squeeze(1)
+            sig = sig.clamp(min=SIG_FLOOR)
+        _nanchk("lift: ctx", ctx)
+        _nanchk("lift: ctx_s (sampled)", ctx_s)
+        _nanchk("lift: mu", mu)
+        _nanchk("lift: sig", sig)
+        wgt = (torch.exp(-((dist - mu) ** 2) / (2 * sig * sig))
+               + 0.05).unsqueeze(1)
+        wgt = wgt * valid.unsqueeze(1).to(wgt.dtype)
+        _nanchk("lift: wgt", wgt)
+        num = (ctx_s.view(B, N, Cc, G2) * wgt.view(B, N, 1, G2)).sum(1)
+        den = wgt.view(B, N, 1, G2).sum(1).clamp(min=1e-4)
+        _nanchk("lift: num", num)
+        _nanchk("lift: den", den)
+        return _nanchk("lift: out",
+                       (num / den).view(B, Cc, BEV_H, BEV_W))
+
+    def _project_bev_frustum_regr(self, dprob, ctx, K, T_cam_ego, B, N, H, W):
+        """Frustum-restricted lift with the regression depth weight."""
+        Cc = ctx.shape[1]
+        pts = self.bev_pts
+        G2 = pts.shape[0]
+        pc = torch.matmul(T_cam_ego.reshape(B * N, 4, 4),
+                          pts.t().unsqueeze(0).expand(B * N, 4, G2))
+        x, y, z = pc[:, 0], pc[:, 1], pc[:, 2]
+        Kf = K.reshape(B * N, 3, 3)
+        zc = z.clamp(min=0.5)
+        u = Kf[:, 0, 0].unsqueeze(-1) * x / zc + Kf[:, 0, 2].unsqueeze(-1)
+        v = Kf[:, 1, 1].unsqueeze(-1) * y / zc + Kf[:, 1, 2].unsqueeze(-1)
+        dist = torch.sqrt(x * x + y * y + z * z)
+        valid = ((z > 0.5) & (u >= 0) & (u < W) & (v >= 0) & (v < H)
+                 & (dist < 90.0))
+        gu = (u / (W - 1) * 2 - 1).clamp(-2, 2)
+        gv = (v / (H - 1) * 2 - 1).clamp(-2, 2)
+        grid = torch.stack([gu, gv], -1)
+        key = (int(K.data_ptr()), int(T_cam_ego.data_ptr()), B * N, H, W,
+               float(K.reshape(-1)[0]), float(T_cam_ego.reshape(-1)[3]))
+        idx = self._frustum_idx(valid, key)
+        span = (self.D - 1) * self.D_STEP
+        sm = getattr(self.depth_head, "sigma_map", None)
+        num = torch.zeros(B, Cc, G2, device=ctx.device, dtype=ctx.dtype)
+        den = torch.zeros(B, 1, G2, device=ctx.device, dtype=ctx.dtype)
+        for i in range(B * N):
+            ii = idx[i]
+            if ii.numel() == 0:
+                continue
+            g = grid[i].index_select(0, ii).view(1, -1, 1, 2).to(ctx.dtype)
+            cs = F.grid_sample(ctx[i:i + 1], g,
+                               align_corners=False).squeeze(-1)
+            p = F.grid_sample(dprob[i:i + 1, :1], g,
+                              align_corners=False).view(1, 1, -1)
+            mu = self.D_MIN + p * span
+            if sm is None:
+                sig = self.log_sigma.exp().clamp(0.3, 20.0).to(mu.dtype)
+            else:
+                # same zero-padding trap as the dense path: sigma = 0 outside
+                # the image makes the exponent 0/0
+                sig = F.grid_sample(sm[i:i + 1].to(ctx.dtype), g,
+                                    align_corners=False).view(1, 1, -1)
+                sig = sig.clamp(min=SIG_FLOOR)
+            d_ = dist[i].index_select(0, ii).view(1, 1, -1)
+            w = torch.exp(-((d_ - mu) ** 2) / (2 * sig * sig)) + 0.05
+            num[i // N].index_add_(1, ii, (cs * w)[0].to(num.dtype))
+            den[i // N].index_add_(1, ii, w[0].to(den.dtype))
+        return (num / den.clamp(min=1e-4)).view(B, Cc, BEV_H, BEV_W)
+
+    def bev_extra(self, bev):
+        return _nanchk("after bev_extra", super().bev_extra(
+            _nanchk("into bev_extra", bev)))
+
+    def temporal_fuse(self, bev):
+        return _nanchk("after temporal_fuse", super().temporal_fuse(
+            _nanchk("into temporal_fuse", bev)))
+
+    def depth_metres(self, dlog):
+        """Predicted distance in metres, for the depth GT loss / demos."""
+        p = dlog.softmax(1)[:, :1]
+        return self.D_MIN + p * ((self.D - 1) * self.D_STEP)
+
+    def depth_loss(self, dlog, depth_gt):
+        """L1 in metres, plus a gradient-matching term.
+
+        The inherited loss is a cross-entropy over 64 bins and does not apply to
+        a regression head. Plain L1 alone gives the smooth, low-contrast depth
+        the distilled model produces, so the image-gradient term is added: it
+        penalises a prediction that is flatter than the GT across edges, which
+        is exactly the sharpness the bin histogram used to provide."""
+        d = self.depth_metres(dlog.flatten(0, 1)).squeeze(1)
+        g = depth_gt.flatten(0, 1).to(d.dtype)
+        m = (g > 0.5) & (g < 90.0)
+        if not m.any():
+            return d.sum() * 0.0
+        l1 = ((d - g).abs() * m).sum() / m.sum()
+        # First differences along both axes, on cells where both ends are valid.
+        # MEASURED FAILURE: at weight 0.5 against an L1 that was itself divided
+        # by 10, this term took over and depth MAE went 3.10 -> 31.37 m while the
+        # predicted distance drifted +30 m as a block (r51). The term is scale
+        # invariant -- it constrains contrast, not distance -- so it must stay a
+        # small correction. It is now normalised by the GT gradient so a big step
+        # edge cannot dominate, and weighted 0.05 against an unscaled L1.
+        def grad(t):
+            return (t[:, :, 1:] - t[:, :, :-1], t[:, 1:] - t[:, :-1])
+        dx, dy = grad(d)
+        gx, gy = grad(g)
+        mx = m[:, :, 1:] & m[:, :, :-1]
+        my = m[:, 1:] & m[:, :-1]
+        rx = ((dx - gx).abs() / (gx.abs() + 1.0) * mx).sum() \
+            / mx.sum().clamp(min=1)
+        ry = ((dy - gy).abs() / (gy.abs() + 1.0) * my).sum() \
+            / my.sum().clamp(min=1)
+        return l1 / 10.0 + 0.05 * (rx + ry)
+
+    def forward(self, *a, **k):
+        """The base forward reshapes the depth output to [B,N,D,h,w] with
+        D = 64. This head emits 2 channels, so out[1] is re-formed here as the
+        per-pixel distance in metres -- which is what a regression head means
+        and what the demo's depth panel wants anyway."""
+        D0 = self.D
+        try:
+            self.D = 2                      # so the base view() matches
+            out = list(super().forward(*a, **k))
+        finally:
+            self.D = D0
+        d = out[1]                          # [B,N,2,h,w] softmax-able logits
+        B, N = d.shape[:2]
+        out[1] = self.depth_metres(d.reshape(B * N, 2, *d.shape[-2:])) \
+            .reshape(B, N, 1, *d.shape[-2:])
+        return tuple(out)
+
+
+class DepthSegIPMNetV49(DepthSegIPMNetV48):
+    """v49 (r50): BEV seg decoder at HALF the internal width.
+
+    Measured on the deployed graph: the decoder is 11.51 ms of the 31.8 ms INT8
+    engine, and 9 output classes did not need 64/192/320 channels -- halving
+    them is 4.10M -> 1.06M parameters and 7.72 -> 3.28 ms at 800x500 (2.35x).
+    Nothing else changes: the SHARED 96-channel BEV feature that the other
+    eleven tasks read is untouched, so this round isolates the seg-only cost.
+    The decoder is shape-mismatched against v48 checkpoints and is therefore
+    re-initialised on warm start, which is the point of the experiment: how
+    many epochs it takes to recover.
+    """
+
+    def __init__(self, *a, **k):
+        super().__init__(*a, **k)
+        n_cls = self.dec.out[-1].out_channels
+        self.dec = LaneDecED(BEV_CH, n_cls, w=0.5)
+
+
+
+_NAN_PROBE = bool(os.environ.get("METEOR_NAN_PROBE"))
+
+
+def _nanchk(tag, t):
+    """Name the first tensor in the BEV path that goes non-finite.
+
+    r51 and r52 both threw away ~2 % of their steps to a non-finite loss, and
+    the loss is accumulated over 26 sites so its value identifies nothing. The
+    output scan added to train.py narrowed it down: every BEV-space output is
+    100 % non-finite while every image-space output is clean, so the corruption
+    is between ctx and the fused BEV. This walks that stretch. Costs a device
+    sync per call, so it is off unless METEOR_NAN_PROBE is set.
+    """
+    if not _NAN_PROBE or not torch.is_tensor(t):
+        return t
+    d = t.detach()
+    fin = torch.isfinite(d)
+    if not bool(fin.all()):
+        ok = d[fin]
+        mx = float(ok.abs().max()) if ok.numel() else float("nan")
+        print(f"[nan] {tag}: {int((~fin).sum())}/{d.numel()} non-finite, "
+              f"largest finite magnitude {mx:.4g}", flush=True)
+    return t
+
+
+class DepthSegIPMNetV51(DepthSegIPMNetV50):
+    """v50 with the BEV lift run on a HALF-resolution grid, output unchanged.
+
+    The lift is the single biggest cost in the engine. Measured on the INT8
+    engine, the fused block that holds the depth head and the lift is 12.11 of
+    30.7 ms, and a PyTorch breakdown puts 3.67 ms of that on the lift against
+    1.24 ms on the depth head -- so the lift alone is roughly 9 ms, 29 % of the
+    whole network. Its cost is set by the number of (camera, BEV cell) pairs,
+    which falls 4x when the grid goes from 0.2 m to 0.4 m: measured 3.67 -> 1.45
+    ms, 2.53x.
+
+    Nothing downstream changes. The lifted feature is bilinearly resampled back
+    to the full grid immediately, so every head sees exactly the tensor shape it
+    saw before and no other module needs touching. What is actually lost is
+    lift-time spatial precision: two 0.2 m cells that used to sample the image
+    separately now share one sample. Thin classes (laneline is 0.12 IoU already)
+    are where that will show, and it has to be measured, not assumed.
+    """
+
+    # Overridable: the Orin profile puts ~51 % of the engine in the lift's
+    # Myelin cluster, and its cost scales with the (camera, cell) pair count.
+    # DIV 2 = 0.4 m (default); METEOR_LIFT_DIV=4 lifts at 0.8 m -> quarter the
+    # pairs. The 0.2 -> 0.4 move cost -0.003 mIoU without retraining, so 4 is
+    # the same bet one step further -- priced before any round is spent on it.
+    LIFT_DIV = int(os.environ.get("METEOR_LIFT_DIV", "2"))
+
+    def __init__(self, *a, **k):
+        super().__init__(*a, **k)
+        d = self.LIFT_DIV
+        self.lift_h, self.lift_w = BEV_H // d, BEV_W // d
+        xs = torch.linspace(BEV_XH - BEV_RES * d / 2,
+                            -BEV_XH + BEV_RES * d / 2, self.lift_h)
+        ys = torch.linspace(BEV_YH - BEV_RES * d / 2,
+                            -BEV_YH + BEV_RES * d / 2, self.lift_w)
+        gx, gy = torch.meshgrid(xs, ys, indexing="ij")
+        n = self.lift_h * self.lift_w
+        self.register_buffer("bev_pts",
+                             torch.stack([gx.reshape(-1), gy.reshape(-1),
+                                          torch.zeros(n), torch.ones(n)], 1),
+                             persistent=False)
+
+    def project_bev(self, dprob, ctx, K, T_cam_ego, B, N, H, W):
+        import bevlane.model as _M
+        oh, ow = _M.BEV_H, _M.BEV_W
+        _M.BEV_H, _M.BEV_W = self.lift_h, self.lift_w
+        try:
+            bev = super().project_bev(dprob, ctx, K, T_cam_ego, B, N, H, W)
+        finally:
+            _M.BEV_H, _M.BEV_W = oh, ow
+        return F.interpolate(bev, size=(oh, ow), mode="bilinear",
+                             align_corners=False)
+
+
+
+class DepthSegIPMNetV52(DepthSegIPMNetV48):
+    """v48's 64-bin classification depth, lifted on the 0.4 m grid.
+
+    The regression depth head (v50) was adopted to make the lift cheap: it
+    samples ONE channel per (camera, cell) pair instead of the 64-bin
+    histogram, worth 11.5 ms of PyTorch forward. But it has cost two things.
+    It drifts -- a uniform shift of all depths is very nearly a flat direction
+    of the BEV objective, so every round so far has walked depth MAE from
+    3.1 m out to 13-28 m and needed the head swapped back afterwards. And it is
+    blurrier: image-gradient magnitude 0.424 against the 64-bin head's 0.547,
+    where the LiDAR GT is 0.644.
+
+    Once the lift runs on the 0.4 m grid there are 4x fewer pairs, so the
+    64-bin sampling costs 4x less than it used to. This variant exists to
+    measure whether that makes classification affordable again.
+    """
+
+    LIFT_DIV = int(os.environ.get("METEOR_LIFT_DIV", "2"))
+
+    def __init__(self, *a, **k):
+        super().__init__(*a, **k)
+        d = self.LIFT_DIV
+        self.lift_h, self.lift_w = BEV_H // d, BEV_W // d
+        xs = torch.linspace(BEV_XH - BEV_RES * d / 2,
+                            -BEV_XH + BEV_RES * d / 2, self.lift_h)
+        ys = torch.linspace(BEV_YH - BEV_RES * d / 2,
+                            -BEV_YH + BEV_RES * d / 2, self.lift_w)
+        gx, gy = torch.meshgrid(xs, ys, indexing="ij")
+        n = self.lift_h * self.lift_w
+        self.register_buffer("bev_pts",
+                             torch.stack([gx.reshape(-1), gy.reshape(-1),
+                                          torch.zeros(n), torch.ones(n)], 1),
+                             persistent=False)
+
+    def project_bev(self, dprob, ctx, K, T_cam_ego, B, N, H, W):
+        import bevlane.model as _M
+        oh, ow = _M.BEV_H, _M.BEV_W
+        _M.BEV_H, _M.BEV_W = self.lift_h, self.lift_w
+        try:
+            bev = super().project_bev(dprob, ctx, K, T_cam_ego, B, N, H, W)
+        finally:
+            _M.BEV_H, _M.BEV_W = oh, ow
+        return F.interpolate(bev, size=(oh, ow), mode="bilinear",
+                             align_corners=False)
+
+
+
+class DepthSegIPMNetV53(DepthSegIPMNetV52):
+    """v52 with the lift grid at 0.3 m instead of 0.4 m.
+
+    Thin-class width tracks the lift resolution: laneline covered 2.71x the GT
+    area with the 0.2 m grid (r53) and 2.96-3.72x with 0.4 m (r54 onward). The
+    training objective is NOT what widens it -- backprop through each seg term
+    puts a POSITIVE gradient on the ring of cells just outside a true line
+    (+5.3e-6 summed, i.e. every term pushes thinner), so the width is a limit of
+    how sharp a boundary the feature can express, and that is set by how finely
+    the lift samples. 0.3 m sits between the two measured points.
+
+    The grid no longer has to divide the output grid evenly -- the lifted
+    feature is resampled to 800x500 either way -- so this is expressed in metres
+    rather than as an integer divisor.
+    """
+
+    LIFT_RES = 0.3
+
+    def __init__(self, *a, **k):
+        super().__init__(*a, **k)
+        r = self.LIFT_RES
+        self.lift_h = int(round(2 * BEV_XH / r))
+        self.lift_w = int(round(2 * BEV_YH / r))
+        xs = torch.linspace(BEV_XH - r / 2, -BEV_XH + r / 2, self.lift_h)
+        ys = torch.linspace(BEV_YH - r / 2, -BEV_YH + r / 2, self.lift_w)
+        gx, gy = torch.meshgrid(xs, ys, indexing="ij")
+        n = self.lift_h * self.lift_w
+        self.register_buffer("bev_pts",
+                             torch.stack([gx.reshape(-1), gy.reshape(-1),
+                                          torch.zeros(n), torch.ones(n)], 1),
+                             persistent=False)
+
+
+
+class DepthSegIPMNetV54(DepthSegIPMNetV52):
+    """v52 with the two aggressive width cuts, both dialable from outside.
+
+    This exists because the latency target cannot be reached by building the
+    engine better. A static FLOP pass over the exported v52 graph gives 3,405
+    GFLOP per frame, which at the measured 19.24 ms is 177 TOPS -- 48 % of the
+    workstation-GPU INT8 peak. 10 ms would need 93 % of peak, and real graphs do not
+    reach that. FLOPs have to come down, and there are exactly two places worth
+    cutting:
+
+      depth_head  1091 GFLOP, 32.0 % of the graph. Four stages of 3x3 convs at
+                  256/256/192/128, run over 8 cameras at 108x192. DEPTH_MULT
+                  0.5 removes about 800 GFLOP -- 24 % of the whole graph -- from
+                  this module alone.
+      backbone    layer3+layer4 are 37 % of the parameters. resnet34 -> resnet18
+                  keeps every channel count identical (64/128/256/512) and only
+                  drops block counts (layer3 6->2, layer4 3->2), so nothing
+                  downstream needs to change.
+
+    The reason to expect the depth head to survive the cut: `bev_pts` has a
+    single unique z = 0.0, so the lift is flat-ground and depth never moves a
+    sample point -- it only re-weights which camera wins a BEV cell. That is
+    also why the v50 regression head and the v48/v52 classification head
+    measured neutral on BEV (mIoU delta -0.0001 over three measurements). A
+    four-stage 256-channel tower to produce a per-pixel camera weight is very
+    likely more than the job needs. "Likely" is not "measured": BEV Seg,
+    3D BBox and E2E all get measured before and after, one head at a time.
+
+    Subclass and set the two attributes to go further or less far:
+
+        class MyTiny(DepthSegIPMNetV54):
+            DEPTH_MULT = 0.25
+            BACKBONE = "resnet18"
+    """
+
+    DEPTH_MULT = 0.5             # width multiplier on the depth tower
+    BACKBONE = "resnet18"        # None keeps whatever the parent built
+
+    def __init__(self, *a, **k):
+        super().__init__(*a, **k)
+        if self.BACKBONE:
+            rn = getattr(torchvision.models, self.BACKBONE)(
+                weights="IMAGENET1K_V1")
+            # channel counts are identical across resnet18/34, so the lateral
+            # convs and everything after them are untouched
+            self.stem = nn.Sequential(rn.conv1, rn.bn1, rn.relu, rn.maxpool)
+            self.layer1, self.layer2 = rn.layer1, rn.layer2
+            self.layer3, self.layer4 = rn.layer3, rn.layer4
+        m = self.DEPTH_MULT
+        if m and m != 1.0:
+            w = [max(16, int(round(c * m))) for c in (256, 256, 192, 128)]
+            self.depth_head = nn.Sequential(
+                ConvBlock(160, w[0]), ConvBlock(w[0], w[1]),
+                ConvBlock(w[1], w[2]), ConvBlock(w[2], w[3]),
+                nn.Conv2d(w[3], self.D, 1))
+
+
+class DepthSegIPMNetV55(DepthSegIPMNetV54):
+    """v54's depth-tower cut ONLY -- resnet34 backbone kept.
+
+    v54 changed two things at once and lost 36 % of veh R50 and 56 % of turning
+    ADEc for -10.8 % of latency. Which of the two cuts did that is not knowable
+    from that run, and it decides everything: the depth tower is 787 of the 984
+    GFLOP v54 removed (80 %), so if the depth cut is the expensive one there is
+    very little left worth taking."""
+    DEPTH_MULT = 0.5
+    BACKBONE = None
+
+
+class DepthSegIPMNetV56(DepthSegIPMNetV54):
+    """v54's backbone cut ONLY -- full-width depth tower kept.
+
+    resnet34 -> resnet18 is 197 GFLOP, a fifth of what v54 removed. Cheap if it
+    holds the priority tasks; pointless if it does not."""
+    DEPTH_MULT = 1.0
+    BACKBONE = "resnet18"
+
+
+class DepthSegIPMNetV64r50(DepthSegIPMNetV55):
+    """R7 phase 1: ResNet-50 backbone, everything else = v55 (light line).
+
+    The far-range plan (R7) has two axes -- backbone arch and input
+    resolution -- and the v55/v56 lesson demands one axis per run. This class
+    is the ARCH axis alone: bottleneck features at the same 432x768 input and
+    the same stride-4 fusion, so any accuracy move is attributable to the
+    representation, not to extra pixels. r50 laterals differ (256/512/1024/
+    2048 vs 64/128/256/512), so the four lat convs rebuild; everything from
+    `fuse` on is untouched and carries over from a v55-line checkpoint.
+    +14 % backbone FLOP at equal resolution.
+    """
+    BACKBONE = None            # v54's swap logic does not fit r50; done here
+
+    def __init__(self, *a, **k):
+        super().__init__(*a, **k)
+        rn = torchvision.models.resnet50(weights="IMAGENET1K_V1")
+        self.stem = nn.Sequential(rn.conv1, rn.bn1, rn.relu, rn.maxpool)
+        self.layer1, self.layer2 = rn.layer1, rn.layer2
+        self.layer3, self.layer4 = rn.layer3, rn.layer4
+        fc = self.lat1.out_channels
+        self.lat1 = nn.Conv2d(256, fc, 1)
+        self.lat2 = nn.Conv2d(512, fc, 1)
+        self.lat3 = nn.Conv2d(1024, fc, 1)
+        self.lat4 = nn.Conv2d(2048, fc, 1)
+
+
+class DepthSegIPMNetV52s8(DepthSegIPMNetV52):
+    """R7 解像度軸 (2026-08-14, r34 のまま): x2 入力 (dataset --img-scale 2) を
+    stride-8 で融合。特徴グリッドは 108x192 のままなので depth/seg2d GT・
+    リフト・BEV 以降は無変更、lat2/3/4 の入力チャンネルも一致するため
+    成熟した r34 系列の重みを 100% 引き継げる (lat1 のみ未使用)。
+    RepVGG 実験 (r68) は seg -0.05 / veh R50 -0.12 で却下 — 遠方精度の
+    本命レバーは backbone アーキではなく解像度、という判断。"""
+    FUSE_STRIDE = 8
+
+    def __init__(self, *a, **k):
+        super().__init__(*a, **k)
+        # lat1 (stride-4 タップ) は FUSE_STRIDE=8 では使わない。モジュールに
+        # 残すと DDP が未使用パラメータとして落ちる (find_unused_parameters は
+        # 履歴の多重 forward と両立しない) ので、ここで外す。
+        del self.lat1
+
+
+class DepthSegIPMNetV52r50(DepthSegIPMNetV52):
+    """R7 phase 1, LOCAL (accuracy) line: ResNet-50 backbone on the full v52
+    recipe. Per the 2026-08-12 decision the light line stays inside the Orin
+    budget, so the backbone axis lands here first. Same 432x768 input, same
+    stride-4 fusion -- arch axis only; laterals rebuild for the bottleneck
+    channel widths, everything from `fuse` on carries over from a v52-line
+    checkpoint (r67 best)."""
+
+    def __init__(self, *a, **k):
+        super().__init__(*a, **k)
+        rn = torchvision.models.resnet50(weights="IMAGENET1K_V1")
+        self.stem = nn.Sequential(rn.conv1, rn.bn1, rn.relu, rn.maxpool)
+        self.layer1, self.layer2 = rn.layer1, rn.layer2
+        self.layer3, self.layer4 = rn.layer3, rn.layer4
+        fc = self.lat1.out_channels
+        self.lat1 = nn.Conv2d(256, fc, 1)
+        self.lat2 = nn.Conv2d(512, fc, 1)
+        self.lat3 = nn.Conv2d(1024, fc, 1)
+        self.lat4 = nn.Conv2d(2048, fc, 1)
+
+
+class DepthSegIPMNetV52r50s8(DepthSegIPMNetV52r50):
+    """R7 resolution axis (upsample-first): expects x2 input (864x1536,
+    dataset img_scale=2) and fuses at STRIDE 8 (layer2/3/4 laterals), so the
+    feature grid lands on the same 108x192 as today and every 2D GT, the
+    lift, and the BEV stack are untouched. With upsampled jpgs this measures
+    the stride-ratio/compute effect only; the true-resolution re-ingest
+    swaps the data later without touching the model again. lat1 is kept but
+    unused (checkpoint compatibility)."""
+
+    def image_feats(self, imgs):
+        B, N, _, H, W = imgs.shape
+        x0 = self.stem(imgs.reshape(B * N, 3, H, W))
+        x1 = self.layer1(x0)
+        x2 = self.layer2(x1)
+        x3 = self.layer3(x2)
+        x4 = self.layer4(x3)
+        sz = x2.shape[-2:]
+        up = lambda t: F.interpolate(t, size=sz, mode="bilinear",
+                                     align_corners=False)
+        f = self.lat2(x2) + up(self.lat3(x3)) + up(self.lat4(x4))
+        return self.fuse(f)
+
+
+class _RepVGGStage(nn.Module):
+    """Deploy-form RepVGG stage: N plain conv3x3+BN+ReLU blocks, first one
+    strided. Latency-ladder用 (学習時は timm の分岐形から再パラメータ化する
+    前提で、ここでは Orin での Δms 計測に使うデプロイ形のみ)。"""
+
+    def __init__(self, cin, cout, n, stride=2):
+        super().__init__()
+        L = []
+        for i in range(n):
+            L += [nn.Conv2d(cin if i == 0 else cout, cout, 3,
+                            stride=stride if i == 0 else 1, padding=1,
+                            bias=False), nn.BatchNorm2d(cout),
+                  nn.ReLU(inplace=True)]
+        self.f = nn.Sequential(*L)
+
+    def forward(self, x):
+        return self.f(x)
+
+
+class DepthSegIPMNetV64rv(DepthSegIPMNetV55):
+    """Orin backbone efficiency ladder: deploy-form RepVGG-ish backbone
+    (pure dense 3x3 stacks, no branches/1x1/DW) behind the same FPN taps.
+    WIDTHS/BLOCKS are class attrs so A1/A2 variants subclass in two lines.
+    Latency measurement first; training (with reparam + ImageNet init via
+    timm) only if the ladder says the ms is worth it."""
+    WIDTHS = (48, 48, 96, 192, 384)     # ~A1 相当
+    BLOCKS = (1, 2, 4, 14, 1)
+
+    def __init__(self, *a, **k):
+        super().__init__(*a, **k)
+        w, b = self.WIDTHS, self.BLOCKS
+        self.stem = _RepVGGStage(3, w[0], b[0], stride=2)
+        self.layer1 = _RepVGGStage(w[0], w[1], b[1], stride=2)   # s4
+        self.layer2 = _RepVGGStage(w[1], w[2], b[2], stride=2)   # s8
+        self.layer3 = _RepVGGStage(w[2], w[3], b[3], stride=2)   # s16
+        self.layer4 = _RepVGGStage(w[3], w[4], b[4], stride=2)   # s32
+        fc = self.lat1.out_channels
+        self.lat1 = nn.Conv2d(w[1], fc, 1)
+        self.lat2 = nn.Conv2d(w[2], fc, 1)
+        self.lat3 = nn.Conv2d(w[3], fc, 1)
+        self.lat4 = nn.Conv2d(w[4], fc, 1)
+
+
+class DepthSegIPMNetV64rvA2(DepthSegIPMNetV64rv):
+    WIDTHS = (64, 64, 128, 256, 512)
+    BLOCKS = (1, 2, 4, 14, 1)
+
+
+class DepthSegIPMNetV64rvB0(DepthSegIPMNetV64rv):
+    """RepVGG-B0 相当 + 幅微増: r34 超の容量を密 3x3 で。"""
+    WIDTHS = (64, 96, 192, 384, 768)
+    BLOCKS = (1, 4, 6, 16, 1)
+
+
+class DepthSegIPMNetV64rvB1(DepthSegIPMNetV64rv):
+    """RepVGG-B1 相当: 明確に r34/r50 超の容量。"""
+    WIDTHS = (64, 128, 256, 512, 1024)
+    BLOCKS = (1, 4, 6, 16, 1)
+
+
+class DepthSegIPMNetV64r34w(DepthSegIPMNetV55):
+    """幅広 r34: basic block のまま幅 x1.25 (80/160/320/640)。torchvision の
+    resnet34 を width スケールで自前構築 (ImageNet init なし — ladder 用)。"""
+
+    def __init__(self, *a, **k):
+        super().__init__(*a, **k)
+        from torchvision.models.resnet import BasicBlock, ResNet
+        rn = ResNet(BasicBlock, [3, 4, 6, 3], width_per_group=64)
+        # torchvision ResNet は width スケール引数を basic に持たないため手動:
+        def make(cin, cout, n, stride):
+            return _RepVGGStage(cin, cout, n, stride)  # 3x3 スタックで代替
+        self.stem = nn.Sequential(nn.Conv2d(3, 80, 7, 2, 3, bias=False),
+                                  nn.BatchNorm2d(80), nn.ReLU(inplace=True),
+                                  nn.MaxPool2d(3, 2, 1))
+        self.layer1 = _RepVGGStage(80, 80, 3, stride=1)
+        self.layer2 = _RepVGGStage(80, 160, 4, stride=2)
+        self.layer3 = _RepVGGStage(160, 320, 6, stride=2)
+        self.layer4 = _RepVGGStage(320, 640, 3, stride=2)
+        fc = self.lat1.out_channels
+        self.lat1 = nn.Conv2d(80, fc, 1)
+        self.lat2 = nn.Conv2d(160, fc, 1)
+        self.lat3 = nn.Conv2d(320, fc, 1)
+        self.lat4 = nn.Conv2d(640, fc, 1)
+
+
+class DepthSegIPMNetV52rvgg(DepthSegIPMNetV52):
+    """R7 arch axis, take 2 (user decision 2026-08-13): RepVGG-A2 backbone
+    via timm — training form keeps the 3x3+1x1+identity branches (where
+    RepVGG earns its accuracy); export reparameterizes to the dense-3x3
+    stack the Orin ladder priced at ~+5 ms for 1.55x r34 backbone FLOPs
+    (26.8M params). ImageNet pretrained.
+
+    Integration: timm stages are MAPPED onto the existing stem/layer1..4
+    interface (stem := timm stem+stage0 at s4, layer1 := Identity,
+    layer2..4 := stages 1..3) so the base image_feats and every override
+    stacked on it (_last_f for the 2D det head, the TL-stem residual)
+    run untouched. Only the laterals change width."""
+    TIMM_NAME = "repvgg_a2"
+
+    def __init__(self, *a, **k):
+        super().__init__(*a, **k)
+        import timm
+        rv = timm.create_model(self.TIMM_NAME, pretrained=True)
+        self.stem = nn.Sequential(rv.stem, rv.stages[0])   # -> 96ch, s4
+        self.layer1 = nn.Identity()                         # x1 = stem out
+        self.layer2 = rv.stages[1]                          # 192ch, s8
+        self.layer3 = rv.stages[2]                          # 384ch, s16
+        self.layer4 = rv.stages[3]                          # 1408ch, s32
+        fc = self.lat1.out_channels
+        self.lat1 = nn.Conv2d(96, fc, 1)
+        self.lat2 = nn.Conv2d(192, fc, 1)
+        self.lat3 = nn.Conv2d(384, fc, 1)
+        self.lat4 = nn.Conv2d(1408, fc, 1)
+
+
+class DepthSegIPMNetV63b(DepthSegIPMNetV55):
+    """R6 axis 2: depth bins 64 -> 32, everything else = v55.
+
+    The bin geometry keeps the 1..80 m range (D_STEP 1.25 -> 2.5), so the
+    lift's flat-ground camera-weighting job is unchanged in coverage and only
+    halved in resolution. Every consumer reads self.D / D_STEP, so the change
+    is these three attributes -- the depth loss bins GT with the same fields.
+    v63a (ctx 96 -> 64) is the OTHER axis and must ride a separate run:
+    change one axis per run, or the cost of the wrong cut is unattributable.
+    """
+    D = 32
+    D_MIN, D_STEP = 1.0, 2.5
+
+
+class DepthSegIPMNetV55rvgg(DepthSegIPMNetV55):
+    """Light-line arch axis (v68 candidate, pre-registered 2026-08-13):
+    RepVGG-A2 backbone on the v55 light recipe via the same stage-mapping
+    trick as v52rvgg. Orin ladder priced the deploy form at ~+5 ms for
+    1.55x r34 backbone FLOPs; adoption is conditional on the LOCAL r68
+    round demonstrating the accuracy side (out/rvgg_light_verdict.txt)."""
+    TIMM_NAME = "repvgg_a2"
+
+    def __init__(self, *a, **k):
+        super().__init__(*a, **k)
+        import timm
+        rv = timm.create_model(self.TIMM_NAME, pretrained=True)
+        self.stem = nn.Sequential(rv.stem, rv.stages[0])
+        self.layer1 = nn.Identity()
+        self.layer2 = rv.stages[1]
+        self.layer3 = rv.stages[2]
+        self.layer4 = rv.stages[3]
+        fc = self.lat1.out_channels
+        self.lat1 = nn.Conv2d(96, fc, 1)
+        self.lat2 = nn.Conv2d(192, fc, 1)
+        self.lat3 = nn.Conv2d(384, fc, 1)
+        self.lat4 = nn.Conv2d(1408, fc, 1)
+
+
 MODELS = {"v1": IPMSegNet, "v2": IPMSegNetV2, "v3s": IPMSegNetV3,
           "lss": LSSDepthNet, "v8": DepthGatedIPMNet, "v13": DepthSegIPMNet,
           "v13d": DepthSegIPMNetS4, "v14d": DepthSegIPMNetV14,
@@ -3508,4 +5656,22 @@ MODELS = {"v1": IPMSegNet, "v2": IPMSegNetV2, "v3s": IPMSegNetV3,
           "v21": DepthSegIPMNetV21, "v22": DepthSegIPMNetV22,
           "v23": DepthSegIPMNetV23, "v24": DepthSegIPMNetV24,
           "v25": DepthSegIPMNetV25, "v26": DepthSegIPMNetV26, "v27": DepthSegIPMNetV27, "v28": DepthSegIPMNetV28, "v29": DepthSegIPMNetV29, "v30": DepthSegIPMNetV30, "v31": DepthSegIPMNetV31, "v32": DepthSegIPMNetV32, "v33": DepthSegIPMNetV33, "v34": DepthSegIPMNetV34, "v35": DepthSegIPMNetV35, "v36": DepthSegIPMNetV36, "v37": DepthSegIPMNetV37, "v38": DepthSegIPMNetV38, "v39": DepthSegIPMNetV39, "v40": DepthSegIPMNetV40, "v41": DepthSegIPMNetV41, "v42": DepthSegIPMNetV42, "v43": DepthSegIPMNetV43, "v44": DepthSegIPMNetV44, "v45": DepthSegIPMNetV45, "v46": DepthSegIPMNetV46, "v47": DepthSegIPMNetV47,
-          "v48": DepthSegIPMNetV48}
+          "v48": DepthSegIPMNetV48, "v49": DepthSegIPMNetV49, "v50": DepthSegIPMNetV50,
+          "v51": DepthSegIPMNetV51,
+          "v52": DepthSegIPMNetV52,
+          "v53": DepthSegIPMNetV53,
+          "v54": DepthSegIPMNetV54,
+          "v55": DepthSegIPMNetV55,
+          "v56": DepthSegIPMNetV56,
+          "v63b": DepthSegIPMNetV63b,
+          "v52s8": DepthSegIPMNetV52s8,
+          "v52r50": DepthSegIPMNetV52r50,
+          "v64rv": DepthSegIPMNetV64rv,
+          "v64rva2": DepthSegIPMNetV64rvA2,
+          "v64rvb0": DepthSegIPMNetV64rvB0,
+          "v64rvb1": DepthSegIPMNetV64rvB1,
+          "v64r34w": DepthSegIPMNetV64r34w,
+          "v52r50s8": DepthSegIPMNetV52r50s8,
+          "v52rvgg": DepthSegIPMNetV52rvgg,
+          "v55rvgg": DepthSegIPMNetV55rvgg,
+          "v64r50": DepthSegIPMNetV64r50}

@@ -23,7 +23,7 @@ torch.multiprocessing.set_sharing_strategy("file_system")
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from bevlane.dataset import BevLaneDataset  # noqa: E402
-from bevlane.model import (MODELS, N_CLASSES, EGO_K,  # noqa: E402
+from bevlane.model import (DET_RES, MODELS, N_CLASSES, EGO_K,  # noqa: E402
                            make_warp_theta)
 
 CLASS_NAMES = ["unlabeled", "road", "sidewalk", "crosswalk", "laneline",
@@ -32,13 +32,77 @@ CLASS_W = torch.tensor([0.0, 1.0, 1.5, 3.0, 5.0, 6.0, 1.5, 3.0, 1.0])
 THIN = [3, 4, 5, 6, 7]
 DICE_CLASSES = [3]        # area-like (crosswalk): want recall
 LINE_CLASSES = [4, 5, 6]  # laneline / stopline / road_edge: precision/thin
-# (marking/class 7 dropped from GT as noise -> not trained)
+# marking/class 7 carried no supervision until r49: Japanese gt_cons has
+# 0.000 % marking pixels (hence `marking=nan` in every val line) while x2gen2
+# GT carries 0.403 %. CLASS_W[7]=3.0 was already set, so simply having x2gen2
+# in the round starts training it -- measure it on an x2gen2 val slice, the
+# Japanese val set cannot see the class at all.
+
+
+# ---- 走行可能面からの距離場とオフロード罰則 (2026-08-16, VLA 版から移植) ----
+# コマンドで横に動かす損失 (intent_loss) には「道がそれを許すか」の概念が無く、
+# 参照実装では左コマンド時に 6 点中 1.15 点が路外に出て、安全層の VETO 閾値に
+# 14% のフレームで抵触したと記録されている。当方のクローズドループでも
+# VETO 7.5% が出ており、同じ病理とみられる。
+DRIVABLE = (1, 3, 4, 5, 7, 8)   # road/crosswalk/laneline/stopline/marking/parking
+DIST_CELL_M = 1.6               # 0.2 m ラスタを 8 倍ダウンサンプル
+DIST_MAX_CELL = 12              # 約 19 m で飽和
+
+
+def drivable_dist(seg_gt):
+    """各セルから最も近い走行可能セルまでの距離 [m] (上限あり)。
+
+    二値マスクでは壁の奥が平坦になり勾配が消える (参照実装で実測: 平均プール
+    版は無効だった)。距離場なら 15 m 内側からでも道へ押し戻される。
+    cv2.distanceTransform ではなく反復 dilation で作り、GPU 上で完結させる。
+    """
+    dr = torch.zeros(seg_gt.shape, device=seg_gt.device, dtype=torch.float32)
+    for c in DRIVABLE:
+        dr = dr + (seg_gt == c).float()
+    cur = (F.avg_pool2d(dr.clamp(max=1.0)[:, None], 8) >= 0.5).float()
+    dist = torch.zeros_like(cur)
+    for _ in range(DIST_MAX_CELL):
+        cur = F.max_pool2d(cur, 3, 1, 1)
+        dist = dist + (1.0 - cur)
+    return dist * DIST_CELL_M
+
+
+def offroad_loss(seg_gt, ego_pred, rows=None, topk=2, k_modes=None):
+    """コマンドされた経路が走行可能面を外れることを罰する。
+
+    設計上の要点 (参照実装が実測で確定させたもの):
+      * 距離場を使う (壁の奥でも勾配が残る)
+      * 6 点の平均ではなく最悪の 2 点 (5 点が正常でも 1 点の貫通を隠さない)
+      * 3 本の混合ではなく選択されたモードだけ (圧力が 3 分の 1 に薄まるのを防ぐ)
+      * コマンドのある行だけに適用 (コマンド無しの行では GT 自体が縁石を掠める
+        ので、罰則が第二の相反する目的になってしまう)
+    """
+    from bevlane.model import EGO_K as _K
+    K = k_modes or _K
+    if rows is not None:
+        if rows.sum() == 0:
+            return ego_pred.sum() * 0.0
+        seg_gt, ego_pred = seg_gt[rows], ego_pred[rows]
+    B = seg_gt.shape[0]
+    cost = (drivable_dist(seg_gt) / 5.0).clamp(max=1.0)     # 0..1 (0..5 m)
+    e = ego_pred.float()
+    wp = e[:, :12 * K].view(B, K, 6, 2)
+    md = e[:, 12 * K:12 * K + K].argmax(1)
+    sel = wp[torch.arange(B, device=wp.device), md]         # [B,6,2]
+    H, W = seg_gt.shape[-2], seg_gt.shape[-1]
+    xf = 80.0                       # 行 0 = 前方 80 m (後方は H から決まる)
+    gx = ((50.0 - sel[..., 1]) / 0.2) / W * 2.0 - 1.0
+    gy = ((xf - sel[..., 0]) / 0.2) / H * 2.0 - 1.0
+    grid = torch.stack([gx, gy], -1).view(B, 6, 1, 2)
+    s = F.grid_sample(cost, grid.float(), align_corners=False,
+                      padding_mode="border").view(B, 6)
+    return s.topk(min(topk, 6), dim=1).values.mean()
 
 
 def dice_loss(logits, gt, classes=THIN, eps=1.0):
     """Soft dice over selected classes, masked to labeled cells."""
     prob = logits.softmax(1)
-    m = (gt > 0).unsqueeze(1).float()
+    m = ((gt > 0) & (gt != 255)).unsqueeze(1).float()
     loss = 0.0
     for c in classes:
         p = prob[:, c:c + 1] * m
@@ -53,7 +117,7 @@ def tversky_loss(logits, gt, classes, alpha=0.2, beta=0.8, eps=1.0):
     """Tversky loss. beta>alpha penalizes false positives harder -> thinner,
     higher-precision predictions for line classes."""
     prob = logits.softmax(1)
-    m = (gt > 0).unsqueeze(1).float()
+    m = ((gt > 0) & (gt != 255)).unsqueeze(1).float()
     loss = 0.0
     for c in classes:
         p = prob[:, c:c + 1] * m
@@ -64,6 +128,42 @@ def tversky_loss(logits, gt, classes, alpha=0.2, beta=0.8, eps=1.0):
         ti = (tp + eps) / (tp + alpha * fn + beta * fp + eps)
         loss = loss + (1 - ti).mean()
     return loss / len(classes)
+
+
+def lane_cldice_loss(logits, gt, iters=5, eps=1e-6):
+    """Topology-aware soft-clDice for the laneline class (4).
+
+    It penalises broken centreline connectivity, which pixel IoU/Tversky do
+    not distinguish from an equal-area set of disconnected fragments. The
+    map is pooled once to keep the training cost modest; max pooling preserves
+    thin evidence. Consensus 255 cells remain completely outside the loss.
+    """
+    p = logits.softmax(1)[:, 4:5]
+    t = (gt == 4).float().unsqueeze(1)
+    valid = (gt != 255).float().unsqueeze(1)
+    p = F.max_pool2d(p * valid, 2, 2)
+    t = F.max_pool2d(t, 2, 2)
+    valid = -F.max_pool2d(-valid, 2, 2)  # valid only when all 2x2 cells valid
+    p, t = p * valid, t * valid
+
+    def erode(x):
+        return -F.max_pool2d(-x, 3, 1, 1)
+
+    def skel(x):
+        opened = F.max_pool2d(erode(x), 3, 1, 1)
+        s = F.relu(x - opened)
+        cur = x
+        for _ in range(iters):
+            cur = erode(cur)
+            opened = F.max_pool2d(erode(cur), 3, 1, 1)
+            delta = F.relu(cur - opened)
+            s = s + F.relu(delta - s * delta)
+        return s
+
+    sp, st = skel(p), skel(t)
+    tprec = (sp * t).sum() / (sp.sum() + eps)
+    tsens = (st * p).sum() / (st.sum() + eps)
+    return 1.0 - (2.0 * tprec * tsens + eps) / (tprec + tsens + eps)
 
 
 def _lovasz_grad(gt_sorted):
@@ -190,6 +290,28 @@ def sanitize_bn(model):
     return bad
 
 
+HOLDOUT_FILES = ("test.lst", "out/x2gen2_test.txt", "out/newdata_test.txt",
+                 "out/okinawa_test.txt")
+
+
+def holdout_scenes(root):
+    """Scenes that must NEVER be trained on, from every holdout list we keep.
+
+    Enforced in code, not in launcher flags: the refiner takes its train set
+    from split_scenes(root) -- i.e. everything symlinked under out/bevlane --
+    so r47's refiner silently trained on all 279 held-out test scenes. A flag
+    that has to be remembered is not a guarantee.
+    """
+    base = os.path.dirname(os.path.abspath(root.rstrip("/")))
+    out = set()
+    for f in HOLDOUT_FILES:
+        for p in (f, os.path.join(base, f), os.path.join(base, os.path.basename(f))):
+            if os.path.exists(p):
+                out |= {l.strip() for l in open(p) if l.strip()}
+                break
+    return out
+
+
 def split_scenes(root):
     scenes = sorted(os.listdir(root))
     # indoor / GNSS-dead scenes (annotate_indoor.py): ego pose is a smooth
@@ -200,7 +322,13 @@ def split_scenes(root):
         bad = set(open(p).read().split())
     scenes = [s for s in scenes if s not in bad]
     val = [s for s in scenes if "2026-01-23T15-26-01" in s]
-    train = [s for s in scenes if s not in set(val)]
+    ho = holdout_scenes(root)
+    train = [s for s in scenes if s not in set(val) and s not in ho]
+    leak = [s for s in val if s in ho]
+    assert not leak, f"{len(leak)} val scenes are also in a holdout list"
+    if ho:
+        print(f"[holdout] {len(ho)} scenes excluded from training "
+              f"({', '.join(HOLDOUT_FILES)})", flush=True)
     return train, val
 
 
@@ -226,7 +354,8 @@ def evaluate(model, loader, device, max_batches=80, use_lidar=False):
             if isinstance(logits, tuple):
                 logits = logits[0]
         pred = logits.argmax(1)
-        m = gt > 0
+        gt = _fit(gt, pred)
+        m = (gt > 0) & (gt != 255)
         for c in range(1, N_CLASSES):
             pi, gi = (pred == c) & m, gt == c
             inter[c] += (pi & gi).sum().item()
@@ -234,6 +363,7 @@ def evaluate(model, loader, device, max_batches=80, use_lidar=False):
     ious = {CLASS_NAMES[c]: inter[c] / union[c] if union[c] else float("nan")
             for c in range(1, N_CLASSES)}
     model.train()
+    _reeval_frozen(model)
     return ious
 
 
@@ -263,6 +393,7 @@ def evaluate_seg2d(model, loader, device, n_cls, max_batches=40):
             inter[c] += (pi & gi).sum().item()
             union[c] += (pi | gi).sum().item()
     model.train()
+    _reeval_frozen(model)
     return {c: inter[c] / union[c] for c in range(n_cls) if union[c]}
 
 
@@ -270,7 +401,8 @@ def evaluate_seg2d(model, loader, device, n_cls, max_batches=40):
 
 def bev_rotation_aug(theta_max_deg, Tc, gt, det_boxes, det_n, traj_gt,
                      ego_gt, occ_gt, risk_gt, lg_pts, unk_c, rel_pose,
-                     unk_v2=None, p_apply=0.5, lat_max=0.0, lat_p=0.0):
+                     unk_v2=None, p_apply=0.5, lat_max=0.0, lat_p=0.0,
+                     lat_min=0.3):
     """BEV-space SE(2) augmentation: rotate/TRANSLATE the EGO FRAME, not
     pixels.
 
@@ -285,9 +417,11 @@ def bev_rotation_aug(theta_max_deg, Tc, gt, det_boxes, det_n, traj_gt,
     dev = Tc.device
     th = (torch.rand(B, device=dev) * 2 - 1) * math.radians(theta_max_deg)
     th = th * (torch.rand(B, device=dev) < p_apply).float()
+    from bevlane.model import (BEV_XF as _BXF, BEV_XR as _BXR,
+                               BEV_YH as _BYH)
     dy = torch.zeros(B, device=dev)
     if lat_max > 0 and lat_p > 0:
-        mag = 0.3 + (lat_max - 0.3) * torch.rand(B, device=dev)
+        mag = lat_min + (lat_max - lat_min) * torch.rand(B, device=dev)
         sgn = torch.where(torch.rand(B, device=dev) < 0.5, -1.0, 1.0)
         dy = mag * sgn * (torch.rand(B, device=dev) < lat_p).float()
     c, s = th.cos(), th.sin()
@@ -305,14 +439,32 @@ def bev_rotation_aug(theta_max_deg, Tc, gt, det_boxes, det_n, traj_gt,
         x, y = xy[..., 0], xy[..., 1] - dy.view(shp)
         return torch.stack([cc * x + ss * y, -ss * x + cc * y], -1)
     # 2. label rasters via inverse-rotated sampling grid
-    def rot_raster(r, fill, nearest=True):
+    def rot_raster(r, fill, nearest=True, ego_v=None):
         if r is None:
             return None
         r4 = r.float().unsqueeze(1) if r.dim() == 3 else r.float()
         A = torch.zeros(B, 2, 3, device=dev, dtype=torch.float32)
-        A[:, 0, 0] = c; A[:, 0, 1] = -s * (r4.shape[2] / r4.shape[3])
-        A[:, 1, 0] = s * (r4.shape[3] / r4.shape[2]); A[:, 1, 1] = c
-        A[:, 0, 2] = -dy / 50.0          # lateral half-extent is 50 m
+        # 回転の向き (2026-08-14 修正): affine_grid の (u,v)=(col,row) 座標は
+        # BEV の (x,y) に対して軸交換 = 鏡映なので、点側 (rot_pts / カメラ
+        # Tc@R) と同じ向きに回すには s の符号を反転する必要がある。旧実装は
+        # ラスタだけ逆回転しており、rot-aug を当てた全サンプルで seg/occ GT が
+        # 画像・箱と 2θ (最大 20 度) ずれていた。
+        A[:, 0, 0] = c; A[:, 0, 1] = s * (r4.shape[2] / r4.shape[3])
+        A[:, 1, 0] = -s * (r4.shape[3] / r4.shape[2]); A[:, 1, 1] = c
+        # 回転中心の補正 (2026-08-13): affine_grid はラスタ中心周りに回すが、
+        # カメラ/box/ego (rot_pts) は自車周り。対称 ±80 グリッドでは両者が
+        # 一致して無害だったが、rear-40 (+80/−40) ではラスタ中心=+20m となり
+        # GT ラスタだけ最大 ~20·sinθ≈3.5m ずれる (v58 以降の全ラウンドが被弾)。
+        # 自車行の正規化座標 y_e 周りの回転に補正する。±80 では y_e=0 で
+        # 従来と完全一致。
+        # 回転中心はラスタごとに違う。グリッド全域 (+XF..−XR) を張る
+        # レーン/det/unk は自車が中心にいないので自車行周りに補正が要り、
+        # occ/risk (±40 m の対称窓) は中心 = 自車なので補正してはいけない。
+        # 形状からの推測は危険 (対称グリッドでは lane 800x500 と risk
+        # 400x250 が同じ縦横比 1.6 になる) ため、呼び出し側で明示する。
+        _ye = (2.0 * _BXF / (_BXF + _BXR) - 1.0) if ego_v is None else ego_v
+        A[:, 0, 2] = -dy / _BYH - s * (r4.shape[2] / r4.shape[3]) * _ye
+        A[:, 1, 2] = _ye * (1.0 - c)
         g = F.affine_grid(A, list(r4.shape), align_corners=False)
         out = F.grid_sample(r4 + 1.0, g, mode="nearest" if nearest
                             else "bilinear", padding_mode="zeros",
@@ -321,9 +473,9 @@ def bev_rotation_aug(theta_max_deg, Tc, gt, det_boxes, det_n, traj_gt,
                           out) - 1.0
         return res.squeeze(1).to(r.dtype) if r.dim() == 3 else res.to(r.dtype)
     gt = rot_raster(gt, 0)
-    risk_gt = rot_raster(risk_gt, 0, nearest=False)         if risk_gt is not None else None
+    risk_gt = rot_raster(risk_gt, 0, nearest=False, ego_v=0.0)         if risk_gt is not None else None
     if occ_gt is not None:
-        occ_gt = rot_raster(occ_gt, 255)
+        occ_gt = rot_raster(occ_gt, 255, ego_v=0.0)
     if unk_v2 is not None:                    # -1 fill = no-GT sentinel
         unk_v2 = rot_raster(unk_v2, -1)
     # 3. boxes / futures / ego path / graph points / unknown centres
@@ -366,9 +518,130 @@ def bev_rotation_aug(theta_max_deg, Tc, gt, det_boxes, det_n, traj_gt,
             unk_c, rel_pose, unk_v2)
 
 
+class EMA:
+    """Exponential moving average of the trainable weights.
+
+    Consecutive epoch-end evaluations bounce while nothing about the data
+    changes -- r61 went ADE 0.63 / 0.66 / 0.62 / 0.63 over its last four -- which
+    is weights orbiting the basin rather than sitting in it. The independent
+    evidence that averaging helps HERE is that the weight soup over r59/r60/r61
+    beat every one of them (0.6199 -> 0.6056) for free, and narrowed the mode
+    selection loss from 0.171 to 0.143 along with it.
+
+    Costs one fp32 copy of the trainable set (54.2 M = 217 MB per rank). The
+    averaged weights are EVALUATED ALONGSIDE the raw ones every epoch rather
+    than assumed better, so the choice stays measured.
+    """
+
+    def __init__(self, module, decay=0.999, exclude=()):
+        self.decay = decay
+        # exclude: EMA に入れない接頭辞 (2026-09-08, v158): seg_head.* を平均すると lr 1e-4 の回で
+        # 2D セグが単一クラスへ崩壊する (v151/v152/v155/v157 で毎エポック再現)。除外した頭は
+        # swap_in 時に生重みのまま残る (ガードの「生 seg_head 移植」を常時化したのと同じ)。
+        self.shadow = {n: p.detach().clone().float()
+                       for n, p in module.named_parameters()
+                       if p.requires_grad and not n.startswith(tuple(exclude))}
+
+    @torch.no_grad()
+    def update(self, module):
+        d = self.decay
+        for n, p in module.named_parameters():
+            if n in self.shadow:
+                self.shadow[n].mul_(d).add_(p.detach().float(), alpha=1 - d)
+
+    @torch.no_grad()
+    def swap_in(self, module):
+        """Install the averaged weights; returns the raw ones for swap_out."""
+        backup = {}
+        for n, p in module.named_parameters():
+            if n in self.shadow:
+                backup[n] = p.detach().clone()
+                p.copy_(self.shadow[n].to(p.dtype))
+        return backup
+
+    @torch.no_grad()
+    def swap_out(self, module, backup):
+        for n, p in module.named_parameters():
+            if n in backup:
+                p.copy_(backup[n])
+
+
+
+EGO_FREEZE_PREFIX = ("ego_stem", "ego_mlp", "ego_q", "ego_attn", "ego_delta",
+                     "sem_ego", "kin_delta", "intent_delta", "intent_mlp",
+                     "vprof_head", "dec_head", "dec_gate", "risk_gate",
+                     "mode_scorer", "kin_gate", "refiner.e2e")
+
+
+def _apply_freeze_ego(mdl):
+    """--freeze-ego (v142): E2E 頭の凍結。requires_grad を切り BN 統計も固定。
+    **DDP ラップの前に呼ぶこと** (後から切ると DDP が勾配を待ち続けて
+    "Expected to have finished reduction" で落ちる — v142 初回で実証)。
+    BN の eval 固定は _reeval_frozen が model.train() のたびに再適用する。"""
+    base = mdl.module if hasattr(mdl, "module") else mdl
+    base._freeze_ego_prefix = EGO_FREEZE_PREFIX
+    n = 0
+    for nm, p in base.named_parameters():
+        if nm.startswith(EGO_FREEZE_PREFIX):
+            p.requires_grad_(False); n += p.numel()
+    for nm, m in base.named_modules():
+        if nm.startswith(EGO_FREEZE_PREFIX) and isinstance(
+                m, (torch.nn.BatchNorm1d, torch.nn.BatchNorm2d, torch.nn.SyncBatchNorm)):
+            m.eval()
+    return n
+
+
+def _reeval_frozen(model):
+    """--det-head-only: model.train() で凍結部の BN が動き出すのを防ぐ。"""
+    n0 = model.module if hasattr(model, "module") else model
+    # --freeze-ego (v142): ego 系モジュールの BN を eval に固定
+    _fe = getattr(n0, "_freeze_ego_prefix", None)
+    if _fe:
+        for nm, m in n0.named_modules():
+            if nm.startswith(_fe) and isinstance(
+                    m, (torch.nn.BatchNorm1d, torch.nn.BatchNorm2d, torch.nn.SyncBatchNorm)):
+                m.eval()
+    keep = getattr(n0, "_freeze_eval_keep", None)
+    if not keep:
+        return
+    for nm, m in n0.named_modules():
+        if nm and not (nm.split(".")[0] in keep
+                       or any(nm.startswith(k) for k in keep if "." in k)):
+            m.eval()
+
+
+def _fit(gt, pred):
+    """Crop a BEV-space GT tensor's ROW dimension to the prediction's.
+
+    Every BEV product in this pipeline puts row 0 at the far FRONT and shares
+    its resolution with the head that predicts it, so truncating the rear of the
+    grid means keeping exactly the first N rows of the label -- whatever N the
+    head now emits. Deriving N from the prediction rather than from a per-key
+    table is what makes this safe: two products can have the SAME shape and
+    different geometry (lidar_bev is 400x250 at 0.4 m over +-80 m, risk is
+    400x250 at 0.2 m over +-40 m), so a table keyed on shape would silently
+    mis-crop one of them.
+
+    A no-op when the grid is full length, which is the default.
+    """
+    if gt is None or not torch.is_tensor(gt) or not torch.is_tensor(pred):
+        return gt
+    h = pred.shape[-2]
+    return gt if gt.shape[-2] <= h else gt[..., :h, :]
+
+
 def _temporal_inputs(model, batch, device, tmp_idx):
     if tmp_idx is None:
         return None, None
+    # 履歴画像は [B,H,N,3,432,768] = 6 次元で一意。固定インデックス式は
+    # フラグ構成が変わると破綻するので、合わなければ形状で引き直す。
+    if not (tmp_idx < len(batch) and torch.is_tensor(batch[tmp_idx])
+            and batch[tmp_idx].dim() == 6):
+        _i = next((i for i, t in enumerate(batch)
+                   if torch.is_tensor(t) and t.dim() == 6), None)
+        if _i is None:
+            return None, None
+        tmp_idx = _i
     pi = batch[tmp_idx].to(device, non_blocking=True)
     rel = batch[tmp_idx + 1].to(device)
     pv = batch[tmp_idx + 2].to(device)
@@ -395,6 +668,12 @@ def evaluate_ego(model, loader, device, ego_idx, max_batches=40,
     model.eval()
     n = ade = fde = smae = amae = bacc = 0.0
     nc = adec = 0.0
+    ado = adcv = admv = adst = 0.0
+    nmv = nst = 0.0
+    # 連鎖乖離の代理指標 (2026-09-04): 高速帯 (v0 8-15 m/s) の wp0 縦バイアス。
+    # chain_decomp.py で連鎖乖離 +3.2s がこの量 (v132 −0.50, v140 last −0.87)
+    # にほぼ比例すると分かった。エポック末で読めれば ckpt 選択に使える。
+    hsb = hsn = 0.0
     done = 0
     for bi, batch in enumerate(loader):
         if bi % batch_stride:
@@ -406,6 +685,9 @@ def evaluate_ego(model, loader, device, ego_idx, max_batches=40,
             break
         imgs, K, Tc = (t.to(device, non_blocking=True) for t in batch[:3])
         eg = batch[ego_idx].to(device, non_blocking=True)
+        v_ = eg[:, 16]
+        if v_.sum() == 0:
+            continue
         pb, th = _temporal_inputs(model, batch, device, tmp_idx)
         with torch.autocast("cuda", torch.float16):
             out = model(imgs, K, Tc, eg[:, 12], pb, th) if th is not None \
@@ -413,26 +695,46 @@ def evaluate_ego(model, loader, device, ego_idx, max_batches=40,
         if not (isinstance(out, tuple) and len(out) >= 8):
             break
         p = out[7].float()
+        # Decomposition, so an ADE change can be attributed instead of guessed.
+        # Measured on r60 best_e2e over 720 val samples: ADE 0.622, oracle
+        # 0.491 (0.131 lost to mode SELECTION), constant-velocity 0.808 (the
+        # model beats "keep going straight at this speed" by only 23 %), and
+        # the stationary quarter of the frames is the WORST group at 0.688.
+        # None of that is visible from a single ADE number.
+        gwp = eg[:, :12].view(-1, 6, 2)
         if p.shape[1] > 15:                    # v29 multimodal (K=3)
             Kn = 3
             wps = p[:, :12 * Kn].view(-1, Kn, 6, 2)
+            dk = (wps - gwp[:, None]).norm(dim=3).mean(2)      # [B,K]
+            ado += (dk.min(1).values * v_).sum().item()
             mode = p[:, 12 * Kn:12 * Kn + Kn].argmax(1)
             wp1 = wps[torch.arange(len(p)), mode].reshape(-1, 12)
             p = torch.cat([wp1, p[:, 12 * Kn + Kn:]], 1)
-        v = eg[:, 16]
-        if v.sum() == 0:
-            continue
+        else:
+            ado += 0.0
+        _t = (torch.arange(6, device=p.device, dtype=p.dtype) + 1) * 0.5
+        cvp = torch.zeros_like(gwp)
+        cvp[..., 0] = eg[:, 12:13] * _t[None]
+        adcv += ((cvp - gwp).norm(dim=2).mean(1) * v_).sum().item()
+        v = v_
         d = (p[:, :12].view(-1, 6, 2) - eg[:, :12].view(-1, 6, 2)).norm(dim=2)
         ade += (d.mean(1) * v).sum().item()
         fde += (d[:, -1] * v).sum().item()
         vc = v * (eg[:, 11].abs() > 2.0).float()   # curve subset |lat@3s|>2m
         adec += (d.mean(1) * vc).sum().item()
         nc += vc.sum().item()
+        vhs = v * ((eg[:, 12] >= 8.0) & (eg[:, 12] < 15.0)).float()
+        hsb += ((p[:, 0] - eg[:, 0]) * vhs).sum().item(); hsn += vhs.sum().item()
+        vmv = v * (eg[:, 12] > 2.0).float()          # moving
+        vst = v * (eg[:, 12] <= 2.0).float()         # stopped / crawling
+        admv += (d.mean(1) * vmv).sum().item(); nmv += vmv.sum().item()
+        adst += (d.mean(1) * vst).sum().item(); nst += vst.sum().item()
         smae += ((p[:, 12] - eg[:, 14]).abs() * v).sum().item()
         amae += ((p[:, 13] - eg[:, 13]).abs() * v).sum().item()
         bacc += (((p[:, 14] > 0).float() == eg[:, 15]).float() * v).sum().item()
         n += v.sum().item()
     model.train()
+    _reeval_frozen(model)
     if raw:
         return torch.tensor([ade, fde, smae, amae, bacc, n,
                              adec, nc], dtype=torch.float64, device=device)
@@ -440,7 +742,11 @@ def evaluate_ego(model, loader, device, ego_idx, max_batches=40,
         return None
     return {"ade": ade / n, "fde": fde / n, "steer": smae / n,
             "acc": amae / n, "brake": bacc / n,
-            "ade_c": adec / nc if nc else float("nan")}
+            "ade_c": adec / nc if nc else float("nan"),
+            "ade_o": ado / n, "ade_cv": adcv / n,
+            "ade_mv": admv / nmv if nmv else float("nan"),
+            "ade_st": adst / nst if nst else float("nan"),
+            "hs_bias": hsb / hsn if hsn else float("nan"), "hs_n": hsn}
 
 
 @torch.no_grad()
@@ -459,6 +765,7 @@ def evaluate_occ(model, loader, device, occ_idx, max_batches=25):
         if not (isinstance(out, tuple) and len(out) == 9):
             break
         pred = out[8].argmax(1)
+        og = _fit(og, pred)
         valid = og != 255
         if valid.sum() == 0:
             continue
@@ -467,6 +774,7 @@ def evaluate_occ(model, loader, device, occ_idx, max_batches=25):
             inter[c] += (pi & gi).sum().item()
             union[c] += (pi | gi).sum().item()
     model.train()
+    _reeval_frozen(model)
     return {c: inter[c] / union[c] for c in range(10) if union[c]}
 
 
@@ -494,6 +802,7 @@ def evaluate_tl(model, loader, device, tl_idx, max_batches=40, tmp_idx=None):
             tot[g] += 1
             hit[g] += int(p == g)
     model.train()
+    _reeval_frozen(model)
     if sum(tot) == 0:
         return None
     r = {"acc": sum(hit) / sum(tot)}
@@ -519,6 +828,7 @@ def evaluate_risk(model, loader, device, rk_idx, max_batches=30, tmp_idx=None):
         if not (isinstance(out, tuple) and len(out) >= 13):
             break
         p = out[12][:, 0].float().sigmoid()
+        gt = _fit(gt, p)
         m = gt >= 0
         if m.sum() == 0:
             continue
@@ -528,6 +838,7 @@ def evaluate_risk(model, loader, device, rk_idx, max_batches=30, tmp_idx=None):
         if hi.any():
             l1h += float(d[hi].sum()); nh += float(hi.sum())
     model.train()
+    _reeval_frozen(model)
     if n == 0:
         return None
     return {"l1": l1 / n, "l1_hi": l1h / max(nh, 1)}
@@ -585,6 +896,7 @@ def evaluate_lanegraph(model, loader, device, lg_idx, max_batches=20,
                     a_hit += int(a_p == a_g)
                     a_tot += 1
     model.train()
+    _reeval_frozen(model)
     if tp + fn == 0:
         return None
     return {"p": tp / max(tp + fp, 1), "r": tp / max(tp + fn, 1),
@@ -602,7 +914,7 @@ def evaluate_flow(model, loader, device, bx_idx, max_batches=20,
         if bi >= max_batches:
             break
         imgs, K, Tc = (t.to(device, non_blocking=True) for t in batch[:3])
-        bx, nb = batch[bx_idx], batch[bx_idx + 1]
+        bx, nb = batch[bx_idx], batch[bx_idx + 1].clamp(min=0)
         tj, tv = batch[bx_idx + 2], batch[bx_idx + 3]
         pb, th = _temporal_inputs(model, batch, device, tmp_idx)
         with torch.autocast("cuda", torch.float16):
@@ -617,6 +929,10 @@ def evaluate_flow(model, loader, device, bx_idx, max_batches=20,
                     continue
                 ri = int((40 - xe) / 0.4)
                 ci = int((40 - ye) / 0.4)
+                # a rear-truncated grid gives the flow head fewer rows than the
+                # +-40 m window; agents behind the new limit have no cell
+                if not (0 <= ri < fl.shape[-2] and 0 <= ci < fl.shape[-1]):
+                    continue
                 vx = vy = 0.0
                 if tv[b, k, 0] > 0.5:
                     vx, vy = (float(tj[b, k, 0, 0]) / 0.5,
@@ -628,6 +944,7 @@ def evaluate_flow(model, loader, device, bx_idx, max_batches=20,
                 else:
                     es += e; ns += 1
     model.train()
+    _reeval_frozen(model)
     if nm + ns == 0:
         return None
     return {"epe_mov": em / max(nm, 1), "epe_stat": es / max(ns, 1)}
@@ -669,6 +986,7 @@ def evaluate_unknown(model, loader, device, uk_idx, max_batches=20,
                     fp += 1
             fn += used.count(False)
     model.train()
+    _reeval_frozen(model)
     if tp + fn == 0:
         return None
     return {"p": tp / max(tp + fp, 1), "r": tp / max(tp + fn, 1)}
@@ -694,6 +1012,7 @@ def evaluate_unknown_dense(model, loader, device, um_idx, max_batches=20,
         if len(out) < 18:
             break
         prob = out[17].float().sigmoid()[:, 0].detach().cpu().numpy()
+        um = _fit(um, out[17])
         for b in range(prob.shape[0]):
             g = um[b].numpy()
             if (g >= 0).sum() == 0:              # all -1 = no GT frame
@@ -735,6 +1054,7 @@ def evaluate_unknown_dense(model, loader, device, um_idx, max_batches=20,
                 elif far:
                     tp_f += 1
     model.train()
+    _reeval_frozen(model)
     if tp + fn == 0:
         return None
     return {"p": tp / max(tp + fp, 1), "r": tp / max(tp + fn, 1),
@@ -754,7 +1074,7 @@ def evaluate_traj(model, loader, device, tj_idx, max_batches=40,
             break
         imgs, K, Tc = (t.to(device, non_blocking=True) for t in batch[:3])
         bx = batch[tj_idx].to(device)
-        nb = batch[tj_idx + 1]
+        nb = batch[tj_idx + 1].clamp(min=0)
         tj = batch[tj_idx + 2].to(device)
         tv = batch[tj_idx + 3].to(device)
         pb, th = _temporal_inputs(model, batch, device, tmp_idx)
@@ -799,6 +1119,7 @@ def evaluate_traj(model, loader, device, tj_idx, max_batches=40,
                         gt_s = float(tj[b, k, 5].norm()) < 0.5
                         _STAT[0] += int(pred_s == gt_s); _STAT[1] += 1
     model.train()
+    _reeval_frozen(model)
     if n == 0:
         return None
     r = {"ade": ade / n, "fde": fde / max(nf, 1)}
@@ -812,29 +1133,109 @@ def evaluate_traj(model, loader, device, tj_idx, max_batches=40,
     return r
 
 
+
+@torch.no_grad()
+def thickness_ratio(model, loader, device, classes=(4, 5, 6), max_batches=10):
+    """predicted area / GT area per class. 1.0 is correct, >1 is too fat.
+
+    mIoU cannot see this: widening a 1-cell line to 3 cells grows the union
+    about as fast as the intersection, so r54 set a best-ever mIoU (0.3359 on
+    the 7-class slice) while laneline went from 2.71x to 2.96x the GT area and
+    the lines visibly bled. Anything the metric does not show, the round will
+    happily make worse.
+    """
+    model.eval()
+    P = {c: 0 for c in classes}
+    G = {c: 0 for c in classes}
+    for bi, batch in enumerate(loader):
+        if bi >= max_batches:
+            break
+        imgs, K, Tc = (t.to(device, non_blocking=True) for t in batch[:3])
+        with torch.autocast("cuda", torch.float16):
+            out = model(imgs, K, Tc)
+        pr = (out[0] if isinstance(out, tuple) else out).float().argmax(1)
+        gt = _fit(batch[3].to(device), pr)
+        for c in classes:
+            P[c] += int((pr == c).sum())
+            G[c] += int((gt == c).sum())
+    return {c: (P[c] / G[c] if G[c] else float("nan")) for c in classes}
+
+
 @torch.no_grad()
 def evaluate_det3d(model, loader, device, bx_idx, max_batches=30,
                    tmp_idx=None, thresh=0.3, match_m=2.0):
     """BEV 3D detection: per-class precision/recall (centre match <2 m) and
-    mean centre error on matched pairs."""
+    centre, size, yaw and four-corner errors on matched pairs."""
     model.eval()
     tp = [0, 0]
     fp = [0, 0]
     fn = [0, 0]
     cerr = [0.0, 0.0]
+    lerr = [0.0, 0.0]
+    werr = [0.0, 0.0]
+    corner_err = [0.0, 0.0]
     yerr = [0.0, 0.0]
     yflip = [0, 0]
     tp50 = [0, 0]
     fn50 = [0, 0]
     tpn = [0, 0]
     fnn = [0, 0]
+    # Vehicle localisation split around ego. Aggregate metrics hid the exact
+    # rear/far failure this round is targeting.
+    z_gt = [0, 0, 0, 0]       # front 0-40, front 40-80, rear 0-40, rear 40-80
+    z_tp = [0, 0, 0, 0]
+    z_err = [0.0, 0.0, 0.0, 0.0]
+    z_lerr = [0.0, 0.0, 0.0, 0.0]
+    z_werr = [0.0, 0.0, 0.0, 0.0]
+    z_corner = [0.0, 0.0, 0.0, 0.0]
+    z_yerr = [0.0, 0.0, 0.0, 0.0]
+    def _zone(x):
+        if x >= 0:
+            return 0 if x < 40 else (1 if x <= 80 else None)
+        return 2 if x > -40 else (3 if x >= -80 else None)
+    def _corners(x, y, l, w, yaw):
+        """Clockwise BEV corners; cyclic matching makes yaw+pi equivalent."""
+        local = np.asarray(((l / 2, w / 2), (l / 2, -w / 2),
+                            (-l / 2, -w / 2), (-l / 2, w / 2)),
+                           dtype=np.float64)
+        cs, sn = np.cos(yaw), np.sin(yaw)
+        rot = np.asarray(((cs, -sn), (sn, cs)), dtype=np.float64)
+        return local @ rot.T + np.asarray((x, y), dtype=np.float64)
+
+    def _corner_mae(pred, truth):
+        pc = _corners(*pred)
+        gc = _corners(*truth)
+        return min(float(np.linalg.norm(pc - np.roll(gc, k, axis=0), axis=1).mean())
+                   for k in range(4))
     s_tp = s_fp = s_tn = s_fn = 0        # stationary-flag confusion
+    s_scores, s_truth = [], []             # threshold/calibration audit
+    s_zone = [[0, 0, 0, 0] for _ in range(4)]  # TP, FP, TN, FN by x zone
     for bi, batch in enumerate(loader):
         if bi >= max_batches:
             break
         imgs, K, Tc = (t.to(device, non_blocking=True) for t in batch[:3])
+        # 箱テンソルは形状で特定する (2026-08-14): 損失重みを 0 にすると
+        # use_depth/use_seg2d 等が落ちてタプル長が変わり、呼び出し側の
+        # 固定インデックス式 (4 + use_seg2d ...) が別のテンソルを指す。
+        # 箱は [B,K,6]、個数は [B] の整数系という形で一意に決まる。
+        if not (torch.is_tensor(batch[bx_idx]) and batch[bx_idx].dim() == 3
+                and batch[bx_idx].shape[-1] == 6):
+            bx_idx = next((i for i, t in enumerate(batch)
+                           if torch.is_tensor(t) and t.dim() == 3
+                           and t.shape[-1] == 6), bx_idx)
+        if os.environ.get("METEOR_DET_DEBUG") and bi == 0:
+            print("[det3d-dbg] bx_idx=", bx_idx, "tmp_idx=", tmp_idx,
+                  "shapes=", [tuple(t.shape) if torch.is_tensor(t) else "?"
+                              for t in batch][:8], flush=True)
         bx = batch[bx_idx]
         nb = batch[bx_idx + 1]
+        # 個数テンソルは [B] だったり [B,1] だったりする。以前ここで
+        # dim()!=1 を「並びが違う」と判断して全バッチを飛ばしてしまい、
+        # 検出が常に 0 個 = vehRn/P/yaw が全部 0 と表示されていた
+        # (2026-08-14, ユーザー報告)。形を潰して受け入れる。
+        if torch.is_tensor(nb) and nb.dim() > 1:
+            nb = nb.reshape(nb.shape[0], -1)[:, 0]
+        nb = nb.clamp(min=0)
         pb, th = _temporal_inputs(model, batch, device, tmp_idx)
         with torch.autocast("cuda", torch.float16):
             out = model(imgs, K, Tc, None, pb, th) if th is not None \
@@ -843,9 +1244,11 @@ def evaluate_det3d(model, loader, device, bx_idx, max_batches=30,
                                   thresh=thresh, topk=64)
         # stationary-flag accuracy at GT vehicle centres (r46 metric):
         # GT static = 3 s displacement <=0.35 m; 0.35-0.8 m dead-band
-        if len(out) >= 11 and len(batch) > bx_idx + 3:
-            traj_g = batch[bx_idx + 2]
-            tval_g = batch[bx_idx + 3]
+        traj_g = batch[bx_idx + 2] if len(batch) > bx_idx + 2 else None
+        tval_g = batch[bx_idx + 3] if len(batch) > bx_idx + 3 else None
+        if (len(out) >= 11 and torch.is_tensor(traj_g) and traj_g.dim() == 4
+                and torch.is_tensor(tval_g) and tval_g.dim() == 3
+                and tval_g.shape[1] == bx.shape[1]):
             stat_p = out[10][:, 0].float().sigmoid().cpu()
             from bevlane.model import DET_RES as _DR
             for b in range(bx.shape[0]):
@@ -860,26 +1263,39 @@ def evaluate_det3d(model, loader, device, bx_idx, max_batches=30,
                     if not (0 <= ri < stat_p.shape[-2]
                             and 0 <= ci < stat_p.shape[-1]):
                         continue
-                    pred_s = float(stat_p[b, ri, ci]) > 0.5
+                    score_s = float(stat_p[b, ri, ci])
+                    pred_s = score_s > 0.5
                     gt_s = d3 <= 0.35
+                    s_scores.append(score_s)
+                    s_truth.append(gt_s)
+                    _szi = _zone(float(bx[b, k, 1]))
                     if pred_s and gt_s:
                         s_tp += 1
+                        if _szi is not None: s_zone[_szi][0] += 1
                     elif pred_s and not gt_s:
                         s_fp += 1
+                        if _szi is not None: s_zone[_szi][1] += 1
                     elif not pred_s and gt_s:
                         s_fn += 1
+                        if _szi is not None: s_zone[_szi][3] += 1
                     else:
                         s_tn += 1
+                        if _szi is not None: s_zone[_szi][2] += 1
         for b in range(bx.shape[0]):
             gt = [(0 if bx[b, k, 0] < 1.5 else 1,
                    float(bx[b, k, 1]), float(bx[b, k, 2]),
+                   float(bx[b, k, 3]), float(bx[b, k, 4]),
                    float(bx[b, k, 5]))
                   for k in range(int(nb[b])) if bx[b, k, 3] > 0]
+            for gc, gx, _gy, _gl, _gw, _ga in gt:
+                zi = _zone(gx)
+                if gc == 0 and zi is not None:
+                    z_gt[zi] += 1
             used = [False] * len(gt)
             for cls, sc, xe, ye, l, w, yaw in sorted(dets[b],
                                                      key=lambda d: -d[1]):
                 best, bd = -1, match_m
-                for gi, (gc, gx, gy, gyaw) in enumerate(gt):
+                for gi, (gc, gx, gy, _gl, _gw, _gyaw) in enumerate(gt):
                     if used[gi] or gc != cls:
                         continue
                     d = ((gx - xe) ** 2 + (gy - ye) ** 2) ** 0.5
@@ -889,17 +1305,30 @@ def evaluate_det3d(model, loader, device, bx_idx, max_batches=30,
                     used[best] = True
                     tp[cls] += 1
                     cerr[cls] += bd
-                    dy = abs((yaw - gt[best][3] + np.pi) % (2 * np.pi) - np.pi)
+                    _, gx, gy, gl, gw, gyaw = gt[best]
+                    lerr[cls] += abs(l - gl)
+                    werr[cls] += abs(w - gw)
+                    ce = _corner_mae((xe, ye, l, w, yaw),
+                                     (gx, gy, gl, gw, gyaw))
+                    corner_err[cls] += ce
+                    dy = abs((yaw - gyaw + np.pi) % (2 * np.pi) - np.pi)
                     yflip[cls] += dy > np.pi / 2
                     yerr[cls] += min(dy, np.pi - dy)   # axis error
-                    gx, gy = gt[best][1], gt[best][2]
+                    zi = _zone(gx)
+                    if cls == 0 and zi is not None:
+                        z_tp[zi] += 1
+                        z_err[zi] += bd
+                        z_lerr[zi] += abs(l - gl)
+                        z_werr[zi] += abs(w - gw)
+                        z_corner[zi] += ce
+                        z_yerr[zi] += min(dy, np.pi - dy)
                     if gx * gx + gy * gy < 50.0 ** 2:
                         tp50[cls] += 1
                     if gx * gx + gy * gy < 30.0 ** 2 and abs(gy) < 12.0:
                         tpn[cls] += 1
                 else:
                     fp[cls] += 1
-            for gi, (gc, gx, gy, _) in enumerate(gt):
+            for gi, (gc, gx, gy, _gl, _gw, _gyaw) in enumerate(gt):
                 if not used[gi]:
                     fn[gc] += 1
                     if gx * gx + gy * gy < 50.0 ** 2:
@@ -907,11 +1336,15 @@ def evaluate_det3d(model, loader, device, bx_idx, max_batches=30,
                     if gx * gx + gy * gy < 30.0 ** 2 and abs(gy) < 12.0:
                         fnn[gc] += 1
     model.train()
+    _reeval_frozen(model)
     r = {}
     for c, nm in ((0, "veh"), (1, "vru")):
         p_ = tp[c] / max(tp[c] + fp[c], 1)
         rc = tp[c] / max(tp[c] + fn[c], 1)
         r[nm] = (p_, rc, cerr[c] / max(tp[c], 1))
+        r[nm + "_shape"] = (lerr[c] / max(tp[c], 1),
+                             werr[c] / max(tp[c], 1),
+                             corner_err[c] / max(tp[c], 1))
         r[nm + "_yaw"] = np.degrees(yerr[c] / max(tp[c], 1))
         r[nm + "_flip"] = yflip[c] / max(tp[c], 1)
         r[nm + "50"] = tp50[c] / max(tp50[c] + fn50[c], 1)
@@ -920,6 +1353,39 @@ def evaluate_det3d(model, loader, device, bx_idx, max_batches=30,
     r["stat"] = (s_tp / max(s_tp + s_fp, 1), s_tp / max(s_tp + s_fn, 1),
                  (s_tp + s_tn) / max(tot, 1),
                  (s_tn) / max(s_tn + s_fp, 1), tot)
+    r["stat_zones"] = tuple(
+        (v[0] / max(v[0] + v[1], 1),
+         v[0] / max(v[0] + v[3], 1),
+         v[2] / max(v[2] + v[1], 1), sum(v),
+         (v[0] + v[3]) / max(sum(v), 1))
+        for v in s_zone)
+    if s_scores and any(s_truth) and not all(s_truth):
+        ss = np.asarray(s_scores, np.float64)
+        st = np.asarray(s_truth, bool)
+        vals = np.unique(ss)
+        cuts = np.r_[vals[0] - 1e-6, (vals[:-1] + vals[1:]) / 2,
+                     vals[-1] + 1e-6]
+        def _sm(t):
+            pred = ss > t
+            _tp = int(np.sum(pred & st)); _fp = int(np.sum(pred & ~st))
+            _tn = int(np.sum(~pred & ~st)); _fn = int(np.sum(~pred & st))
+            _p = _tp / max(_tp + _fp, 1)
+            _r = _tp / max(_tp + _fn, 1)
+            _sp = _tn / max(_tn + _fp, 1)
+            return (float(t), _p, _r, (_tp + _tn) / len(st), _sp,
+                    (_r + _sp) / 2)
+        trials = [_sm(t) for t in cuts]
+        bal = max(trials, key=lambda x: (x[5], x[4], x[2]))
+        safe_set = [x for x in trials if x[4] >= 0.95]
+        safe = max(safe_set, key=lambda x: (x[2], x[5])) \
+            if safe_set else None
+        r["stat_cal"] = {"balanced": bal, "safe95": safe}
+    r["veh_zones"] = tuple(
+        (z_tp[i] / max(z_gt[i], 1), z_err[i] / max(z_tp[i], 1), z_gt[i],
+         z_corner[i] / max(z_tp[i], 1), z_lerr[i] / max(z_tp[i], 1),
+         z_werr[i] / max(z_tp[i], 1),
+         np.degrees(z_yerr[i] / max(z_tp[i], 1)))
+        for i in range(4))
     return r
 
 
@@ -937,6 +1403,7 @@ def class_pr(model, loader, device, cls, max_batches=40):
             if isinstance(logits, tuple):
                 logits = logits[0]
         pred = logits.argmax(1)
+        gt = _fit(gt, pred)
         pc, gc = pred == cls, gt == cls
         lab = gt > 0
         tp += (pc & gc).sum().item()
@@ -946,6 +1413,7 @@ def class_pr(model, loader, device, cls, max_batches=40):
         pcount += pc.sum().item()
         gcount += gc.sum().item()
     model.train()
+    _reeval_frozen(model)
     p = tp / max(tp + fp, 1)
     r = tp / max(tp + fn, 1)
     ratio = pcount / max(gcount, 1)
@@ -961,17 +1429,139 @@ def main():
     ap.add_argument("--workers", type=int, default=6)
     ap.add_argument("--out", default="out/bevlane_ckpt")
     ap.add_argument("--limit-train", type=int, default=None)
-    ap.add_argument("--model", default="v1", choices=["v1", "v2", "v3s", "lss", "v8", "v13", "v13d", "v14d", "v15", "v16", "v17", "v18", "v19", "v20", "v21", "v22", "v23", "v24", "v25", "v26", "v27", "v28", "v29", "v30", "v31", "v32", "v33", "v34", "v35", "v36", "v37", "v38", "v39", "v40", "v41", "v42", "v43", "v44", "v45", "v46", "v47", "v48"])
+    ap.add_argument("--model", default="v1", choices=["v1", "v2", "v3s", "lss", "v8", "v13", "v13d", "v14d", "v15", "v16", "v17", "v18", "v19", "v20", "v21", "v22", "v23", "v24", "v25", "v26", "v27", "v28", "v29", "v30", "v31", "v32", "v33", "v34", "v35", "v36", "v37", "v38", "v39", "v40", "v41", "v42", "v43", "v44", "v45", "v46", "v47", "v48", "v49", "v50", "v51", "v52", "v53", "v54", "v55", "v56", "v63b", "v64r50", "v52r50", "v52r50s8", "v52rvgg", "v55rvgg", "v52s8"])
+    ap.add_argument("--freeze-depth", action="store_true",
+                    help="train no depth-head parameter. The head is pulled by "
+                         "25 downstream losses through the lift, and shifting "
+                         "every depth by the same amount is very nearly a FLAT "
+                         "direction of that objective -- measured: a +30 m bias "
+                         "left the lift weight sharpness at 7.22 against 7.31 "
+                         "and mIoU unchanged, because the lift normalises "
+                         "across cameras, not along the ray. The only force "
+                         "holding the metric scale is the depth L1 at an "
+                         "effective weight of 0.06, and it loses: r51 and r52 "
+                         "both drifted from 3.10 m to ~30 m MAE while every "
+                         "other metric stayed healthy. Freeze it here and "
+                         "re-distil the head on its own instead.")
     ap.add_argument("--depth-w", type=float, default=0.3)
     ap.add_argument("--seg2d-w", type=float, default=0.5)
     ap.add_argument("--seg2d-key", default="seg2d",
                     help="manifest key: seg2d (12cls) or seg2d21 (csv 21cls)")
     ap.add_argument("--n-seg2d", type=int, default=12,
                     help="2D seg head classes (21 with --seg2d-key seg2d21)")
+    ap.add_argument("--gt-lidar-w", type=float, default=40.0,
+                    help="LiDAR points a GT box needs for full weight. "
+                         "0 disables. A box with no points is dropped "
+                         "from the target entirely: measured on val, "
+                         "13 %% of 60-80 m GT boxes have zero LiDAR "
+                         "support, and evaluating only against boxes "
+                         "with >=40 points lifts 40-60 m recall from "
+                         "0.34 to 0.44. Training on unsupported boxes "
+                         "teaches the detector to fire without "
+                         "evidence.")
     ap.add_argument("--box-w", type=float, default=0.0,
                     help="BEV 3D-box occupancy multi-task loss weight (v15)")
     ap.add_argument("--bbox2d-w", type=float, default=0.0,
                     help="per-camera 10-class 2D bbox det loss weight (v17)")
+    ap.add_argument("--n-cams", type=int, default=8,
+                    help="cameras fed to the network. CAMS ends with "
+                         "CAM_BACK_NARROW, so 7 drops exactly that one and "
+                         "runs the backbone and depth tower 7/8 as often. "
+                         "Different from --cam-drop, which ZEROES it and keeps "
+                         "the compute.")
+    ap.add_argument("--sparse-24", action="store_true",
+                    help="2:4 structured-sparse TRAINING: prune once by "
+                         "magnitude (groups of 4 along input channels, the "
+                         "pattern TensorRT SPARSE_WEIGHTS accepted and timed "
+                         "at -11%% workstation GPU / -9.5%% Orin), then keep the mask "
+                         "fixed and re-apply after every optimiser step so "
+                         "the surviving weights retrain. First conv is dense "
+                         "automatically (in=3); named output layers stay "
+                         "dense too.")
+    ap.add_argument("--freeze-trunk", action="store_true",
+                    help="共有部 (backbone/FPN/depth/ctx/リフト/時間融合) を"
+                         "凍結し、各ヘッドだけを学習する。共有の学習可能"
+                         "パラメータが無くなるので、ヘッド同士の勾配干渉が"
+                         "構造的にゼロになる (BN 統計も凍結)")
+    ap.add_argument("--det-head-only", action="store_true",
+                    help="3D BBox ヘッドだけを微調整 (backbone/リフト/時間融合/"
+                         "他ヘッドは全て凍結し BN 統計も止める)。共有特徴が"
+                         "動かないので seg/E2E など他出力は数値的に不変 = "
+                         "ゼロリスクで姿勢だけ直せるかの検証・実運用手段")
+    ap.add_argument("--det-only", action="store_true",
+                    help="3D BBox 単独学習 (切り分け用): det 以外の損失を 0 に "
+                         "し、det 経路外のヘッドを凍結する。DDP は勾配の来ない "
+                         "パラメータで落ちるため、重み 0 と凍結はセットで必要。"
+                         "refiner は hm/reg/seg/ego を同時に出すので "
+                         "METEOR_NOREF=1 と併用すること")
+    ap.add_argument("--depth-ent-w", type=float, default=0.0,
+                    help="深度分布のエントロピー罰則 (鋭化)。実測で 30-60m 帯は"
+                         "ほぼ一様分布 (最大確率 0.07) になっており、これが"
+                         "遠方 3D BBox recall の頭打ちの直接原因")
+    ap.add_argument("--depth-far-w", type=float, default=0.0,
+                    help="遠方画素の深度 CE 重み (0 で従来と同一)")
+    ap.add_argument("--lidar-distill-w", type=float, default=0.0,
+                    help="LiDAR->カメラのモダリティ蒸留の重み (0=無効)。"
+                         "教師=LiDAR 強制 ON の no-grad パス、生徒=主パスの"
+                         "LiDAR ドロップ行。fused BEV と det hm の L2")
+    ap.add_argument("--lidar-distill-every", type=int, default=4,
+                    help="蒸留を行うステップ間隔 (全 rank 同期のため step 基準)")
+    ap.add_argument("--yaw-fix-deg", type=float, default=0.0,
+                    help="GT 層間回転の補正角 [deg]。ポーズ由来 GT (BEV ラスタ"
+                         "・wp) を自車原点まわりに回す (out/yawfix_plan.md)")
+    ap.add_argument("--bn-guard", type=float, default=0.0,
+                    help="in-loop conv->BN renorm when running_var exceeds "
+                         "this (0=off). Function-preserving; 1e4 recommended")
+    ap.add_argument("--det-sup-front", type=float, default=None,
+                    help="det loss supervision window forward limit [m]")
+    ap.add_argument("--det-sup-rear", type=float, default=None,
+                    help="det loss supervision window rear limit [m]")
+    ap.add_argument("--lat-min", type=float, default=0.3,
+                    help="lat-aug magnitude lower bound [m]. C2 measured the "
+                         "recovery skill weakest exactly below the training "
+                         "range floor (0.5 m offsets recover 19-25 %% by 3 s "
+                         "vs 51 %% at 1.0 m); 0.1 widens the taught range")
+    ap.add_argument("--img-scale", type=int, default=1,
+                    help="upsample input images (and K/bbox2d) by this "
+                         "factor at load time -- R7 resolution axis")
+    ap.add_argument("--seg-deep", type=int, default=0,
+                    help="attach an N-block zero-init residual tower on the "
+                         "BEV seg head (heads are cheap on Orin)")
+    ap.add_argument("--det-deep", type=int, default=0,
+                    help="attach an N-block zero-init residual tower on the "
+                         "3D det trunk")
+    ap.add_argument("--lane-branch", action="store_true",
+                    help="dedicated residual decoder for the thin classes "
+                         "(laneline/stopline/road_edge). Zero-init: attaches "
+                         "to a trained checkpoint function-preservingly. The "
+                         "Orin profile priced heads at ~18 ms total, so the "
+                         "1-2 ms cost objection to a separate lane head is "
+                         "gone; this tests the accuracy side.")
+    ap.add_argument("--lane-sdf-w", type=float, default=0.0,
+                    help="auxiliary lane signed-distance regression (probe). "
+                         "L1 to the metre distance-to-nearest-laneline, "
+                         "clipped at 2 m, supervised within a 3 m band. "
+                         "Attacks the sub-cell label-jitter ceiling that CE "
+                         "cannot (M5); measured levers on the loss side are "
+                         "exhausted.")
+    ap.add_argument("--ema", type=float, default=0.0,
+                    help="EMA decay for the trainable weights (0 = off). The "
+                         "averaged weights are evaluated next to the raw ones "
+                         "each epoch, never assumed better.")
+    ap.add_argument("--ego-ce-tau", type=float, default=0.0,
+                    help="soft selector target: CE against "
+                         "softmax(-candidate_error/tau) instead of the hard "
+                         "argmin. 0 keeps the hard target. The argmin is a "
+                         "coin flip on 44%% of frames (median best-vs-second "
+                         "gap 0.231 m), which is why the selector picks the "
+                         "best mode on only 37%% against a 33%% baseline.")
+    ap.add_argument("--ego-fde-w", type=float, default=0.3,
+                    help="extra weight on the +3.0 s waypoint of the "
+                         "SELECTED candidate, added on top of the "
+                         "per-step loss. Re-weighting the profile "
+                         "instead (r56, flat EGO_TW) cost 18 % of ADE "
+                         "and ADEc; this adds supervision without "
+                         "removing any.")
     ap.add_argument("--ego-w", type=float, default=0.0,
                     help="E2E ego head loss weight: traj/steer/accel/brake (v18)")
     ap.add_argument("--occ-w", type=float, default=0.0,
@@ -990,8 +1580,65 @@ def main():
                     help="draw weight for turn frames (|lat@3s|>4m)")
     ap.add_argument("--unk-w", type=float, default=0.0)
     ap.add_argument("--unk-dense-w", type=float, default=0.0)
+    ap.add_argument("--intent-drop", type=float, default=0.3,
+                    help="fraction of samples whose driving command is zeroed "
+                         "(modality dropout). The selector is evaluated with "
+                         "NO command, so this is what trains it to infer the "
+                         "manoeuvre instead of copying the command.")
     ap.add_argument("--intent-w", type=float, default=0.0,
                     help="v43 command-consistency hinge weight")
+    ap.add_argument("--paint-seg", default="",
+                    help="PointPainting: seg2d の指定クラス確率をリフト前の "
+                         "ctx にゼロ初期化 1x1 射影で加算 (例 2,3,4,5,6,7)")
+    ap.add_argument("--ego-conv-pool", default="",
+                    help="ego の大域平均プーリングを INT8 耐性のある畳み込みへ"
+                         "置き換える。値は make_ego_pool_stats.py が出す JSON。"
+                         "統計で正規化を畳み込み、ego_mlp 側で打ち消すので"
+                         "変換直後の出力は不変 (機能保存)")
+    ap.add_argument("--pact", default="",
+                    help="上限つき ReLU (PACT) に置換する層の接頭辞 "
+                         "(例 tfuse,ego_stem)。alpha は実測 max で初期化する "
+                         "ので導入時点は機能保存")
+    ap.add_argument("--pact-w", type=float, default=0.0,
+                    help="PACT の alpha に掛ける L1。上限を押し下げて外れ値を刈る")
+    ap.add_argument("--pact-lr", type=float, default=0.02,
+                    help="PACT の alpha 専用 lr。alpha は実測 max (30-130) から "
+                         "p99.9 の数倍 (10-15) まで下げる必要があり、本体の lr "
+                         "(1e-4) では Adam でも届かないため別グループにする")
+    ap.add_argument("--pact-alpha-init", default="out/pact_alpha_init.json",
+                    help="層名 -> alpha 初期値の JSON (実測 max x1.10)")
+    ap.add_argument("--dense-teacher", default="",
+                    help="密教師 ckpt (例 out/ckpt_v151/best_e2e.pt)。スパース微調整で fused BEV と E2E 出力を教師に合わせる (2026-09-07)")
+    ap.add_argument("--dense-distill-w", type=float, default=0.0, help="密教師蒸留の重み (0=無効)")
+    ap.add_argument("--dense-distill-ego-w", type=float, default=1.0, help="蒸留のうち E2E 出力 (ego) の相対重み")
+    ap.add_argument("--dense-distill-every", type=int, default=1, help="教師パスを何 step 毎に走らせるか")
+    ap.add_argument("--ema-exclude", default="",
+                    help="EMA に含めないパラメータ接頭辞 (カンマ区切り, 例 seg_head.)")
+    ap.add_argument("--sparse-ramp-steps", type=int, default=0,
+                    help="2:4 を段階的に入れる: 最初の N step は 1:4 (各 4 要素の最小 1 つだけ零) で学習し、"
+                         "N step 後に 2:4 へ切替 (一発剪定より回復が良い; v157, 2026-09-08)")
+    ap.add_argument("--sparse-exclude", default="",
+                    help="--sparse-24 で密のまま残すモジュール接頭辞 (カンマ区切り, 例 ego_,traj_,tfuse3,tgate,sem_ego,delta_stat,refiner.e2e)")
+    ap.add_argument("--hist-lr-mult", type=float, default=1.0,
+                    help="履歴系モジュール (tfuse3/tgate/traj_stem/delta_stat/ego 系) の lr 倍率")
+    ap.add_argument("--val-hs", type=int, default=240,
+                    help="エポック末に高速帯 (v0>=8) の val フレームを最大 N 枚別途評価し、"
+                         "wp0 縦バイアスを best_chain 選択に使う (0=無効)")
+    ap.add_argument("--depth-slim-force", action="store_true",
+                    help="init の深度頭幅と違っても要求した --depth-slim 幅を"
+                         "維持し、init を先頭チャネルで切り出して初期化する")
+    ap.add_argument("--depth-band-balance", type=float, default=0.0,
+                    help="深度 CE を 10m 帯の逆頻度で重み付け (1.0 で完全均等)。"
+                         "深度 GT の有効画素は 0-10m が 58.9%%、40-60m は 4.6%% "
+                         "しかなく、--depth-far-w は最大 2 倍にしかならない")
+    ap.add_argument("--paint-det", default="",
+                    help="2D 検出ヒートマップ (hm2d) の指定クラス確率を"
+                         "リフト前の ctx にゼロ初期化 1x1 射影で加算 "
+                         "(例 0,1,2)。深度分布の鋭化が飽和した遠方物体を、"
+                         "2D で見えている証拠として BEV に届ける")
+    ap.add_argument("--offroad-w", type=float, default=0.0,
+                    help="コマンド経路が走行可能面を外れることへの罰則 "
+                         "(距離場 x 最悪2点 x 選択モードのみ)")
     ap.add_argument("--intent-mode-w", type=float, default=0.0,
                     help="v44 command->mode CE weight (raw logits)")
     ap.add_argument("--lat-aug", type=float, default=0.0,
@@ -1002,12 +1649,19 @@ def main():
                     help="v45 INT8-robust feature noise (1.0 = 1 LSB)")
     ap.add_argument("--use-sdmap", action="store_true",
                     help="v46: feed the OSM SD-map raster (optional input)")
+    ap.add_argument("--val-scenes-file", default=None,
+                    help="val シーンを固定リストで上書き (ホールドアウト評価用)")
     ap.add_argument("--val-batch", type=int, default=0,
                     help="batch for the val loaders (default: max(train batch, 2)); evaluation is no-grad, so it should not shrink with the training batch -- at batch 1 the capped evals covered half the samples and the rare curve subset (ADEc) hit zero -> nan")
     ap.add_argument("--sync-bn", action="store_true",
                     help="SyncBatchNorm: needed when the batch per GPU drops to 1")
     ap.add_argument("--grad-ckpt", action="store_true",
                     help="checkpoint the image backbone: ~15%% slower, frees several GB of activations")
+    ap.add_argument("--intent-margin", type=float, default=1.5,
+                    help="metres the commanded mode must reach in the "
+                         "commanded direction before the direction hinge goes "
+                         "silent; set from the acceptance bar (>= half the "
+                         "required command spread), not left at the default")
     ap.add_argument("--intent-wrong", type=float, default=0.0,
                     help="fraction of commanded rows given a "
                          "DELIBERATELY wrong command; their "
@@ -1032,14 +1686,34 @@ def main():
                          "that get the predicted raster fed back")
     ap.add_argument("--stat-w", type=float, default=None,
                     help="stationary-flag loss weight (default: traj-w)")
+    ap.add_argument("--stat-margin", type=float, default=0.0,
+                    help="extra signed-logit margin for stationary/moving "
+                         "cells. A positive value keeps logits away from the "
+                         "zero decision boundary and improves INT8 robustness")
+    ap.add_argument("--stat-quant-head", type=float, default=0.0,
+                    help="replace stat_head2 by an equivalent +/- branch "
+                         "with this bounded logit cap (e.g. 8); creates a "
+                         "stable head-specific INT8 activation range")
     ap.add_argument("--bev-dropblock", type=float, default=0.0,
                     help="MAE-like BEV block-mask prob per sample")
+    ap.add_argument("--bev-wedgedrop", type=float, default=0.0,
+                    help="BEV 角度セクタ (くさび) 零化のサンプル毎確率。"
+                         "カメラ 1 本分の視野欠損を特徴レベルで模擬")
+    ap.add_argument("--bev-ringdrop", type=float, default=0.0,
+                    help="BEV 距離帯リング零化のサンプル毎確率")
+    ap.add_argument("--bev-chandrop", type=float, default=0.0,
+                    help="BEV チャネルドロップ率 (SpatialDropout 風)")
     ap.add_argument("--use-tl", action="store_true",
                     help="v47: per-camera box-level traffic-light input")
     ap.add_argument("--tl-drop", type=float, default=0.5,
                     help="prob of dropping the TL input per sample")
     ap.add_argument("--sdmap-drop", type=float, default=0.5,
                     help="whole-sample SD-map dropout (modality dropout)")
+    ap.add_argument("--cam-drop", type=float, default=0.0,
+                    help="probability of feeding CAM_BACK_NARROW as zeros on "
+                         "an 8-camera sample, so one set of weights stays "
+                         "calibrated for both the 8- and the 7-camera rig "
+                         "(x2gen2 has no CAM_BACK_NARROW)")
     ap.add_argument("--zero-cams", default="",
                     help="comma-separated camera names to hard-zero "
                          "(J6 7-cam fine-tune: CAM_BACK_NARROW)")
@@ -1050,6 +1724,25 @@ def main():
                     help="BEV-frame rotation augmentation: max |yaw| in "
                     "degrees rotated into the extrinsics + all BEV GT "
                     "(images and camera-space heads untouched)")
+    ap.add_argument("--x2-oversample", type=float, default=1.0,
+                    help="sampling weight for the x2gen2 (7-camera) scenes")
+    ap.add_argument("--farveh-oversample", type=float, default=1.0,
+                    help="D2': 遠方車両リッチシーン (out/farveh_scenes.txt) の"
+                         "サンプル重み。40-80m recall 対策")
+    ap.add_argument("--tversky-area-w", type=float, default=0.0,
+                    help="S2: road(1)/crosswalk(3) への FP 罰則 tversky")
+    ap.add_argument("--vru-cw", type=float, default=5.0,
+                    help="V レバー: det ヒートマップの VRU クラス重み (既定 5.0)")
+    ap.add_argument("--okinawa-oversample", type=float, default=1.0,
+                    help="沖縄シーン (out/okinawa_train_scenes.txt) の重み")
+    ap.add_argument("--vru-oversample", type=float, default=1.0,
+                    help="V レバー: VRU リッチシーン (out/vru_scenes.txt) の重み")
+    ap.add_argument("--cosmos-no-ego", action="store_true",
+                    help="v131 設計: cosmos3_* フレームを ego (E2E) 損失から"
+                         "除外 (認識のみ学習)。v126 の ADEc +0.027 対策")
+    ap.add_argument("--cosmos-oversample", type=float, default=1.0,
+                    help="sampling weight for registered cosmos3_* weather/"
+                         "lighting transfer scenes")
     ap.add_argument("--mined-oversample", type=float, default=1.0,
                     help="C2: weight boost for scenes in out/mined_scenes.txt")
     ap.add_argument("--lidar-drop", type=float, default=0.5,
@@ -1071,22 +1764,80 @@ def main():
                     help="Lovasz-Softmax loss weight (IoU-direct, sharp edges)")
     ap.add_argument("--tversky-w", type=float, default=0.0,
                     help="Tversky loss weight on line classes (FP-heavy -> thin)")
+    ap.add_argument("--cldice-w", type=float, default=0.0,
+                    help="soft-clDice weight for laneline connectivity")
     ap.add_argument("--seg-w", type=float, default=1.0)
     ap.add_argument("--init-ckpt", default="")
+    ap.add_argument("--depth-bins", type=int, default=64,
+                    help="深度ヘッドのビン数 (Orin 48bin レバー。64 以外は"
+                         "init の深度ヘッドが drop され再学習)")
+    ap.add_argument("--depth-slim", type=float, default=0.0,
+                    help="深度ヘッド幅の縮小倍率 (0=無効, 例 0.75)。"
+                         "init-ckpt 読み込み後に新規初期化ヘッドへ置換")
     ap.add_argument("--train-list", default="",
                     help="file of scene names to restrict training to")
     ap.add_argument("--min-cov-core", type=float, default=0.03,
                     help="min labeled frac +-30m band (0=off)")
     ap.add_argument("--min-cov-fwd", type=float, default=0.005,
                     help="min labeled frac +30..80m band (drops stationary)")
+    ap.add_argument("--trim-start", type=int, default=3,
+                    help="drop first K frames/scene (weak rear GT at scene start)")
     ap.add_argument("--trim-end", type=int, default=10,
                     help="drop last K frames/scene (weak forward GT at scene end)")
     ap.add_argument("--train-bg", action="store_true",
                     help="supervise unlabeled(0) as background class")
+    ap.add_argument("--ego-speed-w", type=float, default=0.0,
+                    help="ego 損失の速度重み 1+v0/この値 (上限 4)。高速直進の"
+                         "少数フレームを L1 中央値で無視させない (v139b)")
+    ap.add_argument("--freeze-ego", action="store_true",
+                    help="E2E (ego) 頭を凍結: ego_stem/ego_mlp/ego_attn/ego_delta/"
+                         "sem_ego/kin_delta/dec_head/refiner.e2e 等の requires_grad を"
+                         "切り、BN を eval 固定。認識レバーのラウンドで連鎖乖離を守る (v142)")
+    ap.add_argument("--kin-anchor", action="store_true",
+                    help="v139: ego waypoint に g_t*[v0*t,0] を加算 (ゼロ初期化)")
+    ap.add_argument("--semantic-ego", action="store_true",
+                    help="ego に「意味出力 (seg/det) を読むゼロ初期化残差」を追加"
+                         "する。INT8 で健全なテンソルだけを読む経路を学習させ、"
+                         "fp16-keep から tfuse/ego を外して素の INT8 (99ms) を狙う")
+    ap.add_argument("--traj-flow", action="store_true",
+                    help="A1: flow 場を traj ヘッド入力へゼロ初期化残差で接続"
+                         " (detach 供給、stat 入力は不変)")
+    ap.add_argument("--depth-log-bins", action="store_true",
+                    help="D5: 深度ビンを対数間隔化 (遠方の相対分解能を確保)")
+    ap.add_argument("--mode-scorer", action="store_true",
+                    help="E3: 経路条件付きモード選択スコアラ (ゼロ初期化)")
+    ap.add_argument("--det-temporal", action="store_true",
+                    help="D7: det hm へ時間特徴のゼロ初期化残差")
+    ap.add_argument("--traj-cv", action="store_true",
+                    help="A6: 他車軌跡を CV(v̂)+残差へ再パラメータ化")
+    ap.add_argument("--graft-lr-mult", type=float, default=1.0,
+                    help="det_tmp/traj_vel 残差の専用 lr 倍率 (probe 用)")
+    ap.add_argument("--traj-flow-lr-mult", type=float, default=1.0,
+                    help="A1b: traj_flow 残差の専用 lr 倍率 (probe 短期で"
+                         "ゼロ初期化を育てるため)")
+    ap.add_argument("--delta-stat", action="store_true",
+                    help="停止判定を時間差分 |bev - warp(prev)| から出す新ヘッド"
+                         "に差し替える (INT8 で stat が潰れる問題の根本対処)")
+    ap.add_argument("--gt-valid", action="store_true",
+                    help="ignore cells outside per-frame LiDAR-observed mask")
+    ap.add_argument("--box-corner-w", type=float, default=0.0,
+                    help="metric 4-corner geometry loss (train-only)")
     ap.add_argument("--dontcare-sidewalk", action="store_true")
     ap.add_argument("--gt-key", default="gt", choices=["gt", "gt_vec", "gt_cons"],
                     help="gt = raster autolabel; gt_vec = hybrid vector-line GT")
     args = ap.parse_args()
+    if getattr(args, "det_head_only", False):
+        args.det_only = True          # 損失の落とし方は det-only と同じ
+    if getattr(args, "det_only", False):
+        for _w in ("seg_w", "dice_w", "lovasz_w", "boundary_w", "tversky_w",
+                   "depth_w", "seg2d_w", "bbox2d_w", "ego_w", "occ_w",
+                   "traj_w", "tl_w", "risk_w", "lanegraph_w", "flow_w",
+                   "unk_w", "unk_dense_w", "pseudo_lidar_w", "stat_w",
+                   "intent_w", "intent_mode_w", "lane_sdf_w", "rl_w",
+                   "ego_fde_w"):
+            if hasattr(args, _w):
+                setattr(args, _w, 0.0)
+        args.pl_feed_p = 0.0
 
     ddp = "RANK" in os.environ
     if ddp:
@@ -1104,35 +1855,55 @@ def main():
         os.makedirs(args.out, exist_ok=True)
 
     train_s, val_s = split_scenes(args.root)
-    use_depth = args.model in ("lss", "v8", "v13", "v13d", "v14d", "v15", "v16", "v17", "v18", "v19", "v20", "v21", "v22", "v23", "v24", "v25", "v26", "v27", "v28", "v29", "v30", "v31", "v32", "v33", "v34", "v35", "v36", "v37", "v38", "v39", "v40", "v41", "v42", "v43", "v44", "v45", "v46", "v47", "v48") and args.depth_w > 0
-    use_seg2d = args.model in ("v13", "v13d", "v14d", "v15", "v16", "v17", "v18", "v19", "v20", "v21", "v22", "v23", "v24", "v25", "v26", "v27", "v28", "v29", "v30", "v31", "v32", "v33", "v34", "v35", "v36", "v37", "v38", "v39", "v40", "v41", "v42", "v43", "v44", "v45", "v46", "v47", "v48") and args.seg2d_w > 0
+    if args.val_scenes_file:
+        # ホールドアウト評価用: val を固定リストで上書き (実在シーンのみ)。
+        # 学習側からは二重に除外 (HOLDOUT_FILES と重複しても無害)。
+        want = set(open(args.val_scenes_file).read().split())
+        val_s = sorted(want & set(os.listdir(args.root)))
+        train_s = [s for s in train_s if s not in want]
+        print(f"[val-override] {args.val_scenes_file}: "
+              f"{len(val_s)} scenes", flush=True)
+    use_depth = args.model in ("lss", "v8", "v13", "v13d", "v14d", "v15", "v16", "v17", "v18", "v19", "v20", "v21", "v22", "v23", "v24", "v25", "v26", "v27", "v28", "v29", "v30", "v31", "v32", "v33", "v34", "v35", "v36", "v37", "v38", "v39", "v40", "v41", "v42", "v43", "v44", "v45", "v46", "v47", "v48", "v49", "v51", "v52", "v53", "v54", "v55", "v56", "v63b", "v64r50", "v52r50", "v52r50s8", "v52rvgg", "v55rvgg", "v52s8") and args.depth_w > 0
+    use_seg2d = args.model in ("v13", "v13d", "v14d", "v15", "v16", "v17", "v18", "v19", "v20", "v21", "v22", "v23", "v24", "v25", "v26", "v27", "v28", "v29", "v30", "v31", "v32", "v33", "v34", "v35", "v36", "v37", "v38", "v39", "v40", "v41", "v42", "v43", "v44", "v45", "v46", "v47", "v48", "v49", "v51", "v52", "v53", "v54", "v55", "v56", "v63b", "v64r50", "v52r50", "v52r50s8", "v52rvgg", "v55rvgg", "v52s8") and args.seg2d_w > 0
     use_box = args.model == "v15" and args.box_w > 0
-    use_boxdet = args.model in ("v16", "v17", "v18", "v19", "v20", "v21", "v22", "v23", "v24", "v25", "v26", "v27", "v28", "v29", "v30", "v31", "v32", "v33", "v34", "v35", "v36", "v37", "v38", "v39", "v40", "v41", "v42", "v43", "v44", "v45", "v46", "v47", "v48") and args.box_w > 0
-    use_bbox2d = args.model in ("v17", "v18", "v19", "v20", "v21", "v22", "v23", "v24", "v25", "v26", "v27", "v28", "v29", "v30", "v31", "v32", "v33", "v34", "v35", "v36", "v37", "v38", "v39", "v40", "v41", "v42", "v43", "v44", "v45", "v46", "v47", "v48") and args.bbox2d_w > 0
-    use_ego = args.model in ("v18", "v19", "v20", "v21", "v22", "v23", "v24", "v25", "v26", "v27", "v28", "v29", "v30", "v31", "v32", "v33", "v34", "v35", "v36", "v37", "v38", "v39", "v40", "v41", "v42", "v43", "v44", "v45", "v46", "v47", "v48") and args.ego_w > 0
-    use_occ = args.model in ("v20", "v21", "v22", "v23", "v24", "v25", "v26", "v27", "v28", "v29", "v30", "v31", "v32", "v33", "v34", "v35", "v36", "v37", "v38", "v39", "v40", "v41", "v42", "v43", "v44", "v45", "v46", "v47", "v48") and args.occ_w > 0
-    use_traj = args.model in ("v21", "v22", "v23", "v24", "v25", "v26", "v27", "v28", "v29", "v30", "v31", "v32", "v33", "v34", "v35", "v36", "v37", "v38", "v39", "v40", "v41", "v42", "v43", "v44", "v45", "v46", "v47", "v48") and args.traj_w > 0
-    use_temporal = args.model in ("v22", "v23", "v24", "v25", "v26", "v27", "v28", "v29", "v30", "v31", "v32", "v33", "v34", "v35", "v36", "v37", "v38", "v39", "v40", "v41", "v42", "v43", "v44", "v45", "v46", "v47", "v48")
-    use_tl = args.model in ("v27", "v28", "v29", "v30", "v31", "v32", "v33", "v34", "v35", "v36", "v37", "v38", "v39", "v40", "v41", "v42", "v43", "v44", "v45", "v46", "v47", "v48") and args.tl_w > 0
-    use_risk = args.model in ("v28", "v29", "v30", "v31", "v32", "v33", "v34", "v35", "v36", "v37", "v38", "v39", "v40", "v41", "v42", "v43", "v44", "v45", "v46", "v47", "v48") and args.risk_w > 0
-    use_lg = args.model in ("v29", "v30", "v31", "v32", "v33", "v34", "v35", "v36", "v37", "v38", "v39", "v40", "v41", "v42", "v43", "v44", "v45", "v46", "v47", "v48") and args.lanegraph_w > 0
-    use_unk = args.model in ("v30", "v31", "v32", "v33", "v34", "v35", "v36", "v37", "v38", "v39", "v40", "v41", "v42", "v43", "v44", "v45", "v46", "v47", "v48") and args.unk_w > 0
-    use_unk_v2 = args.model in ("v41", "v42", "v43", "v44", "v45", "v46", "v47", "v48") and args.unk_dense_w > 0
-    use_sdmap = args.model in ("v46", "v47", "v48") and args.use_sdmap
-    use_tlin = args.model in ("v47", "v48") and args.use_tl
-    use_pl = args.model == "v48" and args.pseudo_lidar_w > 0
+    use_boxdet = args.model in ("v16", "v17", "v18", "v19", "v20", "v21", "v22", "v23", "v24", "v25", "v26", "v27", "v28", "v29", "v30", "v31", "v32", "v33", "v34", "v35", "v36", "v37", "v38", "v39", "v40", "v41", "v42", "v43", "v44", "v45", "v46", "v47", "v48", "v49", "v51", "v52", "v53", "v54", "v55", "v56", "v63b", "v64r50", "v52r50", "v52r50s8", "v52rvgg", "v55rvgg", "v52s8") and args.box_w > 0
+    use_bbox2d = args.model in ("v17", "v18", "v19", "v20", "v21", "v22", "v23", "v24", "v25", "v26", "v27", "v28", "v29", "v30", "v31", "v32", "v33", "v34", "v35", "v36", "v37", "v38", "v39", "v40", "v41", "v42", "v43", "v44", "v45", "v46", "v47", "v48", "v49", "v51", "v52", "v53", "v54", "v55", "v56", "v63b", "v64r50", "v52r50", "v52r50s8", "v52rvgg", "v55rvgg", "v52s8") and args.bbox2d_w > 0
+    use_ego = args.model in ("v18", "v19", "v20", "v21", "v22", "v23", "v24", "v25", "v26", "v27", "v28", "v29", "v30", "v31", "v32", "v33", "v34", "v35", "v36", "v37", "v38", "v39", "v40", "v41", "v42", "v43", "v44", "v45", "v46", "v47", "v48", "v49", "v51", "v52", "v53", "v54", "v55", "v56", "v63b", "v64r50", "v52r50", "v52r50s8", "v52rvgg", "v55rvgg", "v52s8") and args.ego_w > 0
+    use_occ = args.model in ("v20", "v21", "v22", "v23", "v24", "v25", "v26", "v27", "v28", "v29", "v30", "v31", "v32", "v33", "v34", "v35", "v36", "v37", "v38", "v39", "v40", "v41", "v42", "v43", "v44", "v45", "v46", "v47", "v48", "v49", "v51", "v52", "v53", "v54", "v55", "v56", "v63b", "v64r50", "v52r50", "v52r50s8", "v52rvgg", "v55rvgg", "v52s8") and args.occ_w > 0
+    use_traj = args.model in ("v21", "v22", "v23", "v24", "v25", "v26", "v27", "v28", "v29", "v30", "v31", "v32", "v33", "v34", "v35", "v36", "v37", "v38", "v39", "v40", "v41", "v42", "v43", "v44", "v45", "v46", "v47", "v48", "v49", "v51", "v52", "v53", "v54", "v55", "v56", "v63b", "v64r50", "v52r50", "v52r50s8", "v52rvgg", "v55rvgg", "v52s8") and args.traj_w > 0
+    use_temporal = args.model in ("v22", "v23", "v24", "v25", "v26", "v27", "v28", "v29", "v30", "v31", "v32", "v33", "v34", "v35", "v36", "v37", "v38", "v39", "v40", "v41", "v42", "v43", "v44", "v45", "v46", "v47", "v48", "v49", "v51", "v52", "v53", "v54", "v55", "v56", "v63b", "v64r50", "v52r50", "v52r50s8", "v52rvgg", "v55rvgg", "v52s8")
+    use_tl = args.model in ("v27", "v28", "v29", "v30", "v31", "v32", "v33", "v34", "v35", "v36", "v37", "v38", "v39", "v40", "v41", "v42", "v43", "v44", "v45", "v46", "v47", "v48", "v49", "v51", "v52", "v53", "v54", "v55", "v56", "v63b", "v64r50", "v52r50", "v52r50s8", "v52rvgg", "v55rvgg", "v52s8") and args.tl_w > 0
+    use_risk = args.model in ("v28", "v29", "v30", "v31", "v32", "v33", "v34", "v35", "v36", "v37", "v38", "v39", "v40", "v41", "v42", "v43", "v44", "v45", "v46", "v47", "v48", "v49", "v51", "v52", "v53", "v54", "v55", "v56", "v63b", "v64r50", "v52r50", "v52r50s8", "v52rvgg", "v55rvgg", "v52s8") and args.risk_w > 0
+    use_lg = args.model in ("v29", "v30", "v31", "v32", "v33", "v34", "v35", "v36", "v37", "v38", "v39", "v40", "v41", "v42", "v43", "v44", "v45", "v46", "v47", "v48", "v49", "v51", "v52", "v53", "v54", "v55", "v56", "v63b", "v64r50", "v52r50", "v52r50s8", "v52rvgg", "v55rvgg", "v52s8") and args.lanegraph_w > 0
+    use_unk = args.model in ("v30", "v31", "v32", "v33", "v34", "v35", "v36", "v37", "v38", "v39", "v40", "v41", "v42", "v43", "v44", "v45", "v46", "v47", "v48", "v49", "v51", "v52", "v53", "v54", "v55", "v56", "v63b", "v64r50", "v52r50", "v52r50s8", "v52rvgg", "v55rvgg", "v52s8") and args.unk_w > 0
+    use_unk_v2 = args.model in ("v41", "v42", "v43", "v44", "v45", "v46", "v47", "v48", "v49", "v51", "v52", "v53", "v54", "v55", "v56", "v63b", "v64r50", "v52r50", "v52r50s8", "v52rvgg", "v55rvgg", "v52s8") and args.unk_dense_w > 0
+    use_sdmap = args.model in ("v46", "v47", "v48", "v49", "v51", "v52", "v53", "v54", "v55", "v56", "v63b", "v64r50", "v52r50", "v52r50s8", "v52rvgg", "v55rvgg", "v52s8") and args.use_sdmap
+    use_tlin = args.model in ("v47", "v48", "v49", "v51", "v52", "v53", "v54", "v55", "v56", "v63b", "v64r50", "v52r50", "v52r50s8", "v52rvgg", "v55rvgg", "v52s8") and args.use_tl
+    # every version FROM v48 on has the pseudo-LiDAR head. An equality test
+    # here silently disabled the loss for v49, and pl_head then received no
+    # gradient at all -- which DDP reports as "parameters that were not used in
+    # producing loss" and kills the round before step 1.
+    use_pl = args.model in ("v48", "v49", "v51", "v52", "v53", "v54", "v55", "v56", "v63b", "v64r50", "v52r50", "v52r50s8", "v52rvgg", "v55rvgg", "v52s8") and args.pseudo_lidar_w > 0
     use_rl = args.rl_w > 0 and use_ego
     # v31 reuses the depth4 GT tensor as the (train-time) LiDAR input
-    use_lidar = args.model in ("v31", "v32", "v33", "v34", "v35", "v36", "v37", "v38", "v39", "v40", "v41", "v42", "v43", "v44", "v45", "v46", "v47", "v48")
+    use_lidar = args.model in ("v31", "v32", "v33", "v34", "v35", "v36", "v37", "v38", "v39", "v40", "v41", "v42", "v43", "v44", "v45", "v46", "v47", "v48", "v49", "v51", "v52", "v53", "v54", "v55", "v56", "v63b", "v64r50", "v52r50", "v52r50s8", "v52rvgg", "v55rvgg", "v52s8")
     # v32 additionally takes the pillar BEV raster (extract_lidar_bev.py)
-    use_lidarbev = args.model in ("v32", "v33", "v34", "v35", "v36", "v37", "v38", "v39", "v40", "v41", "v42", "v43", "v44", "v45", "v46", "v47", "v48")
-    use_flow = args.model in ("v29", "v30", "v31", "v32", "v33", "v34", "v35", "v36", "v37", "v38", "v39", "v40", "v41", "v42", "v43", "v44", "v45", "v46", "v47", "v48") and args.flow_w > 0
-    hist_n = 3 if args.model in ("v29", "v30", "v31", "v32", "v33", "v34", "v35", "v36", "v37", "v38", "v39", "v40", "v41", "v42", "v43", "v44", "v45", "v46", "v47", "v48") else 0
+    use_lidarbev = args.model in ("v32", "v33", "v34", "v35", "v36", "v37", "v38", "v39", "v40", "v41", "v42", "v43", "v44", "v45", "v46", "v47", "v48", "v49", "v51", "v52", "v53", "v54", "v55", "v56", "v63b", "v64r50", "v52r50", "v52r50s8", "v52rvgg", "v55rvgg", "v52s8")
+    use_flow = args.model in ("v29", "v30", "v31", "v32", "v33", "v34", "v35", "v36", "v37", "v38", "v39", "v40", "v41", "v42", "v43", "v44", "v45", "v46", "v47", "v48", "v49", "v51", "v52", "v53", "v54", "v55", "v56", "v63b", "v64r50", "v52r50", "v52r50s8", "v52rvgg", "v55rvgg", "v52s8") and args.flow_w > 0
+    hist_n = 3 if args.model in ("v29", "v30", "v31", "v32", "v33", "v34", "v35", "v36", "v37", "v38", "v39", "v40", "v41", "v42", "v43", "v44", "v45", "v46", "v47", "v48", "v49", "v51", "v52", "v53", "v54", "v55", "v56", "v63b", "v64r50", "v52r50", "v52r50s8", "v52rvgg", "v55rvgg", "v52s8") else 0
     if args.train_list:                       # restrict train to a scene list
         keep = set(open(args.train_list).read().split())
+        # holdouts are already gone from train_s, but a --train-list could name
+        # them explicitly: intersect, never union, and say so out loud
+        _ho = holdout_scenes(args.root) & keep
+        if _ho:
+            print(f"[holdout] --train-list names {len(_ho)} held-out scenes; "
+                  f"they stay excluded", flush=True)
         train_s = [s for s in train_s if s in keep]
+    assert not (set(train_s) & holdout_scenes(args.root)), \
+        "held-out scenes reached the training set"
     # v13d depth GT is stride-4 of 768 (108x192); resize any mixed-res depth
-    depth_hw = (108, 192) if args.model in ("v13d", "v14d", "v15", "v16", "v17", "v18", "v19", "v20", "v21", "v22", "v23", "v24", "v25", "v26", "v27", "v28", "v29", "v30", "v31", "v32", "v33", "v34", "v35", "v36", "v37", "v38", "v39", "v40", "v41", "v42", "v43", "v44", "v45", "v46", "v47", "v48") else None
+    depth_hw = (108, 192) if args.model in ("v13d", "v14d", "v15", "v16", "v17", "v18", "v19", "v20", "v21", "v22", "v23", "v24", "v25", "v26", "v27", "v28", "v29", "v30", "v31", "v32", "v33", "v34", "v35", "v36", "v37", "v38", "v39", "v40", "v41", "v42", "v43", "v44", "v45", "v46", "v47", "v48", "v49", "v51", "v52", "v53", "v54", "v55", "v56", "v63b", "v64r50", "v52r50", "v52r50s8", "v52rvgg", "v55rvgg", "v52s8") else None
     tr = BevLaneDataset(args.root, train_s, gt_key=args.gt_key,
                         dontcare_sidewalk=args.dontcare_sidewalk,
                         with_depth=use_depth, augment=args.aug,
@@ -1147,27 +1918,42 @@ def main():
                         with_unknown=use_unk, with_lidarbev=use_lidarbev,
                         with_unknown_v2=use_unk_v2, unk2_key=args.unk_key,
                         with_sdmap=use_sdmap, with_tlin=use_tlin,
-                        trim_start=3, trim_end=args.trim_end,
+                        cam_drop=args.cam_drop, img_scale=args.img_scale,
+                        trim_start=args.trim_start, trim_end=args.trim_end,
+                        n_cams=args.n_cams,
                         min_cov_core=args.min_cov_core,
                         min_cov_fwd=args.min_cov_fwd,
-                        seg2d_key=args.seg2d_key)
+                        seg2d_key=args.seg2d_key,
+                        yaw_fix_deg=args.yaw_fix_deg,
+                        use_gt_valid=args.gt_valid,
+                        ego_mask_prefix=("cosmos3_" if args.cosmos_no_ego
+                                         else None))
     # NOTE: --limit-train no longer slices the dataset here; it is applied
     # per epoch by EpochSubsetSampler so each epoch sees fresh frames.
     if True:   # all ranks: the distributed ADE probe shards the val set
         # val never needs depth GT (BEV mIoU eval only) -> with_depth=False
         va = BevLaneDataset(args.root, val_s, max_per_scene=8, gt_key=args.gt_key,
+                            img_scale=args.img_scale,
                             dontcare_sidewalk=args.dontcare_sidewalk,
                             with_depth=False, with_seg2d=use_seg2d,
                             seg2d_key=args.seg2d_key, with_ego=use_ego,
                             with_occ=use_occ, with_agenttraj=use_traj,
                             with_temporal=use_temporal, with_tl=use_tl,
+                            # 箱は通常 agenttraj 経由で入るので、traj 損失を
+                            # 切った構成 (--det-only 等) では val から箱が
+                            # 消えて 3D 評価が全部 0 になっていた
+                            # (2026-08-14, ユーザー報告)。明示的に補う。
+                            with_boxdet=(use_boxdet and not use_traj),
                             with_risk=use_risk, with_lanegraph=use_lg,
                             temporal_hist=hist_n, with_unknown=use_unk,
                             with_lidarbev=use_lidarbev,
                             with_unknown_v2=use_unk_v2,
                             unk2_key=args.unk_key,
                             with_sdmap=use_sdmap, with_tlin=use_tlin,
-                            trim_start=3, trim_end=args.trim_end)
+                            trim_start=3, trim_end=args.trim_end,
+                            n_cams=args.n_cams,
+                            yaw_fix_deg=args.yaw_fix_deg,
+                            use_gt_valid=args.gt_valid)
         seen = min(args.limit_train or len(tr), len(tr)) * args.epochs
         print(f"train {len(tr)} samples / {len(train_s)} scenes; "
               f"val {len(va)} samples / {len(val_s)} scenes; "
@@ -1177,17 +1963,76 @@ def main():
               f"({100 * min(seen, len(tr)) / max(len(tr), 1):.0f}% expected "
               f"coverage)", flush=True)
         vb = args.val_batch or max(args.batch, 2)
+        # Every evaluator caps BATCHES, not samples, so halving the val batch
+        # silently halved the val coverage: [val ep*] went from 160 samples
+        # (20 scenes) to 80 (10 scenes) when --val-batch 1 was introduced for
+        # batch 2, and rare classes started reading 0.000 -- parking looked
+        # like a regression (0.318 -> 0.000) while a direct measurement on the
+        # same weights showed it IMPROVING (IoU 0.101 -> 0.168). Scale the caps
+        # so the sample count, and therefore comparability with r47, is fixed.
+        vcap = lambda n: max(1, int(round(n * 2.0 / vb)))   # noqa: E731
         dv = DataLoader(va, batch_size=vb, shuffle=False,
                         num_workers=4 if is_main else 1, pin_memory=is_main)
+        # Epoch-end val used to read the FIRST `max_batches` batches of `dv`,
+        # i.e. the head of the list: 10 of 270 scenes at val_batch 2, and only
+        # 5 (with ZERO turn frames, hence ADEc=nan) at val_batch 1. Every
+        # epoch-end number therefore described a handful of scenes. dv_ep walks
+        # the same samples with a STRIDE so the identical evaluation budget
+        # spans all 270 val scenes; deterministic, so epochs stay comparable.
+        # dv itself is left alone: the in-epoch probe does its own striding and
+        # shards across ranks.
+        _st = max(1, len(va) // max(80 * 2 // max(vb, 1), 1))
+        va_ep = torch.utils.data.Subset(va, list(range(0, len(va), _st)))
+        dv_ep = DataLoader(va_ep, batch_size=vb, shuffle=False,
+                           num_workers=4 if is_main else 1, pin_memory=is_main)
+        if is_main:
+            _sc = {va.items[i][0] for i in va_ep.indices}
+            print(f"[val] epoch-end slice: {len(va_ep)} samples over "
+                  f"{len(_sc)} of {len(val_s)} scenes (stride {_st})",
+                  flush=True)
+        # 高速帯 val (2026-09-05, v145 判定の反省): エポック末スライスには
+        # v0>=8 m/s のフレームが ~19 しかなく、連鎖乖離を支配する高速帯の
+        # 縦バイアス (v145: −1.13 m) が val では −0.02 と全く見えなかった。
+        # val 全体から v0>=8 のフレームを等間隔に最大 --val-hs 枚集めて
+        # 別スライスで測り、best_chain の選択にはこちらのバイアスを使う。
+        dv_hs = None
+        if use_ego and args.val_hs > 0:
+            _v0c = {}
+            _hs_idx = []
+            for _i, (_s, _f) in enumerate(va.items):
+                if _s not in _v0c:
+                    try:
+                        _v0c[_s] = np.load(os.path.join(args.root, _s,
+                                                        "ego_motion.npz"))["v0"]
+                    except Exception:
+                        _v0c[_s] = None
+                _v = _v0c[_s]
+                if _v is not None and _f["frame"] < len(_v) \
+                        and float(_v[_f["frame"]]) >= 8.0:
+                    _hs_idx.append(_i)
+            if len(_hs_idx) > args.val_hs:
+                _hs_idx = [_hs_idx[int(k)] for k in
+                           np.linspace(0, len(_hs_idx) - 1, args.val_hs)]
+            if _hs_idx:
+                dv_hs = DataLoader(torch.utils.data.Subset(va, _hs_idx),
+                                   batch_size=vb, shuffle=False,
+                                   num_workers=2 if is_main else 1,
+                                   pin_memory=is_main)
+            if is_main:
+                print(f"[val] high-speed slice: {len(_hs_idx)} frames "
+                      f"(v0>=8 m/s) for wp0 bias", flush=True)
         dv_lid = None
         if use_lidar:
             # separate minimal loader (imgs,K,T,gt,depth4) so the main val
             # batch layout (indexed positionally everywhere) is untouched
             va_lid = BevLaneDataset(args.root, val_s, max_per_scene=8,
                                     gt_key=args.gt_key, with_depth=True,
+                                    img_scale=args.img_scale,
                                     with_lidarbev=use_lidarbev,
                                     dontcare_sidewalk=args.dontcare_sidewalk,
-                                    trim_start=3, trim_end=args.trim_end)
+                                    trim_start=3, trim_end=args.trim_end,
+                                    n_cams=args.n_cams,
+                                    use_gt_valid=args.gt_valid)
             dv_lid = DataLoader(va_lid, batch_size=vb, shuffle=False,
                                 num_workers=2, pin_memory=True)
 
@@ -1234,6 +2079,82 @@ def main():
                 print(f"[data] failure-mined oversample x"
                       f"{args.mined_oversample}: {n_m}/{len(tr)} frames "
                       f"({len(mined)} scenes)", flush=True)
+        if args.x2_oversample > 1.0 and os.path.exists("out/x2gen2_train.txt"):
+            # x2gen2 is 2.7 % of the frames (26,540 / 977,420) and scores 0.263
+            # against 0.334 on the Japanese rig: too little of it on its own to
+            # close the domain gap.
+            x2 = set(open("out/x2gen2_train.txt").read().split())
+            if weights is None:
+                weights = torch.ones(len(tr))
+            n_x = 0
+            for ii, (s_, _f) in enumerate(tr.items):
+                if s_ in x2:
+                    weights[ii] = max(float(weights[ii]), args.x2_oversample)
+                    n_x += 1
+            if is_main:
+                print(f"[data] x2gen2 oversample x{args.x2_oversample}: "
+                      f"{n_x}/{len(tr)} frames ({len(x2)} scenes)", flush=True)
+        if args.okinawa_oversample > 1.0 and \
+                os.path.exists("out/okinawa_train_scenes.txt"):
+            # 沖縄ドメイン (2026-09-01): holdout ADEc 1.18 vs 本土 0.49。
+            # 496 シーン / 11.6k = 4.3% の露出では不足 → 重み押し上げ。
+            oki = set(open("out/okinawa_train_scenes.txt").read().split())
+            if weights is None:
+                weights = torch.ones(len(tr))
+            n_o = 0
+            for ii, (s_, _f) in enumerate(tr.items):
+                if s_ in oki:
+                    weights[ii] = max(float(weights[ii]),
+                                      args.okinawa_oversample)
+                    n_o += 1
+            if is_main:
+                print(f"[data] okinawa oversample x{args.okinawa_oversample}: "
+                      f"{n_o}/{len(tr)} frames ({len(oki)} scenes)", flush=True)
+        if args.vru_oversample > 1.0 and \
+                os.path.exists("out/vru_scenes.txt"):
+            vs = set(open("out/vru_scenes.txt").read().split())
+            if weights is None:
+                weights = torch.ones(len(tr))
+            n_vs = 0
+            for ii, (s_, _f) in enumerate(tr.items):
+                if s_ in vs:
+                    weights[ii] = max(float(weights[ii]),
+                                      args.vru_oversample)
+                    n_vs += 1
+            if is_main:
+                print(f"[data] vru oversample x{args.vru_oversample}: "
+                      f"{n_vs}/{len(tr)} frames ({len(vs)} scenes)",
+                      flush=True)
+        if args.farveh_oversample > 1.0 and \
+                os.path.exists("out/farveh_scenes.txt"):
+            # D2' (2026-08-27): 40-80m recall は近傍の半分 (0.19-0.28 vs
+            # 0.46-0.53)。遠方車両リッチなシーンを重み増しして露出を上げる。
+            fv = set(open("out/farveh_scenes.txt").read().split())
+            if weights is None:
+                weights = torch.ones(len(tr))
+            n_fv = 0
+            for ii, (s_, _f) in enumerate(tr.items):
+                if s_ in fv:
+                    weights[ii] = max(float(weights[ii]),
+                                      args.farveh_oversample)
+                    n_fv += 1
+            if is_main:
+                print(f"[data] far-veh oversample x{args.farveh_oversample}: "
+                      f"{n_fv}/{len(tr)} frames ({len(fv)} scenes)",
+                      flush=True)
+        if args.cosmos_oversample > 1.0:
+            if weights is None:
+                weights = torch.ones(len(tr))
+            n_cos = 0
+            for ii, (s_, _f) in enumerate(tr.items):
+                if s_.startswith("cosmos3_"):
+                    weights[ii] = max(float(weights[ii]),
+                                      args.cosmos_oversample)
+                    n_cos += 1
+            if is_main:
+                print(f"[data] cosmos3 oversample x"
+                      f"{args.cosmos_oversample}: {n_cos}/{len(tr)} frames",
+                      flush=True)
         sampler = EpochSubsetSampler(len(tr), args.limit_train,
                                      rank=rank if ddp else 0,
                                      world=world, seed=args.seed_subset,
@@ -1253,8 +2174,48 @@ def main():
                     drop_last=True, **dl_kw)
 
     mkw = {"n_seg": args.n_seg2d} \
-        if args.model in ("v13", "v13d", "v14d", "v15", "v16", "v17", "v18", "v19", "v20", "v21", "v22", "v23", "v24", "v25", "v26", "v27", "v28", "v29", "v30", "v31", "v32", "v33", "v34", "v35", "v36", "v37", "v38", "v39", "v40", "v41", "v42", "v43", "v44", "v45", "v46", "v47", "v48") else {}
+        if args.model in ("v13", "v13d", "v14d", "v15", "v16", "v17", "v18", "v19", "v20", "v21", "v22", "v23", "v24", "v25", "v26", "v27", "v28", "v29", "v30", "v31", "v32", "v33", "v34", "v35", "v36", "v37", "v38", "v39", "v40", "v41", "v42", "v43", "v44", "v45", "v46", "v47", "v48", "v49", "v51", "v52", "v53", "v54", "v55", "v56", "v63b", "v64r50", "v52r50", "v52r50s8", "v52rvgg", "v55rvgg", "v52s8") else {}
+    if args.depth_bins != 64:
+        # Orin 48bin レバー (2026-08-31): D はクラス属性なので、構築前に
+        # 具象クラスへシャドウする。ビン数を変えてもレンジ (1..79.75m) は
+        # 維持 = ステップを粗くする。init の 64bin ヘッドは形不一致で
+        # drop され再学習になる。
+        _M = MODELS[args.model]
+        _span = (_M.D - 1) * _M.D_STEP
+        _M.D = args.depth_bins
+        _M.D_STEP = _span / (args.depth_bins - 1)
+        if is_main:
+            print(f"[depth-bins] D={_M.D} step={_M.D_STEP:.4f} (レンジ維持)",
+                  flush=True)
     model = MODELS[args.model](**mkw).to(device)
+    # METEOR_MODPROBE=1: name the FIRST module whose output goes non-finite.
+    # The existing report names the bad OUTPUT (always out[2], the 2D seg), and
+    # the clamp on those logits did not stop it -- which means the NaN is
+    # already present upstream and clamp(NaN) is NaN. r59 discarded 69 % of its
+    # 34,280 steps (0 % up to step 8k, then 98-100 % for the rest of the round)
+    # and the output-level report could not localise it any further. One
+    # isfinite() per module is a device sync per module, so this is opt-in.
+    _MODBAD = []
+    if os.environ.get("METEOR_MODPROBE"):
+        def _mk(nm):
+            def _h(mod, inp, outp):
+                if _MODBAD or not torch.is_tensor(outp):
+                    return
+                if bool(torch.isfinite(outp.detach()).all()):
+                    return
+                fin_in = all(bool(torch.isfinite(t.detach()).all())
+                             for t in inp if torch.is_tensor(t))
+                _MODBAD.append(f"{nm} ({type(mod).__name__}) "
+                               f"out{tuple(outp.shape)} "
+                               f"入力は{'有限' if fin_in else '既に非有限'}")
+            return _h
+        n_h = 0
+        for _nm, _m in model.named_modules():
+            if len(list(_m.children())) == 0:
+                _m.register_forward_hook(_mk(_nm))
+                n_h += 1
+        if is_main:
+            print(f"[modprobe] {n_h} モジュールに装着", flush=True)
     if args.grad_ckpt:
         model.grad_ckpt = True
         if is_main:
@@ -1273,6 +2234,18 @@ def main():
         model.bev_dropblock = args.bev_dropblock
         if is_main:
             print(f"[bev-dropblock] p={args.bev_dropblock}", flush=True)
+    if args.bev_wedgedrop > 0:
+        model.bev_wedgedrop = args.bev_wedgedrop
+        if is_main:
+            print(f"[bev-wedgedrop] p={args.bev_wedgedrop}", flush=True)
+    if args.bev_ringdrop > 0:
+        model.bev_ringdrop = args.bev_ringdrop
+        if is_main:
+            print(f"[bev-ringdrop] p={args.bev_ringdrop}", flush=True)
+    if args.bev_chandrop > 0:
+        model.bev_chandrop = args.bev_chandrop
+        if is_main:
+            print(f"[bev-chandrop] p={args.bev_chandrop}", flush=True)
     if args.quant_noise > 0:
         model.quant_noise = args.quant_noise
         if rank == 0:
@@ -1285,8 +2258,83 @@ def main():
             print(f"[zero-cams] {args.zero_cams} -> idx {model.zero_cams}",
                   flush=True)
     if args.init_ckpt:
-        sd = torch.load(args.init_ckpt, map_location="cpu")["model"]
+        # Trusted in-house checkpoints include argparse metadata. PyTorch 2.6
+        # otherwise defaults to weights_only=True and can reject that metadata.
+        try:
+            _init_raw = torch.load(args.init_ckpt, map_location="cpu",
+                                   weights_only=False)
+        except TypeError:  # PyTorch < 2.0
+            _init_raw = torch.load(args.init_ckpt, map_location="cpu")
+        sd = _init_raw["model"]
+        # init 側が縮小済み深度ヘッドなら、読み込み前に同じ幅で再構築する
+        # (形状不一致で drop されて学習済み重みを失うのを防ぐ)
+        _npre0 = model.module if hasattr(model, "module") else model
+        if "depth_head.0.0.weight" in sd and hasattr(_npre0, "depth_head"):
+            _w_ck = tuple(sd[f"depth_head.{i}.0.weight"].shape[0]
+                          for i in range(4)
+                          if f"depth_head.{i}.0.weight" in sd)
+            _w_cur = tuple(m[0].out_channels for m in _npre0.depth_head[:-1])
+            if len(_w_ck) == 4 and args.depth_slim_force and args.depth_slim > 0:
+                # --depth-slim-force (2026-09-05, v146): 先に要求幅へ再構築して
+                # から、init の深度頭テンソルを先頭チャネルで切り出して warm
+                # start する (init 合わせの再構築でレバーが無効化されるのを防ぎ、
+                # 新規初期化より速く収束させる)。後段の depth_slim ブロックは
+                # 幅が既定 (256) でないので二重適用しない。
+                from bevlane.model import enable_depth_slim
+                enable_depth_slim(_npre0, scale=args.depth_slim)
+                _w_cur = tuple(m[0].out_channels for m in _npre0.depth_head[:-1])
+                _msd = _npre0.state_dict(); _nsl = 0
+                for _k in list(sd.keys()):
+                    if _k.startswith("depth_head.") and _k in _msd \
+                            and sd[_k].dim() == _msd[_k].dim() \
+                            and tuple(sd[_k].shape) != tuple(_msd[_k].shape):
+                        sd[_k] = sd[_k][tuple(slice(0, d) for d in _msd[_k].shape)].clone()
+                        _nsl += 1
+                print(f"[depth-slim] 要求幅 {_w_cur} を維持し init {_w_ck} を"
+                      f"切り出して初期化 ({_nsl} tensor)", flush=True)
+            elif len(_w_ck) == 4 and _w_ck != _w_cur:
+                from bevlane.model import enable_depth_slim
+                enable_depth_slim(_npre0, widths=_w_ck)
+                print(f"[depth-slim] init に合わせ幅 {_w_ck} で再構築",
+                      flush=True)
+        # Dynamic branches MUST exist before state_dict filtering/loading.
+        # They used to be attached below, after this block, so every warm
+        # start silently discarded their learned tensors and recreated a
+        # zero-initialised lane/paint/deep head. The shared trunk continued,
+        # which hid the reset behind missing=0/unexpected=0 in the log.
+        _npre = model.module if hasattr(model, "module") else model
+        if args.paint_seg and not hasattr(_npre, "paint_proj"):
+            _npre.enable_paint_seg([int(x) for x in args.paint_seg.split(",")])
+        if args.paint_det and not hasattr(_npre, "paint_det_proj"):
+            _npre.enable_paint_det([int(x) for x in args.paint_det.split(",")])
+        if args.lane_branch and getattr(_npre, "lane_branch", None) is None:
+            from bevlane.model import enable_lane_branch
+            enable_lane_branch(_npre)
+        if args.seg_deep and getattr(_npre, "seg_deep", None) is None:
+            from bevlane.model import enable_seg_deep
+            enable_seg_deep(_npre, n=args.seg_deep)
+        if args.det_deep and getattr(_npre, "det_deep", None) is None:
+            from bevlane.model import enable_det_deep
+            enable_det_deep(_npre, n=args.det_deep)
+        if args.lane_sdf_w > 0 and getattr(_npre, "lane_sdf", None) is None:
+            from bevlane.model import enable_lane_sdf
+            enable_lane_sdf(_npre)
+        if args.pact and not getattr(_npre, "_pact_names", None):
+            import json as _jspre
+            _aipre = {}
+            if args.pact_alpha_init and os.path.exists(args.pact_alpha_init):
+                _aipre = _jspre.load(open(args.pact_alpha_init))
+            _npre.enable_pact(args.pact, alpha_init=_aipre, verbose=is_main)
+        # A quant-robust stationary checkpoint has a reparameterised module.
+        # Attach that shape before filtering keys, otherwise continuation
+        # silently drops the trained head and recreates it from random weights.
+        if any(k.replace("module.", "").startswith("stat_head2.proj.")
+               for k in sd):
+            from bevlane.model import enable_quant_stat_head
+            enable_quant_stat_head(model, args.stat_quant_head or 8.0)
         cur = model.state_dict()   # drop shape-mismatched heads (12->21cls seg)
+        _dropped = [k for k, v in sd.items()
+                    if k not in cur or cur[k].shape != v.shape]
         sd = {k: v for k, v in sd.items()
               if k in cur and cur[k].shape == v.shape}
         missing, unexpected = model.load_state_dict(sd, strict=False)
@@ -1296,7 +2344,328 @@ def main():
                   "from the checkpoint", flush=True)
         if is_main:
             print(f"[init] {args.init_ckpt} missing={len(missing)} "
-                  f"unexpected={len(unexpected)}", flush=True)
+                  f"unexpected={len(unexpected)} dropped={len(_dropped)}"
+                  + (f" first={_dropped[:4]}" if _dropped else ""),
+                  flush=True)
+    if args.stat_quant_head > 0:
+        from bevlane.model import enable_quant_stat_head
+        _n0s = model.module if hasattr(model, "module") else model
+        enable_quant_stat_head(_n0s, args.stat_quant_head)
+        if is_main:
+            print(f"[stat-quant-head] +/- bounded reparameterisation "
+                  f"cap={args.stat_quant_head:g}", flush=True)
+    if args.freeze_depth:
+        _nfz = 0
+        for _n, _p in model.named_parameters():
+            if _n.startswith("depth_head") or _n == "log_sigma":
+                _p.requires_grad_(False)
+                _nfz += _p.numel()
+        if is_main:
+            print(f"[freeze-depth] {_nfz / 1e6:.2f}M depth parameters frozen",
+                  flush=True)
+    if args.paint_seg:
+        _n0p = model.module if hasattr(model, "module") else model
+        if not hasattr(_n0p, "paint_proj"):
+            _n0p.enable_paint_seg([int(x) for x in args.paint_seg.split(",")])
+        if is_main:
+            print(f"[paint-seg] クラス {args.paint_seg} をリフト前に注入 "
+                  f"(ゼロ初期化 = 機能保存)", flush=True)
+    if args.ego_speed_w > 0:
+        (model.module if hasattr(model, "module") else model).EGO_SPEED_W = args.ego_speed_w
+        if is_main:
+            print(f"[ego-speed-w] 速度重み 1+v0/{args.ego_speed_w} (cap 4)", flush=True)
+    if args.kin_anchor:
+        from bevlane.model import enable_kinematic_anchor
+        enable_kinematic_anchor(model.module if hasattr(model, "module") else model)
+        if is_main:
+            print("[kin-anchor] 運動学アンカー g_t*[v0*t,0] を有効化 (ゼロ初期化)", flush=True)
+    if args.freeze_ego:
+        _nf = _apply_freeze_ego(model)
+        if is_main:
+            print(f"[freeze-ego] E2E 頭を凍結: {_nf/1e6:.2f}M params (requires_grad=False, BN eval; DDP 前)", flush=True)
+    if args.semantic_ego:
+        from bevlane.model import enable_semantic_ego
+        _n0se = model.module if hasattr(model, "module") else model
+        enable_semantic_ego(_n0se)
+        if is_main:
+            print("[semantic-ego] 意味出力読みの ego 残差を有効化", flush=True)
+    if args.vru_cw != 5.0:
+        _n0v = model.module if hasattr(model, "module") else model
+        _n0v.VRU_CW = args.vru_cw
+        if is_main:
+            print(f"[vru-cw] VRU クラス重み {args.vru_cw}", flush=True)
+    if args.depth_log_bins:
+        from bevlane.model import enable_depth_logbins
+        _n0lb = model.module if hasattr(model, "module") else model
+        enable_depth_logbins(_n0lb)
+        if is_main:
+            print("[depth-log-bins] 対数ビン有効化", flush=True)
+    if args.mode_scorer:
+        from bevlane.model import enable_mode_scorer
+        _n0m = model.module if hasattr(model, "module") else model
+        enable_mode_scorer(_n0m)
+        if is_main:
+            print("[mode-scorer] 経路条件付き選択スコアラを有効化", flush=True)
+    if args.det_temporal:
+        from bevlane.model import enable_det_temporal
+        _n0d = model.module if hasattr(model, "module") else model
+        enable_det_temporal(_n0d)
+        if is_main:
+            print("[det-temporal] hm への時間特徴残差を有効化", flush=True)
+    if args.traj_cv:
+        from bevlane.model import enable_traj_cv
+        _n0c = model.module if hasattr(model, "module") else model
+        enable_traj_cv(_n0c)
+        if is_main:
+            print("[traj-cv] CV 再パラメータ化を有効化", flush=True)
+    if args.traj_flow:
+        from bevlane.model import enable_traj_flow
+        _n0tf = model.module if hasattr(model, "module") else model
+        enable_traj_flow(_n0tf)
+        if is_main:
+            print("[traj-flow] flow→traj ゼロ初期化残差を有効化", flush=True)
+
+    if args.delta_stat:
+        from bevlane.model import enable_delta_stat
+        _n0m = model.module if hasattr(model, "module") else model
+        enable_delta_stat(_n0m)
+        if is_main:
+            print("[delta-stat] 停止判定を時間差分ヘッドへ差し替え", flush=True)
+
+    if args.depth_slim > 0:
+        # init-ckpt が既に縮小済みなら読み込み時に幅を合わせてあるので、
+        # ここで置き換えるのは既定幅 (256 始まり) のときだけ。
+        _n0d = model.module if hasattr(model, "module") else model
+        if _n0d.depth_head[0][0].out_channels == 256:
+            from bevlane.model import enable_depth_slim
+            enable_depth_slim(_n0d, scale=args.depth_slim)
+            if is_main:
+                _w = tuple(m[0].out_channels for m in _n0d.depth_head[:-1])
+                print(f"[depth-slim] 深度ヘッドを幅 {_w} へ縮小 (新規初期化)",
+                      flush=True)
+
+    if args.ego_conv_pool:
+        import json as _js2
+        _st = _js2.load(open(args.ego_conv_pool))
+        _n0e = model.module if hasattr(model, "module") else model
+        _n0e.convert_ego_pool(_st["hw"], _st.get("mean"), _st.get("var"),
+                              verbose=is_main)
+
+    if args.pact:
+        import json as _js
+        _ai = {}
+        if args.pact_alpha_init and os.path.exists(args.pact_alpha_init):
+            _ai = _js.load(open(args.pact_alpha_init))
+        _n0p = model.module if hasattr(model, "module") else model
+        if not getattr(_n0p, "_pact_names", None):
+            _n0p.enable_pact(args.pact, alpha_init=_ai, verbose=is_main)
+
+    if args.paint_det:
+        _n0d = model.module if hasattr(model, "module") else model
+        if not hasattr(_n0d, "paint_det_proj"):
+            _n0d.enable_paint_det([int(x) for x in args.paint_det.split(",")])
+        if is_main:
+            print(f"[paint-det] 2D 検出クラス {args.paint_det} をリフト前に"
+                  f"注入 (ゼロ初期化 = 機能保存)", flush=True)
+    # 損失重みが 0 のヘッドは勾配が来ないため、DDP の reducer が
+    # 「前の iteration の reduction が終わっていない」で落ちる。
+    # 2026-08-15: この凍結は --freeze-trunk の中にしか無かったので、
+    # 幹あり (フェーズ A) の学習が pl_head / lanegraph 一式で起動直後に
+    # 落ちていた。重み 0 のヘッドは元々学習されないので、常時凍結は
+    # 学習内容を変えない (機能保存)。lidar_stem/sdmap_stem のように
+    # freeze-trunk 時だけ幹扱いするものはここには入れない。
+    _ZERO_W = {
+        "pl_head": args.pseudo_lidar_w,
+        "lg_tower": args.lanegraph_w, "lg_in": args.lanegraph_w,
+        "lgdec": args.lanegraph_w, "lgq": args.lanegraph_w,
+        "lg_mlp": args.lanegraph_w, "lg_pts": args.lanegraph_w,
+        "lg_pts2": args.lanegraph_w, "lg_meta": args.lanegraph_w,
+        "lg_meta2": args.lanegraph_w, "lg_adj": args.lanegraph_w,
+        "risk_head": args.risk_w, "risk_gate": args.risk_w,
+        "flow_head": args.flow_w,
+        "unk_head": args.unk_w, "unk_stem": args.unk_w,
+        "unk_head2": args.unk_w,
+        "occ_stem": args.occ_w, "occ_head": args.occ_w,
+        "traj_stem": args.traj_w, "traj_head": args.traj_w,
+        "stat_head": args.stat_w, "stat_head2": args.stat_w,
+        "tl_stem": args.tl_w, "tl_head": args.tl_w, "tl_fc": args.tl_w,
+        "lane_sdf": args.lane_sdf_w,
+    }
+    _n0z = model.module if hasattr(model, "module") else model
+    _offz = []
+    for _nm, _p in _n0z.named_parameters():
+        _top = _nm.split(".")[0]
+        if _ZERO_W.get(_top, 1.0) <= 0:
+            _p.requires_grad_(False)
+            if _top not in _offz:
+                _offz.append(_top)
+    for _nm, _m in _n0z.named_modules():
+        if _nm and _nm.split(".")[0] in _offz:
+            _m.eval()
+    if is_main and _offz:
+        print(f"[freeze-zero] 損失 0 のため凍結: {', '.join(_offz)}",
+              flush=True)
+    if args.freeze_trunk and not args.det_only:
+        # 共有幹 = 画像特徴 -> depth/ctx -> リフト -> 時間融合。ここを止めると
+        # ヘッド同士が共有する学習可能パラメータが無くなり、干渉が構造的に
+        # 消える (各ヘッドの勾配は自分のパラメータにしか届かない)。
+        _TRUNK = ("stem", "layer1", "layer2", "layer3", "layer4",
+                  "lat1", "lat2", "lat3", "lat4", "fuse",
+                  "depth_head", "depth_up", "ctx", "tgate", "tfuse3", "tfuse")
+        _n0 = model.module if hasattr(model, "module") else model
+        _tr = _fr = 0
+        for _nm, _p in _n0.named_parameters():
+            if _nm.split(".")[0] in _TRUNK:
+                _p.requires_grad_(False); _fr += _p.numel()
+            else:
+                _tr += _p.numel()
+        for _nm, _m in _n0.named_modules():
+            if _nm and _nm.split(".")[0] in _TRUNK:
+                _m.eval()
+        # 損失が 0 のヘッドは勾配が来ないので DDP が落ちる -> 併せて凍結する。
+        _HEAD_W = {
+            "dec": args.seg_w, "lane_branch": args.seg_w,
+            "lane_sdf": args.lane_sdf_w, "seg_deep": args.seg_w,
+            "seg_head": args.seg2d_w,
+            "det2d": args.bbox2d_w, "det2d_d8": args.bbox2d_w,
+            "det2d_d16": args.bbox2d_w, "hm2d_head": args.bbox2d_w,
+            "reg2d_head": args.bbox2d_w, "hm2d_head8": args.bbox2d_w,
+            "reg2d_head8": args.bbox2d_w, "hm2d_head16": args.bbox2d_w,
+            "reg2d_head16": args.bbox2d_w, "det2d_stem": args.bbox2d_w,
+            "det_stem": args.box_w, "hm_head": args.box_w,
+            "reg_head": args.box_w, "det_deep": args.box_w,
+            "occ_stem": args.occ_w, "occ_head": args.occ_w,
+            "traj_stem": args.traj_w, "traj_head": args.traj_w,
+            "agent_q": args.traj_w, "agent_attn": args.traj_w,
+            "agent_delta": args.traj_w,
+            "stat_head": args.stat_w, "stat_head2": args.stat_w,
+            "tl_stem": args.tl_w, "tl_head": args.tl_w, "tl_fc": args.tl_w,
+            "risk_head": args.risk_w, "risk_gate": args.risk_w,
+            "flow_head": args.flow_w,
+            "unk_head": args.unk_w, "unk_stem": args.unk_w,
+            "unk_head2": args.unk_w, "unk_dense": args.unk_dense_w,
+            "pl_head": args.pseudo_lidar_w,
+            "lg_tower": args.lanegraph_w, "lg_in": args.lanegraph_w,
+            "lgdec": args.lanegraph_w, "lgq": args.lanegraph_w,
+            "lg_mlp": args.lanegraph_w, "lg_pts": args.lanegraph_w,
+            "lg_pts2": args.lanegraph_w, "lg_meta": args.lanegraph_w,
+            "lg_meta2": args.lanegraph_w, "lg_adj": args.lanegraph_w,
+            "ego_stem": args.ego_w, "ego_mlp": args.ego_w,
+            "ego_q": args.ego_w, "ego_attn": args.ego_w,
+            "ego_delta": args.ego_w, "intent_mlp": args.ego_w,
+            "intent_delta": args.ego_w, "kin_delta": args.ego_w,
+            "vprof_head": args.ego_w, "dec_head": args.ego_w,
+            "dec_gate": args.ego_w,
+            "lidar_stem": 0.0, "sdmap_stem": 0.0, "lid_alpha": 0.0,
+        }
+        _off = []
+        for _nm, _p in _n0.named_parameters():
+            _top = _nm.split(".")[0]
+            if _top in _TRUNK:
+                continue
+            if _HEAD_W.get(_top, 1.0) <= 0:
+                _p.requires_grad_(False); _tr -= _p.numel(); _fr += _p.numel()
+                if _top not in _off:
+                    _off.append(_top)
+        for _nm, _m in _n0.named_modules():
+            if _nm and _nm.split(".")[0] in _off:
+                _m.eval()
+        if is_main and _off:
+            print(f"[freeze-trunk] 損失 0 のため凍結: {', '.join(_off)}",
+                  flush=True)
+        _n0._freeze_eval_keep = tuple(
+            n for n, _ in _n0.named_children()
+            if n not in _TRUNK and n not in _off)
+        if is_main:
+            print(f"[freeze-trunk] ヘッド {_tr / 1e6:.1f}M を学習 / 共有幹 "
+                  f"{_fr / 1e6:.1f}M を凍結 (BN 統計含む)", flush=True)
+    if args.det_only:
+        # det 経路 = backbone -> FPN -> depth/ctx -> lift -> 時間融合 ->
+        # det_stem -> hm/reg。それ以外は凍結する。
+        # --det-head-only はさらに trunk も凍結し、det ヘッドだけを動かす。
+        # --det-head-only は refiner の box 枝も学習対象にする (refiner は
+        # hm/reg を最終的に上書きするので、これを凍結したまま生ヘッドだけ
+        # 動かすと供給側と補正側が食い違う)。seg/ego 枝は凍結したままなので
+        # 他出力は不変、DDP の未使用パラメータ問題も起きない。
+        _KEEP = (("det_stem", "hm_head", "reg_head", "refiner.box")
+                 if args.det_head_only else
+                 ("stem", "layer1", "layer2", "layer3", "layer4",
+                  "lat1", "lat2", "lat3", "lat4", "fuse",
+                  "depth_head", "depth_up", "ctx",
+                  "tgate", "tfuse3", "tfuse",
+                  "det_stem", "hm_head", "reg_head"))
+        _n0 = model.module if hasattr(model, "module") else model
+        _tr = _fr = 0
+        def _keep(nm):
+            return (nm.split(".")[0] in _KEEP
+                    or any(nm.startswith(k) for k in _KEEP if "." in k))
+        for _nm, _p in _n0.named_parameters():
+            if _keep(_nm):
+                _tr += _p.numel()
+            else:
+                _p.requires_grad_(False)
+                _fr += _p.numel()
+        if args.det_head_only:
+            # 凍結部の BatchNorm は train() のままだと running stats が動き、
+            # 「他出力は不変」が崩れる。該当モジュールを eval() に固定する。
+            for _nm, _m in _n0.named_modules():
+                if _nm and not _keep(_nm):
+                    _m.eval()
+            _n0._freeze_eval_keep = _KEEP     # train() 再突入時に維持する印
+        if is_main:
+            print(f"[det-only{'/head' if args.det_head_only else ''}] "
+                  f"学習 {_tr / 1e6:.1f}M / 凍結 {_fr / 1e6:.1f}M "
+                  f"パラメータ; det 以外の損失は 0", flush=True)
+    if args.det_sup_front is not None or args.det_sup_rear is not None:
+        _n = model.module if hasattr(model, "module") else model
+        _n.DET_SUP_XF = args.det_sup_front
+        _n.DET_SUP_XR = args.det_sup_rear
+        if is_main:
+            print(f"[det-sup] loss window front<={args.det_sup_front}m "
+                  f"rear<={args.det_sup_rear}m", flush=True)
+    if args.ego_ce_tau:
+        (model.module if hasattr(model, "module") else model
+         ).EGO_CE_TAU = args.ego_ce_tau
+        if is_main:
+            print(f"[e2e] soft selector target tau={args.ego_ce_tau}",
+                  flush=True)
+    if args.ego_fde_w:
+        (model.module if hasattr(model, 'module') else model
+         ).EGO_FDE_W = args.ego_fde_w
+        if is_main:
+            print(f"[e2e] endpoint term w={args.ego_fde_w}",
+                  flush=True)
+    if args.lane_branch:
+        # MUST attach before SyncBN/DDP: attached after, the branch lands on
+        # the DDP WRAPPER -- absent from module.state_dict() (never saved) and
+        # bypassed by DDP's forward (never trained). v61/v62/r66 ran this flag
+        # as a no-op before the 2026-08-12 fix.
+        from bevlane.model import enable_lane_branch
+        if getattr(model, "lane_branch", None) is None:
+            enable_lane_branch(model)
+        if is_main:
+            print("[lane-branch] thin-class residual decoder on", flush=True)
+    if args.seg_deep:
+        from bevlane.model import enable_seg_deep
+        if getattr(model, "seg_deep", None) is None:
+            enable_seg_deep(model, n=args.seg_deep)
+        if is_main:
+            print(f"[seg-deep] {args.seg_deep}-block BEV-seg residual tower on",
+                  flush=True)
+    if args.det_deep:
+        from bevlane.model import enable_det_deep
+        if getattr(model, "det_deep", None) is None:
+            enable_det_deep(model, n=args.det_deep)
+        if is_main:
+            print(f"[det-deep] {args.det_deep}-block det residual tower on",
+                  flush=True)
+    if args.lane_sdf_w > 0:
+        from bevlane.model import enable_lane_sdf
+        if getattr(model, "lane_sdf", None) is None:
+            enable_lane_sdf(model)
+        if is_main:
+            print(f"[lane-sdf] auxiliary head on, w={args.lane_sdf_w}",
+                  flush=True)
     if args.sync_bn and ddp:
         model = torch.nn.SyncBatchNorm.convert_sync_batchnorm(model)
         if is_main:
@@ -1305,24 +2674,186 @@ def main():
         model = torch.nn.parallel.DistributedDataParallel(
             model, device_ids=[local],
             find_unused_parameters=(args.seg_w == 0 or
-                                    (args.model in ("v13", "v13d", "v14d", "v15", "v16", "v17", "v18", "v19", "v20", "v21", "v22", "v23", "v24", "v25", "v26", "v27", "v28", "v29", "v30", "v31", "v32", "v33", "v34", "v35", "v36", "v37", "v38", "v39", "v40", "v41", "v42", "v43", "v44", "v45", "v46", "v47", "v48") and not use_seg2d)))
-    opt = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-4)
+                                    (args.model in ("v13", "v13d", "v14d", "v15", "v16", "v17", "v18", "v19", "v20", "v21", "v22", "v23", "v24", "v25", "v26", "v27", "v28", "v29", "v30", "v31", "v32", "v33", "v34", "v35", "v36", "v37", "v38", "v39", "v40", "v41", "v42", "v43", "v44", "v45", "v46", "v47", "v48", "v49", "v51", "v52", "v53", "v54", "v55", "v56", "v63b", "v64r50", "v52r50", "v52r50s8", "v52rvgg", "v55rvgg", "v52s8") and not use_seg2d)))
+    _sp_pairs = []
+    _sp_final = []          # ramp 用: 切替後の 2:4 マスク (順序は _sp_pairs と同じ)
+    if args.sparse_24:
+        # Dense exceptions: the network outputs (their per-channel scale is the
+        # calibration surface) and anything whose input-channel count is not a
+        # multiple of 4. Deterministic from the init weights, so every DDP rank
+        # builds identical masks without communication.
+        # "Last dense" means EVERY output layer. The first list missed the
+        # detection heads and v60 paid for it: veh yaw error went 5.5->16.7
+        # deg and R50 0.46->0.35 while seg/E2E recovered fine -- the 2:4 mask
+        # on reg_head's sin/cos regression is exactly the kind of layer
+        # magnitude pruning butchers. Output layers are now excluded two ways:
+        # by name, and by out-channel count (<32 catches hm 2 / reg 6 / risk 1
+        # / flow 2 / stat 1 / lane_branch 3 / seg finals).
+        _DENSE = ("dec.out.3", "seg_head.out.3", "depth_head.4", "occ_head",
+                  "hm_head", "reg_head")
+        _net0 = model.module if ddp else model
+        _n_sp = _n_dense = 0
+        with torch.no_grad():
+            for _nm, _p in _net0.named_parameters():
+                # --sparse-exclude (2026-09-06, v152 候補): E2E/計画系など精度に敏感で
+                # Orin の ms に寄与しない枝を密のまま残す (プレフィックス列挙)。
+                _excl = tuple(x for x in args.sparse_exclude.split(",") if x)
+                if _p.dim() != 4 or _p.shape[1] % 4 != 0 or _p.shape[1] < 16 \
+                        or _p.shape[0] < 32 \
+                        or any(k in _nm for k in _DENSE) \
+                        or (_excl and _nm.startswith(_excl)):
+                    _n_dense += 1
+                    continue
+                _o, _c, _kh, _kw = _p.shape
+                _f = _p.detach().abs().reshape(_o, _c // 4, 4, _kh * _kw)
+                _srt = _f.argsort(2)
+                _idx = _srt[:, :, :2]
+                _m = torch.ones_like(_f)
+                _m.scatter_(2, _idx, 0.0)
+                _m = _m.reshape(_o, _c, _kh, _kw)
+                if args.sparse_ramp_steps > 0:
+                    # 1:4 マスク (最小 1 つだけ零) で開始し、ramp 後に 2:4 (_m) へ
+                    _m1 = torch.ones_like(_f)
+                    _m1.scatter_(2, _srt[:, :, :1], 0.0)
+                    _m1 = _m1.reshape(_o, _c, _kh, _kw)
+                    _p.mul_(_m1)
+                    _sp_pairs.append((_p, _m1))
+                    _sp_final.append(_m)
+                else:
+                    _p.mul_(_m)                     # prune once
+                    _sp_pairs.append((_p, _m))
+                _n_sp += 1
+        if is_main:
+            _kept = sum(int(m.sum()) for _, m in _sp_pairs)
+            _tot = sum(m.numel() for _, m in _sp_pairs)
+            print(f"[sparse-24] {_n_sp} tensors masked "
+                  f"({_kept / max(_tot, 1):.0%} kept), {_n_dense} left dense"
+                  + (f"; ramp: 1:4 for the first {args.sparse_ramp_steps} steps"
+                     if args.sparse_ramp_steps > 0 else ""),
+                  flush=True)
+    # ---- 密教師 (dense-teacher) 蒸留 (2026-09-07, v156): 2:4 スパース微調整で失われる
+    # 計画精度を、同一入力に対する密モデルの fused BEV と E2E 出力へ寄せて回収する。
+    # 教師は probe_net.load_full (export と同じ正しい構築, unexpected/mismatch=0 検証) で作る。
+    _teacher = None
+    if args.dense_teacher and args.dense_distill_w > 0:
+        from bevlane.probe_net import load_full as _load_full
+        _teacher = _load_full(args.dense_teacher, device=next(model.parameters()).device,
+                              verbose=is_main).half().eval()
+        for _p in _teacher.parameters():
+            _p.requires_grad_(False)
+        if is_main:
+            print(f"[dense-teacher] {args.dense_teacher} w={args.dense_distill_w} "
+                  f"ego_w={args.dense_distill_ego_w} every={args.dense_distill_every}", flush=True)
+    ema = EMA(model.module if ddp else model, args.ema,
+              exclude=tuple(x for x in args.ema_exclude.split(",") if x)) if args.ema > 0 else None
+    if ema is not None and args.ema_exclude and is_main:
+        print(f"[ema] excluded prefixes: {args.ema_exclude}", flush=True)
+    if ema is not None and is_main:
+        print(f"[ema] decay {args.ema} over "
+              f"{sum(v.numel() for v in ema.shadow.values()) / 1e6:.1f}M "
+              "parameters; evaluated alongside the raw weights", flush=True)
+    # PACT の alpha は本体と桁の違う動きが要る (30-130 -> 10-15)。本体の
+    # lr 1e-4 だと Adam の 1 ステップ 1e-4 x 24 万ステップ = 24 しか動けず、
+    # tfuse の 127 -> 10 には届かない。別 param group にして専用 lr を与える。
+    _pact_ps = [p for n, p in model.named_parameters()
+                if p.requires_grad and n.endswith(".alpha")]
+    _pact_id = {id(p) for p in _pact_ps}
+    # A1b (2026-08-27): ゼロ初期化の traj_flow 残差は本体 lr では 4000 step
+    # 級のプローブで育たない (実測 |w| が traj_head の 1/70)。PACT と同じ
+    # 「桁の違う動きが要るものは別 group」で専用倍率を与える。
+    _tfl_ps = [p for n, p in model.named_parameters()
+               if p.requires_grad and n.startswith(
+                   ("traj_flow.", "module.traj_flow."))] \
+        if args.traj_flow_lr_mult != 1.0 else []
+    _tfl_id = {id(p) for p in _tfl_ps}
+    _gr_ps = [p for n, p in model.named_parameters()
+              if p.requires_grad and n.startswith(
+                  ("det_tmp.", "module.det_tmp.", "mode_scorer.",
+                   "module.mode_scorer.", "traj_vel.", "module.traj_vel."))] \
+        if args.graft_lr_mult != 1.0 else []
+    _gr_id = {id(p) for p in _gr_ps}
+    # v139b: 運動学アンカーのゲート (6 個) は decay 無し・lr x20 の専用グループ。
+    # v139 では base 群 (wd 1e-4, 符号が打ち消し合う勾配) で 30k step 後も
+    # 0.001 に留まり、アンカーが事実上不在だった。
+    _kin_ps = [p for n, p in model.named_parameters()
+               if p.requires_grad and n.endswith("kin_gate")]
+    _kin_id = {id(p) for p in _kin_ps}
+    # --hist-lr-mult (2026-09-05, v149): 履歴系モジュール (時系列融合・動き残差・
+    # 時間差分停止判定・ego 頭) を lr 倍率付きの専用グループに分離。E2E 全ラウンドで
+    # 履歴が零だったため、これらは実履歴に対して未学習に近い (v144 は一様 lr で劣後)。
+    _HIST_PREFIX = ("tfuse3.", "tgate.", "traj_stem.", "delta_stat.", "ego_stem.",
+                    "ego_mlp.", "ego_q.", "ego_attn.", "ego_delta.", "sem_ego.")
+    _hl_ps = [p for n, p in model.named_parameters()
+              if p.requires_grad and (n.startswith(_HIST_PREFIX)
+                                      or n.startswith(tuple("module." + x for x in _HIST_PREFIX)))
+              and id(p) not in _kin_id] if args.hist_lr_mult != 1.0 else []
+    _hl_id = {id(p) for p in _hl_ps}
+    _base_ps = [p for p in model.parameters()
+                if p.requires_grad and id(p) not in _pact_id
+                and id(p) not in _tfl_id and id(p) not in _gr_id
+                and id(p) not in _kin_id and id(p) not in _hl_id]
+    _groups = [{"params": _base_ps, "lr": lr, "weight_decay": 1e-4}]
+    _maxlr = [lr]
+    if _kin_ps:
+        _groups.append({"params": _kin_ps, "lr": lr * 20.0, "weight_decay": 0.0})
+        _maxlr.append(lr * 20.0)
+        if is_main:
+            print(f"[kin-anchor] gate {len(_kin_ps)} tensor を lr x20 / wd 0 の "
+                  f"param group に分離", flush=True)
+    if _hl_ps:
+        _groups.append({"params": _hl_ps, "lr": lr * args.hist_lr_mult,
+                        "weight_decay": 1e-4})
+        _maxlr.append(lr * args.hist_lr_mult)
+        if is_main:
+            print(f"[hist-lr] 履歴系 {len(_hl_ps)} tensors を lr x{args.hist_lr_mult} "
+                  f"の param group に分離", flush=True)
+    if _gr_ps:
+        _groups.append({"params": _gr_ps,
+                        "lr": lr * args.graft_lr_mult,
+                        "weight_decay": 0.0})
+        _maxlr.append(lr * args.graft_lr_mult)
+        if is_main:
+            print(f"[graft] {len(_gr_ps)} tensors を lr x"
+                  f"{args.graft_lr_mult} の param group に分離", flush=True)
+    if _tfl_ps:
+        _groups.append({"params": _tfl_ps,
+                        "lr": lr * args.traj_flow_lr_mult,
+                        "weight_decay": 0.0})
+        _maxlr.append(lr * args.traj_flow_lr_mult)
+        if is_main:
+            print(f"[traj-flow] {len(_tfl_ps)} tensors を lr x"
+                  f"{args.traj_flow_lr_mult} の param group に分離",
+                  flush=True)
+    if _pact_ps:
+        _groups.append({"params": _pact_ps, "lr": args.pact_lr,
+                        "weight_decay": 0.0})
+        _maxlr.append(args.pact_lr)
+        if is_main:
+            print(f"[pact] alpha {len(_pact_ps)} 個を専用 lr {args.pact_lr} "
+                  f"の param group に分離 (weight_decay なし)", flush=True)
+    opt = torch.optim.AdamW(_groups, lr=lr, weight_decay=1e-4)
     total_steps = len(dl) * args.epochs
-    sched = torch.optim.lr_scheduler.OneCycleLR(opt, max_lr=lr,
-                                                total_steps=total_steps)
+    sched = torch.optim.lr_scheduler.OneCycleLR(
+        opt, max_lr=(_maxlr if len(_maxlr) > 1 else lr),
+        total_steps=total_steps)
     scaler = torch.cuda.amp.GradScaler()
     pl_acc = [0.0, 0.0, 0.0, 0.0]   # occ inter/union, z abs-err, n
     rl_acc = [0.0, 0.0, 0.0, 0.0]   # rew sel/best, pick acc, n
     cw = CLASS_W.clone()
-    ignore = 0
+    # 255 is the explicit consensus don't-care value. Class 0 is controlled
+    # independently by cw[0] (zero by default, 0.5 with --train-bg).
+    ignore = 255
     if args.train_bg:
         cw[0] = 0.5
-        ignore = -100
     cw = cw.to(device)
 
     step = 0
     t0 = time.time()
     best = 0.0
+    best_e2e = 1e9
+    val2d_miou = None   # seg2d 生存ガード (2026-08-28)
+    best_chain = 1e9    # 連鎖代理 (ADEc + |高速帯 wp0 バイアス|) 最小の EMA ckpt
+
     for ep in range(args.epochs):
         if sampler:
             sampler.set_epoch(ep)
@@ -1384,7 +2915,8 @@ def main():
                  lg_pts_gt, unk_c, rel_pose, unk_v2) = bev_rotation_aug(
                     args.bev_rot_aug, Tc, gt, det_boxes, det_n, traj_gt,
                     ego_gt, occ_gt, risk_gt, lg_pts_gt, unk_c, rel_pose,
-                    unk_v2=unk_v2, lat_max=args.lat_aug, lat_p=args.lat_p)
+                    unk_v2=unk_v2, lat_max=args.lat_aug, lat_p=args.lat_p,
+                    lat_min=args.lat_min)
             if use_temporal and hist_n > 0:
                 # v29 memory queue: N history BEVs, each in its own no_grad
                 # + autocast region (r12 autocast-cache lesson).
@@ -1404,6 +2936,7 @@ def main():
                                    * prev_valid[:, hi].view(-1, 1, 1, 1))
                         ths.append(make_warp_theta(rel_pose[:, hi]))
                 model.train()
+                _reeval_frozen(model)
                 pb = torch.stack(pbs, 1).float()
                 theta = torch.stack(ths, 1)
             elif use_temporal:
@@ -1416,12 +2949,13 @@ def main():
                     pb = net00.compute_bev(prev_imgs, K, Tc) \
                         * prev_valid.view(-1, 1, 1, 1)
                 model.train()
+                _reeval_frozen(model)
                 pb = pb.float()
                 theta = make_warp_theta(rel_pose)
             intent_oh = None
-            if args.model in ("v37", "v38", "v39", "v40", "v41", "v42", "v43", "v44", "v45", "v46", "v47", "v48") and ego_gt is not None:
+            if args.model in ("v37", "v38", "v39", "v40", "v41", "v42", "v43", "v44", "v45", "v46", "v47", "v48", "v49", "v51", "v52", "v53", "v54", "v55", "v56", "v63b", "v64r50", "v52r50", "v52r50s8", "v52rvgg", "v55rvgg", "v52s8") and ego_gt is not None:
                 lat = ego_gt[:, 11]
-                if args.model in ("v43", "v44", "v45", "v46", "v47", "v48"):
+                if args.model in ("v43", "v44", "v45", "v46", "v47", "v48", "v49", "v51", "v52", "v53", "v54", "v55", "v56", "v63b", "v64r50", "v52r50", "v52r50s8", "v52rvgg", "v55rvgg", "v52s8"):
                     # v43: earlier-firing command -- ANY waypoint (1.5-3 s)
                     # crossing +-2.0 m counts, so the command is active on
                     # the approach, not only mid-turn (matches the pseudo-nav
@@ -1448,16 +2982,38 @@ def main():
                     _pick = (torch.rand(_B, device=intent_oh.device)
                              < args.intent_wrong) & _has
                     if _pick.any():
-                        _sh = torch.randint(1, 3, (_B,),
-                                            device=intent_oh.device)
-                        _new = (intent_oh.argmax(1) + _sh) % 3
+                        # Flip to the OPPOSITE TURN, not to a random other
+                        # command. Measured on r48: reversal is asymmetric --
+                        # 46 % on GT-left frames vs 26 % on GT-right ones --
+                        # and the asymmetry tracks the data (96 right vs 46
+                        # left turn frames), so a uniform flip spends most of
+                        # its budget on the case that already works.
+                        # 1<->2 is left<->right; a straight row gets a random
+                        # turn as before.
+                        _cur = intent_oh.argmax(1)
+                        _rnd = 1 + torch.randint(0, 2, _cur.shape,
+                                                 device=intent_oh.device)
+                        _new = torch.where(
+                            _cur == 1, torch.full_like(_cur, 2),
+                            torch.where(_cur == 2, torch.full_like(_cur, 1),
+                                        _rnd))
                         intent_oh = torch.where(
                             _pick[:, None], F.one_hot(_new, 3).float(),
                             intent_oh)
                         ego_gt = ego_gt.clone()
                         ego_gt[_pick, 16] = 0.0     # no waypoint target here
+                # Modality dropout on the driving command, same contract as
+                # lidar_bev / sdmap / tl (all 0.5). It was hard-coded at 0.3,
+                # which leaves a 70/30 train-eval mismatch on exactly the thing
+                # the selector is scored on: ego_loss overrides `best` with the
+                # command whenever one is present, so 70 % of samples teach the
+                # selector to COPY a command, while evaluate_ego never passes
+                # one and asks it to INFER the manoeuvre. Measured selection gap
+                # on r60 best_e2e over 720 val samples: ADE 0.622 vs oracle
+                # 0.491, i.e. 0.131 m (21 %) lost to picking the wrong mode.
                 intent_oh = intent_oh * (torch.rand(
-                    imgs.shape[0], 1, device=device) >= 0.3).float()
+                    imgs.shape[0], 1, device=device)
+                    >= args.intent_drop).float()
             pl_gt = lidbev            # before modality dropout
             lid = None
             if use_lidar and depth_gt is not None:
@@ -1479,10 +3035,54 @@ def main():
                 keep_sd = (torch.rand(imgs.shape[0], 1, 1, 1, device=device)
                            >= args.sdmap_drop).to(sdmap_t.dtype)
                 sd_in = sdmap_t * keep_sd
+            # ---- LiDAR->カメラ モダリティ蒸留の教師パス (2026-08-20 登録) ----
+            # 教師 = LiDAR 強制 ON (drop なし) の no-grad/eval パス。生徒 =
+            # この後の主パスのうち LiDAR がドロップされた行。fused BEV と
+            # det hm を合わせる。step 基準の間欠実行 (全 rank 同期)。
+            _dist_t = None
+            _dist_keep = keep if (use_lidar and depth_gt is not None) else None
+            if (args.lidar_distill_w > 0 and use_lidarbev
+                    and pl_gt is not None and use_temporal
+                    and step % max(args.lidar_distill_every, 1) == 0):
+                _net00 = model.module if ddp else model
+                model.eval()
+                with torch.no_grad(), torch.autocast("cuda", torch.float16):
+                    _out_t = model(imgs, K, Tc,
+                                   ego_gt[:, 12] if use_ego else None,
+                                   pb, theta,
+                                   **({"lidar": depth_gt} if use_lidar
+                                      and depth_gt is not None else {}),
+                                   lidar_bev=pl_gt,
+                                   **({"sdmap": sd_in} if use_sdmap else {}),
+                                   **({"tl": tl_in} if use_tlin else {}),
+                                   **({"kin": rel_pose} if args.model in ("v36", "v37", "v38", "v39", "v40", "v41", "v42", "v43", "v44", "v45", "v46", "v47", "v48", "v49", "v51", "v52", "v53", "v54", "v55", "v56", "v63b", "v64r50", "v52r50", "v52r50s8", "v52rvgg", "v55rvgg", "v52s8") else {}),
+                                   **({"intent": intent_oh} if args.model in ("v37", "v38", "v39", "v40", "v41", "v42", "v43", "v44", "v45", "v46", "v47", "v48", "v49", "v51", "v52", "v53", "v54", "v55", "v56", "v63b", "v64r50", "v52r50", "v52r50s8", "v52rvgg", "v55rvgg", "v52s8") else {}))
+                    _dist_t = (_net00._fused_bev.detach().float(),
+                               (_out_t[3].detach().float()
+                                if isinstance(_out_t, tuple)
+                                and len(_out_t) >= 5 else None))
+                model.train()
+                _reeval_frozen(model)
             _bn_bak = {n: b.detach().clone()
                        for n, b in (model.module if ddp else model
                                     ).named_buffers()
                        if "running_" in n}
+            # ---- 密教師パス (同じ入力, no-grad) ----
+            _dt_t = None
+            if _teacher is not None and use_temporal \
+                    and step % max(args.dense_distill_every, 1) == 0:
+                with torch.no_grad(), torch.autocast("cuda", torch.float16):
+                    _out_dt = _teacher(imgs, K, Tc,
+                                       ego_gt[:, 12] if use_ego else None, pb, theta,
+                                       **({"lidar": lid} if use_lidar else {}),
+                                       **({"lidar_bev": lidbev} if use_lidarbev else {}),
+                                       **({"sdmap": sd_in} if use_sdmap else {}),
+                                       **({"tl": tl_in} if use_tlin else {}))
+                    _dt_t = (_teacher._fused_bev.detach().float(),
+                             (_out_dt[3].detach().float() if isinstance(_out_dt, tuple)
+                              and len(_out_dt) >= 5 else None),
+                             (_out_dt[7].detach().float() if isinstance(_out_dt, tuple)
+                              and len(_out_dt) >= 8 else None))
             with torch.autocast("cuda", torch.float16):
                 # v18+ is conditioned on the current speed (ego_gt col 12)
                 if use_temporal:
@@ -1494,9 +3094,9 @@ def main():
                                 **({"sdmap": sd_in} if use_sdmap else {}),
                                 **({"tl": tl_in} if use_tlin else {}),
                                 **({"kin": rel_pose}
-                                   if args.model in ("v36", "v37", "v38", "v39", "v40", "v41", "v42", "v43", "v44", "v45", "v46", "v47", "v48") else {}),
+                                   if args.model in ("v36", "v37", "v38", "v39", "v40", "v41", "v42", "v43", "v44", "v45", "v46", "v47", "v48", "v49", "v51", "v52", "v53", "v54", "v55", "v56", "v63b", "v64r50", "v52r50", "v52r50s8", "v52rvgg", "v55rvgg", "v52s8") else {}),
                                 **({"intent": intent_oh}
-                                   if args.model in ("v37", "v38", "v39", "v40", "v41", "v42", "v43", "v44", "v45", "v46", "v47", "v48") else {}))
+                                   if args.model in ("v37", "v38", "v39", "v40", "v41", "v42", "v43", "v44", "v45", "v46", "v47", "v48", "v49", "v51", "v52", "v53", "v54", "v55", "v56", "v63b", "v64r50", "v52r50", "v52r50s8", "v52rvgg", "v55rvgg", "v52s8") else {}))
                 elif use_ego:
                     out = model(imgs, K, Tc, ego_gt[:, 12])
                 else:
@@ -1521,41 +3121,160 @@ def main():
                     elif len(out) > 3:
                         boxl = out[3]
                 loss = 0.0
+                # ---- モダリティ蒸留損失 (LiDAR ドロップ行のみ, 2026-08-20) ----
+                if _dist_t is not None and _dist_keep is not None:
+                    _m = (_dist_keep.view(-1) < 0.5)
+                    if bool(_m.any()):
+                        # 前景集中の重み付け (2026-08-20 修正)。素の MSE は
+                        # 面積支配で、路面など広い領域に引っ張られて遠方車両
+                        # (数セル = 全体の 0.01%) の情報が無視されていた
+                        # (w=0.5 で寄与 1.38 と十分大きいのに cam recall が
+                        # 0.486 から 1 ミリも動かなかった原因)。教師 hm の
+                        # ピーク強度を空間重みにして、車両セルを 10 倍重視する。
+                        _fs = net0._fused_bev.float()
+                        _th = _dist_t[1]
+                        if _th is not None:
+                            _wfg = _th.sigmoid().amax(1, keepdim=True)
+                            _wfg = F.interpolate(_wfg,
+                                                 size=_fs.shape[-2:],
+                                                 mode="bilinear",
+                                                 align_corners=False)
+                            _w = 0.1 + 0.9 * _wfg.clamp(0, 1)
+                            _se = ((_fs[_m] - _dist_t[0][_m]) ** 2
+                                   ).mean(1, keepdim=True)
+                            _dl = (_se * _w[_m]).sum() / _w[_m].sum().clamp(
+                                min=1e-6)
+                        else:
+                            _dl = F.mse_loss(_fs[_m], _dist_t[0][_m])
+                        if hm is not None and _th is not None:
+                            # hm も前景重み付き (背景 0 合わせの支配を防ぐ)
+                            _hw = 0.1 + 0.9 * _th.sigmoid().amax(
+                                1, keepdim=True).clamp(0, 1)
+                            _hse = ((hm.float()[_m] - _th[_m]) ** 2
+                                    ).mean(1, keepdim=True)
+                            _dl = _dl + 2.0 * (
+                                (_hse * _hw[_m]).sum()
+                                / _hw[_m].sum().clamp(min=1e-6))
+                        loss = loss + args.lidar_distill_w * _dl
+                        if step % 100 == 0 and rank == 0:
+                            print(f"[distill step{step}] loss={float(_dl):.4f}"
+                                  f" x w={args.lidar_distill_w} -> "
+                                  f"{float(args.lidar_distill_w * _dl):.4f}"
+                                  f" (n={int(_m.sum())}/{_m.numel()})",
+                                  flush=True)
+                # ---- 密教師蒸留損失 (2026-09-07): fused BEV (教師 hm ピーク重み) + E2E 出力 ----
+                if _dt_t is not None:
+                    _fs2 = net0._fused_bev.float()
+                    if _dt_t[1] is not None:
+                        _wfg2 = F.interpolate(_dt_t[1].sigmoid().amax(1, keepdim=True),
+                                              size=_fs2.shape[-2:], mode="bilinear",
+                                              align_corners=False)
+                        _w2 = 0.1 + 0.9 * _wfg2.clamp(0, 1)
+                        _se2 = ((_fs2 - _dt_t[0]) ** 2).mean(1, keepdim=True)
+                        _dl2 = (_se2 * _w2).sum() / _w2.sum().clamp(min=1e-6)
+                    else:
+                        _dl2 = F.mse_loss(_fs2, _dt_t[0])
+                    if ego_pred is not None and _dt_t[2] is not None \
+                            and ego_pred.shape == _dt_t[2].shape:
+                        _dl2 = _dl2 + args.dense_distill_ego_w * F.mse_loss(
+                            ego_pred.float(), _dt_t[2])
+                    loss = loss + args.dense_distill_w * _dl2
+                    if step % 100 == 0 and rank == 0:
+                        print(f"[dense-distill step{step}] loss={float(_dl2):.4f}"
+                              f" x w={args.dense_distill_w} -> "
+                              f"{float(args.dense_distill_w * _dl2):.4f}", flush=True)
                 if occ_pred is not None and use_occ:
                     loss = loss + args.occ_w * net0.occ_loss(occ_pred.float(),
-                                                             occ_gt)
+                                                             _fit(occ_gt, occ_pred))
                 if ego_pred is not None and use_ego:
                     loss = loss + args.ego_w * net0.ego_loss(
                         ego_pred.float(), ego_gt,
                         intent_oh if args.model in (
-                            "v43", "v44", "v45", "v46", "v47", "v48") else None)
+                            "v43", "v44", "v45", "v46", "v47", "v48", "v49", "v51", "v52", "v53", "v54", "v55", "v56", "v63b", "v64r50", "v52r50", "v52r50s8", "v52rvgg", "v55rvgg", "v52s8") else None)
                 if dlog is not None and use_depth:
-                    loss = loss + args.depth_w * net0.depth_loss(dlog.float(), depth_gt)
+                    loss = loss + args.depth_w * net0.depth_loss(
+                        dlog.float(), depth_gt,
+                        ent_w=args.depth_ent_w, far_w=args.depth_far_w,
+                        band_bal=args.depth_band_balance)
+                if args.pact_w > 0:
+                    # alpha を押し下げて外れ値を刈る。alpha は実測 max で
+                    # 初期化してあるので、この項が無いと一切動かない。
+                    loss = loss + args.pact_w * net0.pact_penalty()
                 if seg2d is not None and use_seg2d:
                     loss = loss + args.seg2d_w * net0.seg2d_loss(seg2d.float(), seg2d_gt)
                 if boxl is not None and use_box:
                     loss = loss + args.box_w * net0.box_loss(boxl.float(), box_gt)
-                if hm is not None and use_boxdet:
-                    loss = loss + args.box_w * net0.boxdet_loss(hm, rg, det_boxes,
-                                                                det_n)
-                if args.model in ("v38", "v39", "v40", "v41", "v42", "v43", "v44", "v45", "v46", "v47", "v48") and use_ego and ego_gt is not None:
+                # Samples whose scene has NO 3D-box annotation carry det_n=-1
+                # (dataset sentinel). Feeding them as "zero objects" is what
+                # taught the detector to stay silent on x2gen2: heatmap score
+                # 0.919 on the Japanese rig vs 0.080 there, boxes over the demo
+                # threshold in 0 % of frames. Skip those rows in every loss
+                # that reads box GT (det, traj, stationary, flow) -- absence of
+                # a label is not a negative label.
+                _bv = (det_n >= 0) if det_n is not None else None
+                _bn = det_n.clamp(min=0) if det_n is not None else None
+                # DDP SAFETY: every rank must build the SAME graph. Skipping a
+                # loss on the ranks whose batch happens to be all-unannotated
+                # (batch 2, x2gen2 oversampled x3) desynchronised the
+                # all-reduce and hung the round with the GPUs at 100 % and no
+                # step ever printed. So the loss is ALWAYS computed; when no row
+                # is annotated it is multiplied by 0.0, which keeps the module
+                # in the graph and contributes exactly zero gradient.
+                _bsel = _bv if (_bv is not None and bool(_bv.any())) else \
+                    (torch.ones_like(_bv) if _bv is not None else None)
+                _bw = 1.0 if (_bv is not None and bool(_bv.any())) else 0.0
+                if hm is not None and use_boxdet and _bsel is not None:
+                    _gtw = None
+                    # pl_gt, not lidbev: lidbev has already been
+                    # zeroed by the modality dropout, and a dropped
+                    # sample would then lose every box from its
+                    # target instead of just its LiDAR input.
+                    if args.gt_lidar_w > 0 and pl_gt is not None:
+                        # channel 0 of lidar_bev is log1p(point count) on the
+                        # 0.4 m grid; sum a 7x7 window (+-1.2 m) at each box
+                        # centre and ramp the weight to 1.0 at --gt-lidar-w.
+                        _cnt = torch.expm1(pl_gt[:, 0].float())
+                        _pad = F.pad(_cnt, (3, 3, 3, 3))
+                        _rr = ((80.0 - det_boxes[..., 1]) / DET_RES
+                               ).long().clamp(0, 399)
+                        _cc = ((50.0 - det_boxes[..., 2]) / DET_RES
+                               ).long().clamp(0, 249)
+                        _acc = torch.zeros_like(det_boxes[..., 0])
+                        for _dr in range(7):
+                            for _dc in range(7):
+                                _acc = _acc + _pad[
+                                    torch.arange(_pad.shape[0],
+                                                 device=_pad.device
+                                                 ).view(-1, 1),
+                                    _rr + _dr, _cc + _dc]
+                        _gtw = (_acc / args.gt_lidar_w).clamp(0.0, 1.0)
+                    loss = loss + args.box_w * _bw * net0.boxdet_loss(
+                        hm[_bsel], rg[_bsel], det_boxes[_bsel], _bn[_bsel],
+                        gt_w=(None if _gtw is None else _gtw[_bsel]),
+                        corner_w=args.box_corner_w)
+                if args.model in ("v38", "v39", "v40", "v41", "v42", "v43", "v44", "v45", "v46", "v47", "v48", "v49", "v51", "v52", "v53", "v54", "v55", "v56", "v63b", "v64r50", "v52r50", "v52r50s8", "v52rvgg", "v55rvgg", "v52s8") and use_ego and ego_gt is not None:
                     loss = loss + 0.3 * net0.vprof_loss(ego_gt)
-                if traj_pred is not None and use_traj:
-                    loss = loss + args.traj_w * net0.traj_loss(
-                        traj_pred, det_boxes, det_n, traj_gt, tvalid_gt)
+                if traj_pred is not None and use_traj and _bsel is not None:
+                    loss = loss + args.traj_w * _bw * net0.traj_loss(
+                        traj_pred[_bsel], det_boxes[_bsel], _bn[_bsel],
+                        traj_gt[_bsel], tvalid_gt[_bsel])
                     if len(out) >= 11:      # v26 stationary-flag head
                         sw = (args.stat_w if args.stat_w is not None
                               else args.traj_w)
-                        loss = loss + sw * net0.stat_loss(
-                            out[10], det_boxes, det_n, traj_gt, tvalid_gt)
+                        loss = loss + sw * _bw * net0.stat_loss(
+                            out[10][_bsel], det_boxes[_bsel], _bn[_bsel],
+                            traj_gt[_bsel], tvalid_gt[_bsel],
+                            margin=args.stat_margin)
                 if use_tl and len(out) >= 12:   # v27 traffic-light state
                     loss = loss + args.tl_w * net0.tl_loss(out[11], tl_gt)
                 if use_risk and len(out) >= 13:  # v28 area risk map
                     loss = loss + args.risk_w * net0.risk_loss(out[12],
-                                                               risk_gt)
-                if use_flow and len(out) >= 14 and traj_gt is not None:
-                    loss = loss + args.flow_w * net0.flow_loss(
-                        out[13], det_boxes, det_n, traj_gt, tvalid_gt)
+                                                               _fit(risk_gt, out[12]))
+                if use_flow and len(out) >= 14 and traj_gt is not None \
+                        and _bsel is not None:
+                    loss = loss + args.flow_w * _bw * net0.flow_loss(
+                        out[13][_bsel], det_boxes[_bsel], _bn[_bsel],
+                        traj_gt[_bsel], tvalid_gt[_bsel])
                 if use_lg and len(out) >= 17:
                     loss = loss + args.lanegraph_w * net0.lanegraph_loss(
                         out[14], out[15], out[16],
@@ -1565,7 +3284,7 @@ def main():
                         out[17], unk_c, unk_n)
                 if use_unk_v2 and len(out) >= 18:
                     loss = loss + args.unk_dense_w * net0.unk_dense_loss(
-                        out[17], unk_v2)
+                        out[17], _fit(unk_v2, out[17]))
                 if use_rl and ego_pred is not None:
                     from bevlane.e2e_reward import (candidate_rewards,
                                                     grpo_mode_loss)
@@ -1577,7 +3296,10 @@ def main():
                         _lg = _lg - getattr(net0, 'MODE_BOOST', 0.0) \
                             * intent_oh.to(_lg.dtype)
                     _rew, _parts = candidate_rewards(
-                        _wp.detach(), gt=gt, boxes=det_boxes, nbox=det_n,
+                        _wp.detach(), gt=gt, boxes=det_boxes,
+                        nbox=(det_n.clamp(min=0) if det_n is not None
+                              else det_n),          # -1 sentinel -> no boxes
+
                         traj=traj_gt, tvalid=tvalid_gt,
                         tl=(tl_t if use_tlin else None),
                         v0=ego_gt[:, 12], ego_gt=ego_gt,
@@ -1593,10 +3315,10 @@ def main():
                         rl_acc[3] += _st["n"]
                 if use_pl and len(out) >= 19:
                     loss = loss + args.pseudo_lidar_w * \
-                        net0.pseudo_lidar_loss(out[18], pl_gt)
+                        net0.pseudo_lidar_loss(out[18], _fit(pl_gt, out[18]))
                     if pl_gt is not None and step % 20 == 0:
                         with torch.no_grad():
-                            g = pl_gt.to(device).float()
+                            g = _fit(pl_gt, out[18]).to(device).float()
                             v = (g.abs().sum((1, 2, 3)) > 0)
                             if v.any():
                                 og = (g[v, 3] > 0.5)
@@ -1608,26 +3330,74 @@ def main():
                                     ((pa[:, 1] - g[v, 1]).abs()
                                      * og.float()).sum())
                                 pl_acc[3] += float(og.sum())
-                if (args.intent_w > 0 and args.model in ("v43", "v44", "v45", "v46", "v47", "v48")
+                if (args.intent_w > 0 and args.model in ("v43", "v44", "v45", "v46", "v47", "v48", "v49", "v51", "v52", "v53", "v54", "v55", "v56", "v63b", "v64r50", "v52r50", "v52r50s8", "v52rvgg", "v55rvgg", "v52s8")
                         and intent_oh is not None and ego_pred is not None):
                     loss = loss + args.intent_w * net0.intent_loss(
-                        ego_pred, intent_oh)
-                if (args.intent_mode_w > 0 and args.model in ("v44", "v45", "v46", "v47", "v48")
+                        ego_pred, intent_oh, margin=args.intent_margin)
+                if (args.offroad_w > 0 and intent_oh is not None
+                        and ego_pred is not None and gt is not None):
+                    _rows = intent_oh.amax(1) > 0.5      # コマンドのある行だけ
+                    loss = loss + args.offroad_w * offroad_loss(
+                        gt, ego_pred, rows=_rows)
+                if (args.intent_mode_w > 0 and args.model in ("v44", "v45", "v46", "v47", "v48", "v49", "v51", "v52", "v53", "v54", "v55", "v56", "v63b", "v64r50", "v52r50", "v52r50s8", "v52rvgg", "v55rvgg", "v52s8")
                         and intent_oh is not None and ego_pred is not None):
                     loss = loss + args.intent_mode_w * net0.intent_mode_loss(
                         ego_pred, intent_oh)
                 if hm2d is not None and use_bbox2d:
                     loss = loss + args.bbox2d_w * net0.bbox2d_loss(
                         hm2d, rg2d, bb2d, nb2d)
+                # A rear-truncated grid makes the head emit fewer rows than the
+                # 800-row label carries; keep the front rows that still exist.
+                # No-op at the default extent.
+                gt = _fit(gt, logits)
+                if args.lane_sdf_w > 0 and \
+                        getattr(net0, "_lane_sdf_pred", None) is not None:
+                    import cv2 as _cv2
+                    _pred = net0._lane_sdf_pred.float()
+                    _pred = _pred[..., :gt.shape[-2], :]
+                    with torch.no_grad():
+                        _t = []
+                        for _b in range(gt.shape[0]):
+                            _lane = (gt[_b] == 4).to(torch.uint8).cpu().numpy()
+                            _d = _cv2.distanceTransform(
+                                1 - _lane, _cv2.DIST_L2, 3).astype("float32")
+                            _t.append(torch.from_numpy(_d))
+                        _sdf_raw = torch.stack(_t).to(_pred.device) * 0.2
+                        _sdf = _sdf_raw.clamp(max=3.0)   # cells -> metres
+                        # Consensus disagreement/unobserved cells must not
+                        # supervise even the auxiliary distance field. Without
+                        # this mask a lane beside 255 paints a smooth target
+                        # back into the very region CE/clDice intentionally
+                        # ignore.
+                        # Build the band BEFORE clipping.  The old order
+                        # clipped every distance to 2 m and then tested <3 m,
+                        # accidentally supervising the entire raster and
+                        # letting easy background dominate the lane signal.
+                        _band = (_sdf_raw < 3.0) & (gt != 255)
+                    _l = (torch.nn.functional.l1_loss(
+                        _pred[:, 0], _sdf, reduction="none") * _band).sum() \
+                        / _band.sum().clamp(min=1)
+                    loss = loss + args.lane_sdf_w * _l
                 if args.seg_w > 0:
                     ce = F.cross_entropy(logits, gt, weight=cw,
                                          ignore_index=ignore, reduction="none")
                     H2 = ce.shape[-2]
                     wmap = torch.ones_like(ce)
-                    if args.far_w > 0:            # upweight far (top/bottom) rows
-                        rows = torch.arange(H2, device=ce.device, dtype=ce.dtype)
-                        wrow = 1 + args.far_w * (rows - (H2 - 1) / 2).abs() \
-                            / ((H2 - 1) / 2)
+                    if args.far_w > 0:
+                        # Upweight far cells BY METRIC DISTANCE FROM THE EGO,
+                        # not by distance from the tensor centre. The two were
+                        # the same until the grid became rear-truncated: with
+                        # 80 m ahead / 20 m behind, the tensor centre sits at
+                        # +30 m, so the old row formula put its minimum there --
+                        # near-ego cells trained as if they were "far" (x1.6)
+                        # while the +30 m band, where most laneline GT lives,
+                        # got x1.0. Identical to the old behaviour on the
+                        # symmetric default grid.
+                        from bevlane.model import BEV_XF as _XF, BEV_XR as _XR
+                        rows = torch.arange(H2, device=ce.device,
+                                            dtype=ce.dtype)
+                        _x = _XF - (rows + 0.5) * (_XF + _XR) / H2
+                        wrow = 1 + args.far_w * _x.abs() / max(_XF, _XR)
                         wmap = wmap * wrow.view(1, -1, 1)
                     if args.boundary_w > 0:      # sharpen class boundaries
                         wmap = wmap * boundary_weight(
@@ -1644,8 +3414,25 @@ def main():
                     loss = loss + args.tversky_w * tversky_loss(
                         logits.float(), gt, classes=LINE_CLASSES,
                         alpha=0.2, beta=0.8)
+                if args.tversky_area_w > 0:
+                    # S2 (2026-08-27): road/crosswalk の FP 罰則。precision 要望
+                    loss = loss + args.tversky_area_w * tversky_loss(
+                        logits.float(), gt, classes=(1, 3),
+                        alpha=0.2, beta=0.8)
+                if args.cldice_w > 0:
+                    loss = loss + args.cldice_w * lane_cldice_loss(
+                        logits.float(), gt)
             opt.zero_grad(set_to_none=True)
-            if not torch.isfinite(loss):
+            # DDP: the skip decision must be UNANIMOUS. Deciding per rank
+            # desynchronises the gradient all-reduce and the round dies with
+            # "Expected to have finished reduction in the prior iteration"
+            # -- which is exactly what happened the moment a round warm-started
+            # a re-initialised head (r50/v49: fresh decoder, large early loss,
+            # some ranks non-finite and some not).
+            _fin = torch.tensor([float(torch.isfinite(loss))], device=device)
+            if ddp:
+                dist.all_reduce(_fin, op=dist.ReduceOp.MIN)
+            if _fin.item() < 0.5:
                 # the forward already moved the BN running stats; put them
                 # back so one bad batch cannot poison eval-mode inference
                 with torch.no_grad():
@@ -1656,14 +3443,95 @@ def main():
                 opt.zero_grad(set_to_none=True)
                 sched.step(); step += 1
                 if is_main:
+                    # Say WHICH tensor went bad. r51 skipped 2.0 % of its steps
+                    # and the only clue was an "RL sel=+nan" line elsewhere in
+                    # the log; the loss is accumulated over 26 sites so the
+                    # scalar alone identifies nothing. The model outputs are the
+                    # common origin, so name the non-finite ones here.
+                    _bad = []
+                    for _i, _o in enumerate(out if isinstance(out, tuple)
+                                            else (out,)):
+                        if not torch.is_tensor(_o):
+                            continue
+                        if not bool(torch.isfinite(_o.detach()).all()):
+                            _nn = int((~torch.isfinite(_o.detach())).sum())
+                            _bad.append(f"out[{_i}]"
+                                        f"{tuple(_o.shape)}:{_nn}")
+                    if _MODBAD:
+                        print(f"[modprobe] 最初に壊れたモジュール: "
+                              f"{_MODBAD[0]}", flush=True)
+                        _MODBAD.clear()
                     print(f"ep{ep} step{step} SKIP non-finite loss "
-                          "(BN stats restored)", flush=True)
+                          "(BN stats restored) "
+                          + (f"non-finite outputs: {', '.join(_bad)}"
+                             if _bad else "outputs all finite -> the loss "
+                             "itself diverged, not the forward"), flush=True)
                 continue
             scaler.scale(loss).backward()
+            _scale_before = scaler.get_scale()
             scaler.step(opt)
             scaler.update()
-            sched.step()
+            # GradScaler silently skips optimizer.step on overflow. Advancing
+            # OneCycleLR (and EMA) in that case desynchronises both from the
+            # actual parameter updates and emits the scheduler-before-step
+            # warning at startup. The logical data step still advances below.
+            _optimizer_stepped = scaler.get_scale() >= _scale_before
+            if _sp_pairs:
+                if _sp_final and step >= args.sparse_ramp_steps:
+                    # 1:4 -> 2:4 切替 (一度だけ)。以後は 2:4 マスクを再適用
+                    _sp_pairs = [(_p, _mf) for (_p, _), _mf in zip(_sp_pairs, _sp_final)]
+                    _sp_final = []
+                    if is_main:
+                        print(f"[sparse-24] step {step}: switched 1:4 -> 2:4", flush=True)
+                with torch.no_grad():
+                    for _p, _m in _sp_pairs:
+                        _p.mul_(_m)
+            if ema is not None and _optimizer_stepped:
+                ema.update(model.module if ddp else model)
+            if _optimizer_stepped:
+                sched.step()
+            elif is_main:
+                print(f"ep{ep} step{step + 1} AMP-SKIP gradient overflow "
+                      f"scale {_scale_before:g}->{scaler.get_scale():g}; "
+                      "LR/EMA held", flush=True)
             step += 1
+            # 予防的 conv->BN renorm ガード (--bn-guard, 2026-08-13): この系列は
+            # seg_head.out の running_var が数時間で 1e7 級に暴走し fp16 を
+            # 溢れさせる (r59/v63a/v63b/v65 x2 で実測)。事後修復 (renorm_convbn)
+            # と同一の関数保存再スケールを、閾値超過の時点で in-loop 適用する。
+            # 全 rank が同一の決定的計算 -> 通信不要。再スケールした conv の
+            # Adam 状態はリセット (再起動時と同じ扱い)。
+            if args.bn_guard > 0 and step % 200 == 0:
+                with torch.no_grad():
+                    _n0 = model.module if ddp else model
+                    _mods = dict(_n0.named_modules())
+                    for _bnm, _bn in _mods.items():
+                        if not isinstance(_bn, (torch.nn.BatchNorm2d,
+                                                torch.nn.SyncBatchNorm)):
+                            continue
+                        if _bn.running_var is None:
+                            continue
+                        _mx = float(_bn.running_var.max())
+                        if _mx <= args.bn_guard:
+                            continue
+                        _h, _, _i = _bnm.rpartition(".")
+                        if not _i.isdigit():
+                            continue
+                        _cv = _mods.get(f"{_h}.{int(_i) - 1}")
+                        if not isinstance(_cv, torch.nn.Conv2d):
+                            continue
+                        _s = _mx ** 0.5
+                        _cv.weight.div_(_s)
+                        if _cv.bias is not None:
+                            _cv.bias.div_(_s)
+                        _bn.running_mean.div_(_s)
+                        _bn.running_var.div_(_s * _s)
+                        for _p in (_cv.weight, _cv.bias):
+                            if _p is not None and _p in opt.state:
+                                opt.state[_p] = {}
+                        if is_main:
+                            print(f"[bn-guard] {_bnm} var {_mx:.3g} -> 1.0 "
+                                  f"(s={_s:.3g}) step{step}", flush=True)
             if is_main and step % 50 == 0:
                 if os.environ.get("METEOR_MEM_PROBE"):
                     print(f"PEAK {torch.cuda.max_memory_allocated()/2**30:.2f}"
@@ -1680,7 +3548,15 @@ def main():
                 # release this step's activations (18 output maps + graph
                 # refs) BEFORE the eval spike: v48's extra head left only
                 # tens of MB of headroom on 44 GB cards
+                # Dropping `out` alone is not enough: the unpacked views
+                # (logits/dlog/seg2d/hm/rg/hm2d/rg2d/occ_pred/traj_pred) still
+                # reference the step's graph, so empty_cache freed almost
+                # nothing and the E2E probe -- which every rank runs -- OOM'd
+                # on whichever ranks were most fragmented (measured at batch 2:
+                # ranks 2,3,4,7 skipped at step 300 while 0,1,5,6 passed).
                 out = ego_pred = loss = None
+                logits = dlog = seg2d = boxl = hm = rg = None
+                hm2d = rg2d = occ_pred = traj_pred = None
                 torch.cuda.empty_cache()
                 _bad = sanitize_bn(model.module if ddp else model)
                 if _bad and is_main:
@@ -1690,16 +3566,26 @@ def main():
                   try:
                     torch.cuda.empty_cache()
                     netq = model.module if ddp else model
-                    iq = evaluate(netq, dv, device, max_batches=10)
+                    # 5, was 10. Only rank 0 runs the probe; the other six sit
+                    # at the barrier for its whole duration, so every
+                    # batch here is paid seven times over. Sampled GPU
+                    # utilisation shows all six at 0 % while this runs.
+                    iq = evaluate(netq, dv, device, max_batches=5)
                     mq = float(np.nanmean(list(iq.values())))
                     msg = (f"[probe ep{ep} step{step}] mIoU={mq:.3f} "
                            f"road={iq.get('road', float('nan')):.3f} "
                            f"lane={iq.get('laneline', float('nan')):.3f}")
                     if use_lidar and dv_lid is not None:
-                        il = evaluate(netq, dv_lid, device, max_batches=10,
+                        il = evaluate(netq, dv_lid, device, max_batches=5,
                                       use_lidar=True)
                         msg += (f" | +lidar mIoU="
                                 f"{float(np.nanmean(list(il.values()))):.3f}")
+                    try:
+                        _th = thickness_ratio(netq, dv, device, max_batches=3)
+                        msg += (" | 太さ lane={:.2f} stop={:.2f} edge={:.2f}"
+                                .format(_th[4], _th[5], _th[6]))
+                    except Exception as _e:
+                        msg += f" | 太さ n/a({str(_e)[:20]})"
                     if use_rl and rl_acc[3] > 0:
                         msg += (f" | RL sel={rl_acc[0] / rl_acc[3]:+.3f}"
                                 f" best={rl_acc[1] / rl_acc[3]:+.3f}"
@@ -1742,7 +3628,9 @@ def main():
                 # same wall time
                 if use_ego and use_temporal:
                     netq2 = model.module if ddp else model
-                    sums = evaluate_ego(
+                    torch.cuda.empty_cache()
+                    try:
+                      sums = evaluate_ego(
                         netq2, dv, device,
                         4 + int(use_seg2d) + 4 * int(use_traj),
                         max_batches=12, batch_stride=3,
@@ -1754,6 +3642,18 @@ def main():
                                  + 4 * int(use_lg) + 2 * int(use_unk)
                                  + int(use_unk_v2) + int(use_lidarbev)
                                  + int(use_sdmap) + int(use_tlin)))
+                    except torch.cuda.OutOfMemoryError:
+                      # r48 died twice here: this eval sits outside the probe
+                      # guard, and its spike on top of the training reservation
+                      # tipped over 44 GB. The all_reduce below is collective,
+                      # so a skipping rank MUST still contribute zeros or the
+                      # other seven hang. evaluate_ego also leaves the model in
+                      # eval mode when it throws mid-way.
+                      print(f"[probeE2E ep{ep} step{step}] rank{rank} "
+                            f"SKIPPED (OOM)", flush=True)
+                      netq2.train()
+                      torch.cuda.empty_cache()
+                      sums = torch.zeros(8, dtype=torch.float64, device=device)
                     torch.cuda.empty_cache()
                     if ddp:
                         dist.all_reduce(sums)
@@ -1771,26 +3671,29 @@ def main():
           try:
             torch.cuda.empty_cache()
             net = model.module if ddp else model
-            ious = evaluate(net, dv, device)
+            ious = evaluate(net, dv_ep, device, max_batches=vcap(80))
             miou = float(np.nanmean(list(ious.values())))
-            rp, rr, _ = class_pr(net, dv, device, 1)
-            ep_, er_, eratio = class_pr(net, dv, device, 6)
+            rp, rr, _ = class_pr(net, dv_ep, device, 1, max_batches=vcap(40))
+            ep_, er_, eratio = class_pr(net, dv_ep, device, 6,
+                                         max_batches=vcap(40))
             print(f"[val ep{ep}] mIoU={miou:.3f} " +
                   " ".join(f"{k}={v:.3f}" for k, v in ious.items()) +
                   f" | road P={rp:.3f} R={rr:.3f}" +
                   f" | redge P={ep_:.3f} R={er_:.3f} x{eratio:.2f}", flush=True)
             if use_seg2d:
-                s2 = evaluate_seg2d(net, dv, device, args.n_seg2d)
+                s2 = evaluate_seg2d(net, dv_ep, device, args.n_seg2d,
+                                    max_batches=vcap(40))
                 if s2:
                     key = {0: "bg", 8: "mark", 11: "road", 12: "swalk",
                            13: "lane", 20: "pole"}
-                    print(f"[val2d ep{ep}] mIoU={np.mean(list(s2.values())):.3f} "
+                    val2d_miou = float(np.mean(list(s2.values())))
+                    print(f"[val2d ep{ep}] mIoU={val2d_miou:.3f} "
                           + " ".join(f"{key[c]}={s2[c]:.3f}"
                                      for c in key if c in s2), flush=True)
             if use_occ:
-                oc = evaluate_occ(net, dv, device,
+                oc = evaluate_occ(net, dv_ep, device,
                                   4 + int(use_seg2d) + 4 * int(use_traj)
-                                  + int(use_ego))
+                                  + int(use_ego), max_batches=vcap(25))
                 if oc:
                     onm = {0: "free", 2: "veh", 4: "ped", 5: "road",
                            7: "veg", 8: "bldg", 9: "pole"}
@@ -1803,24 +3706,48 @@ def main():
                     + int(use_lidarbev) + int(use_sdmap) + int(use_tlin)) \
                 if use_temporal else None
             if use_traj and use_boxdet:
-                d3 = evaluate_det3d(net, dv, device, 4 + int(use_seg2d),
-                                    tmp_idx=vtmp)
+                d3 = evaluate_det3d(net, dv_ep, device, 4 + int(use_seg2d),
+                                    max_batches=vcap(30), tmp_idx=vtmp)
                 print(f"[val3D ep{ep}] "
                       f"veh P={d3['veh'][0]:.2f} R={d3['veh'][1]:.2f} "
                       f"R50={d3['veh50']:.2f} Rn={d3['vehn']:.2f} "
                       f"err={d3['veh'][2]:.2f}m "
+                      f"L/W={d3['veh_shape'][0]:.2f}/{d3['veh_shape'][1]:.2f}m "
+                      f"corner={d3['veh_shape'][2]:.2f}m "
                       f"yaw={d3['veh_yaw']:.1f}deg flip={d3['veh_flip']:.2f} | "
                       f"vru P={d3['vru'][0]:.2f} R={d3['vru'][1]:.2f} "
                       f"R50={d3['vru50']:.2f} Rn={d3['vrun']:.2f} "
                       f"err={d3['vru'][2]:.2f}m", flush=True)
+                if "veh_zones" in d3:
+                    _zn = ("F0-40", "F40-80", "R0-40", "R40-80")
+                    print("[val3D-zone ep{}] ".format(ep) + " ".join(
+                        f"{nm}:R={v[0]:.2f}/e={v[1]:.2f}/n={v[2]}"
+                        f"/corner={v[3]:.2f}/L={v[4]:.2f}/W={v[5]:.2f}"
+                        f"/yaw={v[6]:.1f}"
+                        for nm, v in zip(_zn, d3["veh_zones"])), flush=True)
                 if "stat" in d3 and d3["stat"][4] > 0:
                     sp, sr, sa, sspec, sn = d3["stat"]
                     print(f"[valStat ep{ep}] P={sp:.2f} R={sr:.2f} "
                           f"acc={sa:.2f} movAcc={sspec:.2f} n={sn}",
                           flush=True)
+                    _zn = ("F0-40", "F40-80", "R0-40", "R40-80")
+                    print(f"[valStat-zone ep{ep}] " + " ".join(
+                        f"{nm}:P={v[0]:.2f}/R={v[1]:.2f}/"
+                        f"movAcc={v[2]:.2f}/n={v[3]}/statFrac={v[4]:.2f}"
+                        for nm, v in zip(_zn, d3["stat_zones"])), flush=True)
+                if "stat_cal" in d3:
+                    def _stat_cal_fmt(name, v):
+                        if v is None:
+                            return f"{name}=unavailable"
+                        return (f"{name}:t={v[0]:.3f}/P={v[1]:.2f}/"
+                                f"R={v[2]:.2f}/acc={v[3]:.2f}/"
+                                f"movAcc={v[4]:.2f}/bal={v[5]:.2f}")
+                    print(f"[valStat-cal ep{ep}] " + " ".join(
+                        _stat_cal_fmt(nm, d3["stat_cal"][nm])
+                        for nm in ("balanced", "safe95")), flush=True)
             if use_traj:
-                tj = evaluate_traj(net, dv, device, 4 + int(use_seg2d),
-                                   tmp_idx=vtmp)
+                tj = evaluate_traj(net, dv_ep, device, 4 + int(use_seg2d),
+                                   max_batches=vcap(40), tmp_idx=vtmp)
                 if tj:
                     ss = (f" statAcc={tj['stat_acc']:.2f}"
                           if "stat_acc" in tj else "")
@@ -1836,7 +3763,8 @@ def main():
             if use_tl:
                 tl_idx = (4 + int(use_seg2d) + 4 * int(use_traj)
                           + int(use_ego) + int(use_occ))
-                tr_ = evaluate_tl(net, dv, device, tl_idx, tmp_idx=vtmp)
+                tr_ = evaluate_tl(net, dv_ep, device, tl_idx, tmp_idx=vtmp,
+                                  max_batches=vcap(40))
                 if tr_:
                     print(f"[valTL ep{ep}] acc={tr_['acc']:.2f} "
                           + " ".join(f"{k}={tr_[k]:.2f}" for k in
@@ -1846,7 +3774,8 @@ def main():
                 uk_idx = (4 + int(use_seg2d) + 4 * int(use_traj)
                           + int(use_ego) + int(use_occ) + int(use_tl)
                           + int(use_risk) + 4 * int(use_lg))
-                uk = evaluate_unknown(net, dv, device, uk_idx, tmp_idx=vtmp)
+                uk = evaluate_unknown(net, dv_ep, device, uk_idx, tmp_idx=vtmp,
+                                  max_batches=vcap(20))
                 if uk:
                     print(f"[valUnk ep{ep}] P={uk['p']:.2f} R={uk['r']:.2f}",
                           flush=True)
@@ -1854,8 +3783,9 @@ def main():
                 umv_idx = (4 + int(use_seg2d) + 4 * int(use_traj)
                            + int(use_ego) + int(use_occ) + int(use_tl)
                            + int(use_risk) + 4 * int(use_lg) + 2 * int(use_unk))
-                ukd = evaluate_unknown_dense(net, dv, device, umv_idx,
-                                             tmp_idx=vtmp)
+                ukd = evaluate_unknown_dense(net, dv_ep, device, umv_idx,
+                                             tmp_idx=vtmp,
+                                  max_batches=vcap(20))
                 if ukd:
                     print(f"[valUnkD ep{ep}] P={ukd['p']:.2f} "
                           f"R={ukd['r']:.2f} Rfar={ukd['r_far']:.2f}",
@@ -1863,13 +3793,14 @@ def main():
             if use_risk:
                 rk_idx = (4 + int(use_seg2d) + 4 * int(use_traj)
                           + int(use_ego) + int(use_occ) + int(use_tl))
-                rk = evaluate_risk(net, dv, device, rk_idx, tmp_idx=vtmp)
+                rk = evaluate_risk(net, dv_ep, device, rk_idx, tmp_idx=vtmp,
+                                  max_batches=vcap(30))
                 if rk:
                     print(f"[valRisk ep{ep}] L1={rk['l1']:.3f} "
                           f"L1(hi)={rk['l1_hi']:.3f}", flush=True)
             if use_flow:
-                fl_ = evaluate_flow(net, dv, device, 4 + int(use_seg2d),
-                                    tmp_idx=vtmp)
+                fl_ = evaluate_flow(net, dv_ep, device, 4 + int(use_seg2d),
+                                    max_batches=vcap(20), tmp_idx=vtmp)
                 if fl_:
                     print(f"[valFlow ep{ep}] EPE(mov)={fl_['epe_mov']:.2f} "
                           f"EPE(stat)={fl_['epe_stat']:.2f} m/s", flush=True)
@@ -1877,22 +3808,137 @@ def main():
                 lg_idx = (4 + int(use_seg2d) + 4 * int(use_traj)
                           + int(use_ego) + int(use_occ) + int(use_tl)
                           + int(use_risk))
-                lg_ = evaluate_lanegraph(net, dv, device, lg_idx,
-                                         tmp_idx=vtmp)
+                lg_ = evaluate_lanegraph(net, dv_ep, device, lg_idx,
+                                         tmp_idx=vtmp,
+                                  max_batches=vcap(20))
                 if lg_:
                     print(f"[valLane ep{ep}] P={lg_['p']:.2f} "
                           f"R={lg_['r']:.2f} adjAcc={lg_['adj']:.2f}",
                           flush=True)
             if use_ego:
-                eg = evaluate_ego(net, dv, device,
+                # ADEc reads nan when the capped slice contains no curve
+                # frames -- exactly what --val-batch 1 caused (valE2E ep3/ep4
+                # ADEc=nan). vcap keeps the sample count fixed.
+                # Cover the WHOLE strided slice. vcap(40) capped this at 80
+                # batches of the 167 the stride was built to span, which was
+                # not making the number optimistic -- measured on r60 ep3, the
+                # first 80 give ADE 0.659 and all 167 give 0.625 -- it was just
+                # measuring half of it. E2E is the metric a round is selected
+                # on; it gets the full slice.
+                eg = evaluate_ego(net, dv_ep, device,
                                   4 + int(use_seg2d) + 4 * int(use_traj),
-                                  tmp_idx=vtmp)
+                                  max_batches=len(dv_ep) + 1, tmp_idx=vtmp)
                 if eg:
                     print(f"[valE2E ep{ep}] ADE={eg['ade']:.2f}m "
                           f"ADEc={eg['ade_c']:.2f}m "
                           f"FDE={eg['fde']:.2f}m steer={eg['steer']:.3f}rad "
                           f"acc={eg['acc']:.2f}m/s2 brakeAcc={eg['brake']:.2f}",
                           flush=True)
+                    print(f"[valE2Ed ep{ep}] oracle={eg['ade_o']:.2f} "
+                          f"(選択ロス {eg['ade'] - eg['ade_o']:+.2f}) "
+                          f"走行={eg['ade_mv']:.2f} 停車={eg['ade_st']:.2f} "
+                          f"等速直進={eg['ade_cv']:.2f} "
+                          f"高速帯wp0バイアス={eg['hs_bias']:+.3f}m "
+                          f"(n={eg['hs_n']:.0f})", flush=True)
+            if use_ego and eg and dv_hs is not None:
+                _hs = evaluate_ego(net, dv_hs, device,
+                                   4 + int(use_seg2d) + 4 * int(use_traj),
+                                   max_batches=len(dv_hs) + 1, tmp_idx=vtmp)
+                if _hs:
+                    eg["hs_bias"], eg["hs_n"] = _hs["hs_bias"], _hs["hs_n"]
+                    print(f"[valHS ep{ep}] 高速帯 wp0 バイアス={_hs['hs_bias']:+.3f}m "
+                          f"ADE={_hs['ade']:.3f} (n={_hs['hs_n']:.0f})", flush=True)
+            # The averaged weights get the SAME evaluation, on the same
+            # slice, so "EMA is better" is a measurement rather than a habit.
+            eg_e = None
+            if ema is not None and use_ego:
+                _bk = ema.swap_in(net)
+                try:
+                    eg_e = evaluate_ego(net, dv_ep, device,
+                                        4 + int(use_seg2d) + 4 * int(use_traj),
+                                        max_batches=len(dv_ep) + 1,
+                                        tmp_idx=vtmp)
+                    if eg_e and dv_hs is not None:
+                        _hse = evaluate_ego(net, dv_hs, device,
+                                            4 + int(use_seg2d) + 4 * int(use_traj),
+                                            max_batches=len(dv_hs) + 1, tmp_idx=vtmp)
+                        if _hse:
+                            eg_e["hs_bias"], eg_e["hs_n"] = _hse["hs_bias"], _hse["hs_n"]
+                            if is_main:
+                                print(f"[valHS-ema ep{ep}] 高速帯 wp0 バイアス="
+                                      f"{_hse['hs_bias']:+.3f}m ADE={_hse['ade']:.3f} "
+                                      f"(n={_hse['hs_n']:.0f})", flush=True)
+                    if eg_e and is_main:
+                        print(f"[valE2E-ema ep{ep}] ADE={eg_e['ade']:.2f}m "
+                              f"ADEc={eg_e['ade_c']:.2f}m "
+                              f"FDE={eg_e['fde']:.2f}m "
+                              f"oracle={eg_e['ade_o']:.2f} "
+                              f"(選択ロス {eg_e['ade'] - eg_e['ade_o']:+.2f}) "
+                              f"高速帯wp0バイアス={eg_e['hs_bias']:+.3f}m",
+                              flush=True)
+                    # seg2d 生存ガードを EMA 重み **自体** で検査する (2026-09-04)。
+                    # 従来は生の網の val2d を見て EMA を保存していたため、v131/v141
+                    # の best_e2e は seg2d が全滅 (SHIP-CHECK 不合格) していた。
+                    # EMA 側だけ死んでいるときは生の seg_head を移植して保存する
+                    # (v141 で手動移植した処置と同じ; 連鎖・ADEc は不変を確認済)。
+                    ema_sd = None
+                    if use_seg2d:
+                        s2e = evaluate_seg2d(net, dv_ep, device, args.n_seg2d,
+                                             max_batches=vcap(20))
+                        v2e = float(np.mean(list(s2e.values()))) if s2e \
+                            else float("nan")
+                        if is_main:
+                            print(f"[val2d-ema ep{ep}] mIoU={v2e:.3f}",
+                                  flush=True)
+                        if not (v2e > 0.30):
+                            if val2d_miou is not None and val2d_miou > 0.30:
+                                ema_sd = {k: v for k, v in
+                                          net.state_dict().items()}
+                                nrep = 0
+                                for k in ema_sd:
+                                    if k.startswith("seg_head.") and k in _bk:
+                                        ema_sd[k] = _bk[k].to(ema_sd[k].dtype)
+                                        nrep += 1
+                                if is_main:
+                                    print(f"[val2d-ema ep{ep}] seg2d 崩壊 -> "
+                                          f"生の seg_head を移植 ({nrep} tensor)",
+                                          flush=True)
+                            else:
+                                ema_sd = False   # 生も死んでいる: 保存禁止
+                    if ema_sd is None:
+                        ema_sd = net.state_dict()
+                    if eg_e and eg_e.get("ade_c") == eg_e.get("ade_c") \
+                            and eg_e["ade_c"] < best_e2e and is_main \
+                            and ema_sd is not False:
+                        best_e2e = eg_e["ade_c"]
+                        torch.save({"model": ema_sd, "epoch": ep,
+                                    "ious": ious, "ade_c": best_e2e,
+                                    "ema": args.ema,
+                                    "args": vars(args), "git": _GIT},
+                                   os.path.join(args.out, "best_e2e.pt"))
+                        print(f"[best-e2e] ep{ep} EMA ADEc={best_e2e:.3f}m "
+                              "saved", flush=True)
+                    # 連鎖代理で選ぶ ckpt (2026-09-04): ADEc + |高速帯 wp0 バイアス|。
+                    # ADEc 最小のエポックが連鎖乖離最良とは限らない (v135/v132 の
+                    # 逆転) ので、連鎖の主因である縦バイアスを同じ重みで足す。
+                    if eg_e and is_main and ema_sd is not False \
+                            and eg_e.get("ade_c") == eg_e.get("ade_c") \
+                            and eg_e.get("hs_bias") == eg_e.get("hs_bias"):
+                        cs = eg_e["ade_c"] + abs(eg_e["hs_bias"])
+                        if cs < best_chain:
+                            best_chain = cs
+                            torch.save({"model": ema_sd, "epoch": ep,
+                                        "ious": ious, "ade_c": eg_e["ade_c"],
+                                        "hs_bias": eg_e["hs_bias"],
+                                        "chain_score": cs, "ema": args.ema,
+                                        "args": vars(args), "git": _GIT},
+                                       os.path.join(args.out, "best_chain.pt"))
+                            print(f"[best-chain] ep{ep} EMA ADEc="
+                                  f"{eg_e['ade_c']:.3f} bias="
+                                  f"{eg_e['hs_bias']:+.3f} score={cs:.3f} "
+                                  "saved", flush=True)
+                finally:
+                    ema.swap_out(net, _bk)
             torch.save({"model": net.state_dict(), "epoch": ep,
                         "ious": ious, "args": vars(args), "git": _GIT},
                        os.path.join(args.out, "last.pt"))
@@ -1906,6 +3952,26 @@ def main():
                 torch.save({"model": net.state_dict(), "epoch": ep,
                             "ious": ious, "args": vars(args), "git": _GIT},
                            os.path.join(args.out, "best.pt"))
+            # E2E is the priority metric and the composite above is dominated
+            # by mIoU: 0.01 * ADEc moves the score by ~0.010-0.018 while mIoU
+            # itself spreads about that much, so an epoch with clearly better
+            # driving loses to one with marginally better segmentation. r57
+            # reached ADEc 0.92 m at ep4 -- the best any round has managed --
+            # and kept neither that epoch nor anything close to it: best.pt is
+            # ep0 (1.478 m on the fixed slice) and last.pt is ep7 (1.758 m).
+            # Keep it explicitly, on ADEc alone.
+            if use_ego and eg and eg.get("ade_c") == eg.get("ade_c") \
+                    and (val2d_miou is None or val2d_miou > 0.30):
+                # seg2d 崩壊エポックの best_e2e 保存を禁止 (v125/v128/v130 で
+                # 配備 ckpt の 2D seg が全滅していた事故の再発防止)
+                if eg["ade_c"] < best_e2e:
+                    best_e2e = eg["ade_c"]
+                    torch.save({"model": net.state_dict(), "epoch": ep,
+                                "ious": ious, "ade_c": best_e2e,
+                                "args": vars(args), "git": _GIT},
+                               os.path.join(args.out, "best_e2e.pt"))
+                    print(f"[best-e2e] ep{ep} ADEc={best_e2e:.3f}m saved",
+                          flush=True)
           except torch.cuda.OutOfMemoryError:
             # never let the epoch-end evaluation kill the round
             print(f'[val ep{ep}] SKIPPED (OOM)', flush=True)
@@ -1913,7 +3979,7 @@ def main():
         if ddp:
             dist.barrier()
     if is_main:
-        print(f"[done] best mIoU={best:.3f}", flush=True)
+        print(f"[done] best score={best:.3f} best_e2e ADEc={best_e2e:.3f}m", flush=True)
     if ddp:
         dist.destroy_process_group()
 

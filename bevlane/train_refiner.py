@@ -97,6 +97,10 @@ def evaluate(frozen, ref0, loader, device, args, max_b=40):
     iR = np.zeros((len(BANDS), N_CLASSES)); uR = iR.copy()
     iF = iR.copy(); uF = iR.copy()
     ade_r = ade_f = nseen = 0.0
+    box_r = ([0, 0, 0], [0, 0, 0], [], [])
+    box_f = ([0, 0, 0], [0, 0, 0], [], [])
+    adec_r = adec_f = orc_r = orc_f = 0.0
+    nturn_r = 0
     hm_r = hm_f = 0.0
     utp_r = ufp_r = ufn_r = utp_f = ufp_f = ufn_f = 0
     s_cm = [[0, 0, 0], [0, 0, 0]]      # raw/refined tp,fp,fn
@@ -106,6 +110,11 @@ def evaluate(frozen, ref0, loader, device, args, max_b=40):
             break
         imgs, K, Tc, gt, _d = _unpack(batch, device, args)
         det_boxes = _d.get("boxes"); det_n = _d.get("nbox")
+        # -1 = scene has no 3D-box annotation (x2gen2): never a "zero
+        # objects" label, so clamp for the counting loops and mask the
+        # box-reading losses below.
+        _bv = (det_n >= 0) if det_n is not None else None
+        det_n = det_n.clamp(min=0) if det_n is not None else None
         traj_gt = _d.get("traj"); tvalid = _d.get("tvalid")
         ego_gt = _d.get("ego"); risk_gt = _d.get("risk")
         unk_gt = _d.get("unk"); lb_gt = _d.get("lb")
@@ -127,6 +136,35 @@ def evaluate(frozen, ref0, loader, device, args, max_b=40):
                            if args.do_stat and len(out) > 10 else None),
                      pl=(out[18].float()
                          if args.do_pl and len(out) > 18 else None))
+        # ---- 3D BBox: 帯別 recall + 位置誤差 (raw vs refined) ----
+        # 2026-08-20 追加: box の効果がこれまで一切可視化されておらず、
+        # accept 判定にも残らなかった。
+        if args.do_box and "hm" in r and det_boxes is not None:
+            for _tag, (_hm, _rg) in (("r", (out[3], out[4])),
+                                     ("f", (r["hm"], r["reg"]))):
+                _d = frozen.decode_boxes(_hm.float().cpu(), _rg.float().cpu(),
+                                         thresh=0.25)
+                for _b in range(det_boxes.shape[0]):
+                    _pv = [(float(x[2]), float(x[3])) for x in _d[_b]
+                           if float(x[0]) < 1.5]
+                    for _k in range(int(det_n[_b])):
+                        _c, _xe, _ye, _ln = [float(v) for v in
+                                             det_boxes[_b, _k, :4]]
+                        if _ln <= 0 or _c >= 1.5:
+                            continue
+                        _rr = (_xe * _xe + _ye * _ye) ** 0.5
+                        _bi = 0 if _rr < 20 else (1 if _rr < 40 else 2)
+                        _best = None
+                        for _px, _py in _pv:
+                            _d2 = (_xe - _px) ** 2 + (_ye - _py) ** 2
+                            if _d2 < 9.0 and (_best is None or _d2 < _best[0]):
+                                _best = (_d2, _px, _py)
+                        _acc = box_r if _tag == "r" else box_f
+                        _acc[0][_bi] += 1
+                        if _best:
+                            _acc[1][_bi] += 1
+                            _acc[2].append(abs(_best[1] - _xe))
+                            _acc[3].append(abs(_best[2] - _ye))
         if args.do_stat and "stat" in r:
             for tag, lg in (("r", out[10]), ("f", r["stat"])):
                 p = lg.float()[:, 0].sigmoid()
@@ -186,18 +224,45 @@ def evaluate(frozen, ref0, loader, device, args, max_b=40):
             valid = ego_gt[:, 16] > 0.5
             if valid.any():
                 gtw = ego_gt[:, :12].view(-1, 6, 2)
+                # SELECTOR, not oracle. This used to be d.min(1) -- the
+                # candidate closest to the log, chosen with knowledge of the
+                # log. That is an upper bound no vehicle can reach at run time,
+                # and it is the wrong thing to steer a decision by: the mode
+                # selector picks the best candidate only 0.70-0.74 of the time
+                # and loses to "always take candidate 0" (measured ADE 1.021 vs
+                # 1.006), so a refiner that improves candidates the selector
+                # never commits to would look like progress and deliver none.
+                # Match what bevlane/train.py's valE2E reports: argmax of the
+                # mode logits, and ADEc over turning frames alongside ADE.
+                turn = gtw[:, -1, 1].abs() > 2.0
                 for tag, ev in (("r", out[7].float()), ("f", r["ego"].float())):
                     wp = ev[:, :12 * EGO_K].view(-1, EGO_K, 6, 2)
-                    d = (wp - gtw[:, None]).pow(2).sum(-1).sqrt().mean(2)  # [B,K]
-                    ade = d.min(1).values[valid].mean().item()
+                    d = (wp - gtw[:, None]).pow(2).sum(-1).sqrt().mean(2)
+                    lg = ev[:, 12 * EGO_K:12 * EGO_K + EGO_K]
+                    k = lg.argmax(1, keepdim=True)
+                    sel = d.gather(1, k).squeeze(1)
+                    ade = sel[valid].mean().item()
+                    vt = valid & turn
+                    adec = sel[vt].mean().item() if vt.any() else float("nan")
+                    orc = d.min(1).values[valid].mean().item()
                     if tag == "r":
                         ade_r += ade
+                        adec_r += 0.0 if adec != adec else adec
+                        orc_r += orc
+                        nturn_r += int(vt.any())
                     else:
                         ade_f += ade
+                        adec_f += 0.0 if adec != adec else adec
+                        orc_f += orc
                 nseen += 1
     res = {"seg": (iR, uR, iF, uF)}
+    if args.do_box and sum(box_r[0]):
+        res["box"] = (box_r, box_f)
     if args.do_e2e and nseen:
         res["ade"] = (ade_r / nseen, ade_f / nseen)
+        nt = max(nturn_r, 1)
+        res["adec"] = (adec_r / nt, adec_f / nt)
+        res["orc"] = (orc_r / nseen, orc_f / nseen)
     if args.do_unk:
         res["unk"] = ((utp_r / max(utp_r + ufp_r, 1),
                        utp_r / max(utp_r + ufn_r, 1)),
@@ -213,6 +278,18 @@ def evaluate(frozen, ref0, loader, device, args, max_b=40):
 
 
 def _report(res, ep, step, tag=""):
+    if "box" in res:
+        _br, _bf = res["box"]
+        _nm = ["0-20m", "20-40m", "40m+"]
+        _line = ""
+        for _i in range(3):
+            if _br[0][_i]:
+                _line += (f"  {_nm[_i]} R {_br[1][_i]/_br[0][_i]:.3f}->"
+                          f"{_bf[1][_i]/_bf[0][_i]:.3f}")
+        _dr = np.mean(_br[3]) if _br[3] else float("nan")
+        _df = np.mean(_bf[3]) if _bf[3] else float("nan")
+        print(f"[refBox ep{ep} step{step}] {tag} veh recall raw->refined"
+              f"{_line} | |dy| {_dr:.3f}->{_df:.3f} m", flush=True)
     if "seg" in res:
         iR, uR, iF, uF = res["seg"]
         if uR.sum():
@@ -225,6 +302,10 @@ def _report(res, ep, step, tag=""):
                     f_ = iF[bidx, c] / uF[bidx, c] if uF[bidx, c] else float("nan")
                     row += f"  {nm} {r:.3f}->{f_:.3f}"
                 print(row, flush=True)
+    if "adec" in res:
+        print(f"[refE2Ec ep{ep} step{step}]  ADEc(selector) "
+              f"{res['adec'][0]:.3f}->{res['adec'][1]:.3f}  "
+              f"oracle {res['orc'][0]:.3f}->{res['orc'][1]:.3f}", flush=True)
     if "ade" in res:
         print(f"[refE2E ep{ep} step{step}] {tag} ADE raw->refined "
               f"{res['ade'][0]:.3f}->{res['ade'][1]:.3f}", flush=True)
@@ -239,6 +320,61 @@ def _report(res, ep, step, tag=""):
         (pr, rr_), (pf, rf) = res["unk"]
         print(f"[refUnk ep{ep} step{step}] {tag} pix P/R raw "
               f"{pr:.3f}/{rr_:.3f} -> refined {pf:.3f}/{rf:.3f}", flush=True)
+
+
+def _verdict(res):
+    """Which heads actually BEAT the frozen model on val, per head.
+
+    The refiner is zero-init, so at step 0 refined == raw exactly; a head that
+    ends up worse than raw is a head that must not be applied. Measured on
+    r45 and r47: the seg head trades far-range road / road_edge / stopline IoU
+    away, so it fails this gate while E2E / stationary / pseudo-LiDAR pass.
+    Stored in the ckpt as `accept` and honoured by demo_rgbd_bev.py, so a
+    losing head can never silently degrade a priority task."""
+    v = {}
+    if "seg" in res:
+        iR, uR, iF, uF = res["seg"]
+        dl = []
+        percls = {}
+        for c in range(1, N_CLASSES):
+            d_ = []
+            for b_ in range(len(BANDS)):
+                if uR[b_, c] and uF[b_, c]:
+                    d_.append(iF[b_, c] / uF[b_, c] - iR[b_, c] / uR[b_, c])
+            if d_:
+                percls[c] = d_
+                dl += d_
+        # every band/class matters: accept only if the mean does not drop and
+        # no single band/class loses more than 1 IoU point
+        v["seg"] = bool(dl) and (sum(dl) / len(dl) >= 0.0) and min(dl) > -0.01
+        # Per-class list, DIAGNOSTICS ONLY -- do not apply it at inference.
+        # Swapping single channels into an otherwise-raw logit field is invalid:
+        # the residual is learned jointly, so a lone refined channel sits below
+        # its untouched competitors and the argmax drops the class (measured:
+        # laneline IoU 0.125 -> 0.0045, predicted pixels 0.134 % -> 0.0013 %).
+        # The seg head is applied whole or not at all.
+        v["seg_classes"] = sorted(
+            c for c, d_ in percls.items()
+            if sum(d_) / len(d_) > 0.0 and min(d_) > -0.005)
+    if "adec" in res:
+        print(f"[refE2Ec ep{ep} step{step}]  ADEc(selector) "
+              f"{res['adec'][0]:.3f}->{res['adec'][1]:.3f}  "
+              f"oracle {res['orc'][0]:.3f}->{res['orc'][1]:.3f}", flush=True)
+    if "ade" in res:
+        v["e2e"] = res["ade"][1] <= res["ade"][0]        # lower ADE is better
+    if "stat" in res:
+        (pr, rr_), (pf, rf) = res["stat"]
+        f1r = 2 * pr * rr_ / max(pr + rr_, 1e-6)
+        f1f = 2 * pf * rf / max(pf + rf, 1e-6)
+        v["stat"] = f1f >= f1r
+    if "pl" in res:
+        v["pl"] = res["pl"][1] >= res["pl"][0]
+    if "unk" in res:
+        (pr, rr_), (pf, rf) = res["unk"]
+        f1r = 2 * pr * rr_ / max(pr + rr_, 1e-6)
+        f1f = 2 * pf * rf / max(pf + rf, 1e-6)
+        v["unk"] = f1f >= f1r
+    return v
 
 
 def main():
@@ -256,6 +392,12 @@ def main():
     ap.add_argument("--far-w", type=float, default=3.0)
     ap.add_argument("--bg-w", type=float, default=0.5)
     ap.add_argument("--lovasz-w", type=float, default=0.3)
+    ap.add_argument("--ce-w", type=float, default=1.0,
+                    help="weight of the (far-row-weighted) CE term; drop it "
+                         "below the lovasz weight to optimise what is measured")
+    ap.add_argument("--class-iou-w", type=float, default=0.0,
+                    help="per-class soft-IoU term on sidewalk/stopline/parking "
+                         "-- the classes r48 regressed")
     ap.add_argument("--do-seg", action="store_true", default=True)
     ap.add_argument("--no-seg", dest="do_seg", action="store_false")
     ap.add_argument("--do-box", action="store_true", default=False)
@@ -268,6 +410,12 @@ def main():
                     help="refine the dense unknown logit (out[17], v41+)")
     ap.add_argument("--unk-w", type=float, default=2.0)
     ap.add_argument("--unk-key", default="unknown_v3")
+    ap.add_argument("--eval-samples", type=int, default=480,
+                    help="val samples in the report/verdict slice; taken with "
+                         "a stride so they span every val scene")
+    ap.add_argument("--cam-drop", type=float, default=0.0,
+                    help="probability of zeroing CAM_BACK_NARROW on an "
+                         "8-camera sample (keeps the 7-camera rig calibrated)")
     ap.add_argument("--do-stat", action="store_true",
                     help="refine the stationary flag (out[10])")
     ap.add_argument("--stat-w", type=float, default=1.0)
@@ -289,6 +437,8 @@ def main():
     ap.add_argument("--flow-w", type=float, default=0.3)
     ap.add_argument("--do-lg", action="store_true")
     ap.add_argument("--lanegraph-w", type=float, default=0.5)
+    ap.add_argument("--yaw-fix-deg", type=float, default=0.0,
+                    help="GT 層間回転の補正 (train.py と同じ、out/yawfix_plan.md)")
     ap.add_argument("--do-all", action="store_true",
                     help="refine every head the network emits")
     ap.add_argument("--box-w", type=float, default=1.0)
@@ -390,16 +540,30 @@ def main():
                with_boxdet=args.do_box and not args.do_traj,
                with_ego=args.do_e2e, with_risk=args.do_risk,
                with_unknown_v2=args.do_unk, unk2_key=args.unk_key,
-               with_lidarbev=args.do_pl)
-    tr = BevLaneDataset(args.root, train_s, gt_key=args.gt_key, **dkw)
+               with_lidarbev=args.do_pl,
+               yaw_fix_deg=args.yaw_fix_deg)
+    tr = BevLaneDataset(args.root, train_s, gt_key=args.gt_key,
+                        cam_drop=args.cam_drop, **dkw)
     va = BevLaneDataset(args.root, val_s, max_per_scene=4, gt_key=args.gt_key,
                         **dkw)
     sampler = DistributedSampler(tr) if ddp else None
     dl = DataLoader(tr, batch_size=args.batch, shuffle=sampler is None,
                     sampler=sampler, num_workers=args.workers, pin_memory=True,
                     drop_last=True, persistent_workers=args.workers > 0)
-    dv = DataLoader(va, batch_size=args.batch, shuffle=False,
+    # The reports (and the per-head ACCEPTANCE verdict written into the ckpt)
+    # used to read the first max_b batches of an unshuffled loader: 480 samples
+    # = 60 of 270 val scenes, all from the head of the list. A verdict decided
+    # on the head of the list is not a verdict about the val set, and the seg
+    # head was rejected on exactly that basis. Stride the slice so the same
+    # evaluation cost spans every val scene; deterministic across epochs.
+    _st = max(1, len(va) // max(args.eval_samples, 1))
+    va_ev = torch.utils.data.Subset(va, list(range(0, len(va), _st)))
+    dv = DataLoader(va_ev, batch_size=args.batch, shuffle=False,
                     num_workers=2, pin_memory=True)
+    if is_main:
+        _sc = {va.items[i][0] for i in va_ev.indices}
+        print(f"[val] eval slice: {len(va_ev)} samples over {len(_sc)} of "
+              f"{len(val_s)} scenes (stride {_st})", flush=True)
     if is_main:
         print(f"train {len(tr)} / {len(train_s)} scenes; "
               f"val {len(va)} / {len(val_s)} scenes; world={world} lr={lr:.1e}",
@@ -422,6 +586,15 @@ def main():
                 break
             imgs, K, Tc, gt, _d = _unpack(batch, device, args)
             det_boxes = _d.get("boxes"); det_n = _d.get("nbox")
+            # -1 = the scene has no 3D-box annotation (x2gen2): never a
+            # "zero objects" label. Mask the box-reading losses instead.
+            # DDP safety: same graph on every rank (see train.py) -- select
+            # all rows and zero-weight the loss when none is annotated.
+            _bv0 = (det_n >= 0) if det_n is not None else None
+            _bw = 1.0 if (_bv0 is not None and bool(_bv0.any())) else 0.0
+            _bv = _bv0 if _bw else (torch.ones_like(_bv0)
+                                    if _bv0 is not None else None)
+            det_n = det_n.clamp(min=0) if det_n is not None else None
             traj_gt = _d.get("traj"); tvalid = _d.get("tvalid")
             ego_gt = _d.get("ego"); risk_gt = _d.get("risk")
             unk_gt = _d.get("unk"); lb_gt = _d.get("lb")
@@ -468,24 +641,49 @@ def main():
                 loss = seg.new_zeros(())
                 if args.do_seg:
                     rs = r["seg"].float()
+                    # The seg head is graded on BANDED PER-CLASS IoU, but was
+                    # trained on far-row-weighted CE. Optimising CE with a x3
+                    # far weight while measuring IoU is how the head ended up
+                    # LOSING to the frozen model on r45 and r47 (road 40-80m
+                    # 0.474->0.420, stopline 0-20m 0.251->0.208): CE rewards
+                    # confident far-range road, IoU punishes the false
+                    # positives that come with it. lovasz_softmax IS the IoU
+                    # surrogate, so it leads and CE only regularises.
                     ce = F.cross_entropy(rs, gt, weight=cw,
                                          ignore_index=-100, reduction="none")
                     H2 = ce.shape[-2]
                     rows = torch.arange(H2, device=device, dtype=ce.dtype)
                     wrow = 1 + args.far_w * (1 - rows / (H2 - 1)).clamp(min=0)
-                    loss = loss + (ce * wrow.view(1, -1, 1)).mean()
+                    loss = loss + args.ce_w * (ce * wrow.view(1, -1, 1)).mean()
                     if args.lovasz_w > 0:
                         loss = loss + args.lovasz_w * lovasz_softmax(
                             rs, gt, ignore=0)
-                if args.do_box:
-                    loss = loss + args.box_w * ref0_boxloss(
-                        frozen, r["hm"], r["reg"], det_boxes, det_n)
+                    if args.class_iou_w > 0:
+                        # per-class soft IoU, so a class that the round
+                        # regressed (r48: sidewalk 0.573->0.556, stopline
+                        # 0.138->0.130, parking 0.264->0.248) gets its own
+                        # gradient instead of being averaged away
+                        p_ = rs.softmax(1)
+                        for c in (2, 5, 8):
+                            gi = (gt == c).float()
+                            if gi.sum() < 1:
+                                continue
+                            pi = p_[:, c]
+                            inter = (pi * gi).sum()
+                            uni = pi.sum() + gi.sum() - inter
+                            loss = loss + args.class_iou_w * (
+                                1.0 - inter / uni.clamp(min=1.0))
+                if args.do_box and _bv is not None:
+                    loss = loss + args.box_w * _bw * ref0_boxloss(
+                        frozen, r["hm"][_bv], r["reg"][_bv],
+                        det_boxes[_bv], det_n[_bv])
                 if args.do_e2e:
                     loss = loss + args.e2e_w * frozen.ego_loss(
                         r["ego"].float(), ego_gt)
-                if args.do_traj:
-                    loss = loss + args.traj_w * frozen.traj_loss(
-                        r["traj"].float(), det_boxes, det_n, traj_gt, tvalid)
+                if args.do_traj and _bv is not None:
+                    loss = loss + args.traj_w * _bw * frozen.traj_loss(
+                        r["traj"].float()[_bv], det_boxes[_bv], det_n[_bv],
+                        traj_gt[_bv], tvalid[_bv])
                 if args.do_risk:
                     loss = loss + args.risk_w * frozen.risk_loss(
                         r["risk"].float(), risk_gt)
@@ -495,7 +693,8 @@ def main():
                         r["unk"].float(), unk_gt)
                 if args.do_stat and "stat" in r:
                     loss = loss + args.stat_w * frozen.stat_loss(
-                        r["stat"].float(), det_boxes, det_n, traj_gt, tvalid)
+                        r["stat"].float()[_bv], det_boxes[_bv], det_n[_bv],
+                        traj_gt[_bv], tvalid[_bv])
                 if args.do_pl and "pl" in r:
                     loss = loss + args.pl_w * frozen.pseudo_lidar_loss(
                         r["pl"].float(), lb_gt)
@@ -515,8 +714,9 @@ def main():
                     loss = loss + args.tl_w * frozen.tl_loss(
                         r["tl"].float(), _d["tl"])
                 if args.do_flow and "flow" in r:
-                    loss = loss + args.flow_w * frozen.flow_loss(
-                        r["flow"].float(), det_boxes, det_n, traj_gt, tvalid)
+                    loss = loss + args.flow_w * _bw * frozen.flow_loss(
+                        r["flow"].float()[_bv], det_boxes[_bv], det_n[_bv],
+                        traj_gt[_bv], tvalid[_bv])
                 if args.do_lg and "lg_pts" in r:
                     loss = loss + args.lanegraph_w * frozen.lanegraph_loss(
                         r["lg_pts"].float(), r["lg_meta"].float(),
@@ -603,8 +803,23 @@ def main():
                        os.path.join(args.out, "last.pt"))
             print(f"[ckpt] saved epoch {ep}", flush=True)
     if is_main:
-        _report(evaluate(frozen, ref0, dv, device, args, max_b=120),
-                args.epochs, step, tag="FINAL")
+        fin = evaluate(frozen, ref0, dv, device, args,
+                       max_b=len(dv))          # the whole strided slice
+        _report(fin, args.epochs, step, tag="FINAL")
+        acc = _verdict(fin)
+        sc = acc.get("seg_classes")
+        print(f"[refAccept] heads that beat the frozen model: "
+              f"{ {k: v for k, v in acc.items() if k != 'seg_classes'} }",
+              flush=True)
+        if sc is not None:
+            print(f"[refAccept] seg classes accepted: "
+                  f"{[CLASS_NAMES[c] for c in sc]}", flush=True)
+        pth = os.path.join(args.out, "last.pt")
+        if os.path.exists(pth):
+            _ck = torch.load(pth, map_location="cpu")
+            _ck["accept"] = acc
+            torch.save(_ck, pth)
+            print(f"[refAccept] written into {pth}", flush=True)
         print("REFINER DONE", flush=True)
     if ddp:
         dist.destroy_process_group()

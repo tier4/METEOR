@@ -16,6 +16,11 @@ from bevlane.dataset import BevLaneDataset  # noqa: E402
 from bevlane.model import MODELS  # noqa: E402
 from bevlane.train import split_scenes  # noqa: E402
 
+# Always 8 camera slots. A 7-camera rig (x2gen2 has no CAM_BACK_NARROW) is
+# deployed on the SAME engine by feeding zeros in slot 7 and the donor pose in
+# K/T -- measured bit-identical to zeroing the camera inside the model
+# (bevlane/probe_cam_config.py check C: max |seg logit diff| 0.0), so no
+# separate export is needed.
 SHAPES = {"imgs": (1, 8, 3, 288, 512), "K": (1, 8, 3, 3), "T": (1, 8, 4, 4)}
 
 

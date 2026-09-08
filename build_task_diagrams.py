@@ -3,7 +3,7 @@
 
 Four figures: BEV generation, temporal memory & routing, E2E planning
 stack (with guardrails), perception heads (det / forecast / unknown /
-lane graph / occupancy).
+occupancy).
 """
 import matplotlib
 matplotlib.use("Agg")
@@ -121,7 +121,7 @@ fig.savefig("docs/media/detail_e2e.png", bbox_inches="tight",
 # ---------------------------------------------- 4. perception head detail
 fig, ax = new_fig(); box, arrow = mk(ax)
 ax.set_title("Perception heads — detection, forecasting, unknown, "
-             "lane graph, occupancy", fontsize=15, fontweight="bold",
+             "occupancy", fontsize=15, fontweight="bold",
              color=DARK)
 box(2, 46, 20, 14, "RAW BEV", fc=OP)
 box(2, 24, 20, 14, "FUSED BEV\n+ motion residual", fc=MEM, fs=10.5)
@@ -129,15 +129,14 @@ box(28, 56, 34, 12, "3D box head", "CenterPoint + crossing-yaw\nweight (yaw 4.7�
 box(28, 42, 34, 12, "Unknown head (v34)", "temporal stem → cones/posts\n0.4 m fixed, occ-blob GT")
 box(28, 28, 34, 12, "Forecast + stationary", "det-yaw feature + heading loss\nvehHead 23°, vruHead 63°", fc=E2E)
 box(28, 14, 34, 12, "Occupancy + flow", "16z voxels + velocity\nnear-ego FP penalty (v33)")
-box(68, 42, 36, 14, "B1 lane-graph decoder", "24 queries, self+cross attn\nover 352 BEV ROI tokens")
 box(68, 22, 36, 14, "B4 interaction (lite)", "scene token → forecast\ncontext residual", fc=E2E)
-box(110, 34, 42, 20, "Outputs", "boxes+unknown / futures /\nvoxels+flow / vector graph",
+box(110, 34, 42, 20, "Outputs", "boxes+unknown / futures /\nvoxels+flow",
     fc=E2E, out="all from ONE BEV;\neach head < 5% compute")
 arrow(22, 55, 28, 61); arrow(22, 52, 28, 48); arrow(22, 33, 28, 34)
-arrow(22, 50, 28, 20, dash=True); arrow(22, 53, 68, 48, col=GREEN)
+arrow(22, 50, 28, 20, dash=True)
 arrow(22, 30, 68, 28, col=AMBER); arrow(62, 61, 110, 46)
 arrow(62, 48, 110, 44); arrow(62, 34, 110, 42); arrow(62, 20, 110, 38)
-arrow(104, 48, 110, 46); arrow(104, 29, 110, 40)
+arrow(104, 29, 110, 40)
 fig.savefig("docs/media/detail_heads.png", bbox_inches="tight",
             facecolor="white")
 print("saved 4 detail diagrams")
