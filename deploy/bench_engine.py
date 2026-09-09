@@ -55,7 +55,7 @@ def main():
           f"{'min':>8s} {'FPS':>6s}")
     for e in a.engine:
         if not os.path.exists(e):
-            print(f"{os.path.basename(e):40s}   見つかりません")
+            print(f"{os.path.basename(e):40s}   not found")
             continue
         t = bench(e, a.iters, a.warmup)
         print(f"{os.path.basename(os.path.dirname(e)) + '/' + os.path.basename(e):40s} "

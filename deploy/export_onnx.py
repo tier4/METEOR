@@ -51,13 +51,13 @@ _POOL_CACHE = {}
 
 
 def _pool_matrix(n_in, n_out, dtype, device):
-    """平均プーリング行列を **定数** として作る。
+    """Build the average-pooling matrix as a **constant**.
 
-    2026-08-14: 以前は torch テンソルに Python ループで代入していたため、
-    トレース時に代入 1 回 = ScatterND 1 ノードとして記録され、エンジンに
-    86 個の直列 ScatterND チェーン (myelin クラスタ 31 ms / 8cam 48 ms) が
-    焼き込まれていた。値は (n_in, n_out) だけで決まる定数なので numpy 側で
-    組んでから 1 つのテンソルにする。数値は完全に同一。
+    2026-08-14: this used to be filled into a torch tensor by a Python loop,
+    so tracing recorded one ScatterND node per assignment and the engine
+    ended up with a serial chain of 86 ScatterND nodes (myelin cluster
+    31 ms / 48 ms for 8cam) baked in. The values depend only on (n_in, n_out),
+    so build the constant in numpy and make a single tensor. Bit-identical.
     """
     key = (n_in, n_out)
     m = _POOL_CACHE.get(key)
@@ -126,11 +126,11 @@ class MeteorExport(torch.nn.Module):
         super().__init__()
         self.net = net
         self.drop_lg = drop_lg
-        # --no-hist (2026-09-05): 履歴スロットが常に零 (学習条件 = 実機の
-        # METEOR_ZERO_HIST=1) なら、cat[bev,0,0,0] に掛かる tgate / tfuse3[0]
-        # の 1x1 畳み込みは入力チャネル先頭 BEV_CH 分の重みだけで数学的に同一。
-        # 3 本の grid_sample、履歴入力 (460MB/frame の IO)、raw_bev 出力を
-        # グラフから消し、精度は構成上不変 (ORT で等価性を検査する)。
+        # --no-hist (2026-09-05): if the history slots are always zero (training
+        # condition = METEOR_ZERO_HIST=1 on the vehicle), the 1x1 convs tgate /
+        # tfuse3[0] on cat[bev,0,0,0] are mathematically identical using only the
+        # first BEV_CH input-channel weights. Drop the 3 grid_samples, the hist
+        # input (460MB/frame of IO) and the raw_bev output; accuracy unchanged by construction (ORT equivalence check).
         self.no_hist = no_hist
         if no_hist:
             import copy
@@ -175,20 +175,20 @@ class MeteorExport(torch.nn.Module):
                 hist_bev1=None, hist_bev2=None, lidar_bev=None, lidar_flag=None):
         net = self.net
         bg = self.base_grid
-        # --with-lidar (2026-09-08): 任意入力 lidar_bev [1,4,400,250] を lidar_stem 経由で BEV に
-        # 加える (モデル本体の bev_extra と同じ; 零入力 = カメラのみと同値)。
+        # --with-lidar (2026-09-08): optional input lidar_bev [1,4,400,250] is added to the BEV
+        # through lidar_stem (same as the model's bev_extra; zero input == camera-only).
         _lb_kw = {"lidar_bev": lidar_bev} if lidar_bev is not None else {}
         if lidar_bev is not None:
-            # Orin 実測 (2026-09-08): モデル本体の bev_extra は flag [B,1,1,1] を 800x500x96 へ
-            # ブロードキャストして掛けるため Myelin の ReplAbsSum 1 ノードで 14.8 ms 食う。
-            # flag は補間前の 400x250 で掛ける (補間は線形なので数値は同一) → 上乗せ ≈1 ms。
+            # Orin measurement (2026-09-08): the model's bev_extra broadcasts flag [B,1,1,1] to
+            # 800x500x96 before multiplying, costing 14.8 ms in a single Myelin ReplAbsSum node.
+            # Multiply by flag at 400x250 before interpolation (linear, so numerically identical) -> overhead ~1 ms.
             def _bev_extra_export(bev, _net=net):
                 lb = _net._lidar_bev
                 if lb is None:
                     return bev
                 lb = lb.to(bev.dtype)
-                # 2 回目のプロファイル (2026-09-08): グラフ内の abs().sum() 縮約 (ReplAbsSum) が 14.8 ms。
-                # フラグはホストが知っている (LiDAR を渡したか) のでスカラー入力 lidar_flag [1] で受ける。
+                # Second profile (2026-09-08): the in-graph abs().sum() reduction (ReplAbsSum) costs 14.8 ms.
+                # The host knows the flag (whether LiDAR was passed), so take it as a scalar input lidar_flag [1].
                 flag = lidar_flag.to(bev.dtype).view(1, 1, 1, 1)
                 res = F.interpolate(_net.lidar_stem(lb) * flag, bev.shape[-2:],
                                     mode="bilinear", align_corners=False)
@@ -196,8 +196,8 @@ class MeteorExport(torch.nn.Module):
             net.bev_extra = _bev_extra_export
         if self.no_hist:
             def temporal_fuse_nohist(bev):
-                # 静的形状の零定数 (zeros_like は Shape 依存で、LiDAR 入力付きグラフでは traj_feat の
-                # abs().sum 判定が定数畳み込みされず Myelin で 14.8 ms になった; 2026-09-08)
+                # Static-shape zero constant (zeros_like depends on Shape; in the graph with the LiDAR input the
+                # abs().sum check on traj_feat was not constant-folded and cost 14.8 ms in Myelin; 2026-09-08)
                 net._warped0 = torch.zeros(1, int(bev.shape[1]), BEV_H, BEV_W,
                                            dtype=bev.dtype, device=bev.device)
                 net._prefuse_bev = bev
@@ -208,8 +208,8 @@ class MeteorExport(torch.nn.Module):
                 imgs = imgs.to(torch.float32) / 255.0
             out = list(net(imgs, K, T_cam_ego, v0, **_lb_kw))
             return self._finish(out, imgs, with_raw=False)
-        # --split-hist: 3 スロットが別々の入力で来る。添字の代わりにこの
-        # リストから取るだけなので、計算グラフは分割前と完全に同一。
+        # --split-hist: the 3 slots arrive as separate inputs. We only index this
+        # list instead of the tensor, so the compute graph is identical to the unsplit one.
         _hs = ([hist_bev, hist_bev1, hist_bev2]
                if hist_bev1 is not None else None)
 
@@ -224,7 +224,7 @@ class MeteorExport(torch.nn.Module):
                 cat.append(F.grid_sample(_h.to(bev.dtype), grid,
                                          align_corners=False))
             net._warped0 = cat[1]
-            net._prefuse_bev = bev             # delta-stat が読む
+            net._prefuse_bev = bev             # read by delta-stat
             g = net.tgate(torch.cat(cat, 1)).softmax(1)
             cat = [c * (4.0 * g[:, i:i + 1]) for i, c in enumerate(cat)]
             return bev + net.tfuse3(torch.cat(cat, 1))
@@ -232,8 +232,8 @@ class MeteorExport(torch.nn.Module):
         net.temporal_fuse = temporal_fuse          # instance-level override
         if self.uint8_in:
             imgs = imgs.to(torch.float32) / 255.0
-        # net() 本体は temporal_fuse を上書き済みなので hist_bev の中身は
-        # 使わない (形だけ合っていればよい)。
+        # net() has temporal_fuse overridden, so the contents of hist_bev are
+        # not used (only the shape has to match).
         out = list(net(imgs, K, T_cam_ego, v0, hist_bev, hist_theta, **_lb_kw))
         return self._finish(out, imgs, with_raw=True)
 
@@ -242,10 +242,10 @@ class MeteorExport(torch.nn.Module):
         _lane_logit = out[0] if self.lane_logits else None
         _depth_mean = None
         if self.depth_mean:
-            # 期待値深度 [B,N,h,w] (fp16): 最頻ビン ±2 の再正規化期待値 (旧 demo_rgbd_bev と同じ)。
-            # 素の全体期待値は物体境界で前景/背景が混ざり中間距離に化けるため使わない。
-            # 2D 未知物体の BEV 投影 (unk2d) が argmax ビン 1 画素で距離を外していた対策 (2026-09-07)。
-            # 2x2 平均プール後の半解像度で計算 (+2.5 ms → 約 0.6 ms; unk2d の距離取得には十分, 2026-09-08)
+            # Expected depth [B,N,h,w] (fp16): renormalised expectation over the modal bin +-2 (as in the old demo_rgbd_bev).
+            # The plain full expectation is not used: at object edges foreground/background mix into a bogus mid-range depth.
+            # Fix for the 2D unknown-object BEV projection (unk2d) missing the range with a single argmax-bin pixel (2026-09-07).
+            # Computed at half resolution after a 2x2 mean pool (+2.5 ms -> ~0.6 ms; enough for the unk2d range lookup, 2026-09-08)
             _B0, _N0, _D, _h0, _w0 = out[1].shape
             _dl = torch.nn.functional.avg_pool2d(out[1].float().reshape(_B0 * _N0, _D, _h0, _w0), 2)
             _dl = _dl.reshape(_B0, _N0, _D, _dl.shape[-2], _dl.shape[-1])   # [B,N,D,h/2,w/2]
@@ -264,8 +264,8 @@ class MeteorExport(torch.nn.Module):
         if self.drop_lg:
             del out[14:17]          # lg_pts / lg_meta / lg_adj
         if self.drop:
-            # eager スロット名 (hm2d/reg2d はタプル 1 スロット)。フラット名を
-            # zip すると位置ズレして誤った出力を落とす (2026-08-13 実害確認)。
+            # eager slot names (hm2d/reg2d are one tuple slot each). Zipping the
+            # flat names misaligns and drops the wrong outputs (bit us in practice, 2026-08-13).
             eager = ["lane", "depth", "seg2d", "hm", "reg", "hm2d", "reg2d",
                      "ego", "occ", "traj", "stationary", "tl", "risk",
                      "flow", "lg_pts", "lg_meta", "lg_adj", "unk", "pl"]
@@ -273,19 +273,19 @@ class MeteorExport(torch.nn.Module):
                 eager = [n for n in eager
                          if n not in ("lg_pts", "lg_meta", "lg_adj")]
             assert len(eager) == len(out), \
-                f"eager名{len(eager)} != 出力{len(out)}"
+                f"eager names {len(eager)} != outputs {len(out)}"
             out = [o for o, n in zip(out, eager) if n not in self.drop]
         # The streaming memory needs the PRE-fusion BEV back out, otherwise a
         # host running the engine cannot fill hist_bev on the next frame and
         # has to feed zeros (losing the temporal fusion entirely).
-        # raw_bev は return 時に末尾へ足されるため、lane_logit はさらに
-        # その後ろに置く (out へ append すると名前が 1 つずれる — 2026-08-19
-        # 実害: raw_bev と lane_logit の実体が入れ替わり履歴リングが無効化)。
+        # raw_bev is appended at the tail on return, so lane_logit goes after
+        # it (appending to out shifts the names by one -- 2026-08-19 real
+        # failure: raw_bev and lane_logit swapped and the history ring was disabled).
         tail = (net._last_bev,) if with_raw else ()
         if _lane_logit is not None:
             tail = tail + (_lane_logit,)
         if _depth_mean is not None:
-            tail = tail + (_depth_mean,)          # 末尾 (lane_logit の後)
+            tail = tail + (_depth_mean,)          # tail (after lane_logit)
         return tuple(out) + tail
 
 
@@ -437,16 +437,16 @@ def build(ckpt, mv=None, seg_bias=""):
         from bevlane.model import enable_lane_branch
         enable_lane_branch(net)
         print("[build] lane_branch attached (ckpt carries branch weights)")
-    # v115 以降: ego の大域平均プーリングが depthwise conv へ置換されている
-    # (INT8 で出力が入力の物差しを流用されて潰れる問題への根本対処)。
-    # ckpt にその重みがあれば、読み込む前に同じ形へ変換しておく。
+    # v115 onwards: the ego global average pooling is replaced by a depthwise conv
+    # (root fix for the INT8 collapse where the output reused the input's scale).
+    # If the ckpt carries those weights, convert to the same form before loading.
     _cp = [k for k, v in sd.items()
            if k.startswith("ego_stem.") and k.endswith(".weight")
            and getattr(v, "dim", lambda: 0)() == 4 and v.shape[1] == 1]
     if _cp:
         _hw = tuple(int(x) for x in sd[_cp[0]].shape[-2:])
         net.convert_ego_pool(_hw, verbose=False)
-        print(f"[build] ego 大域プーリングの conv 化を検出 -> {_hw} で変換")
+        print(f"[build] detected conv-ified ego global pooling -> converting with {_hw}")
 
     if "depth_head.0.0.weight" in sd and hasattr(net, "depth_head"):
         _wck = tuple(sd[f"depth_head.{i}.0.weight"].shape[0]
@@ -456,15 +456,15 @@ def build(ckpt, mv=None, seg_bias=""):
         if len(_wck) == 4 and _wck != _wcur:
             from bevlane.model import enable_depth_slim
             enable_depth_slim(net, widths=_wck)
-            print(f"[build] depth-slim 幅 {_wck} を検出 -> 再構築")
+            print(f"[build] detected depth-slim widths {_wck} -> rebuilding")
     if any(k.startswith("sem_ego.") for k in sd):
         from bevlane.model import enable_semantic_ego
         enable_semantic_ego(net)
-        print("[build] semantic-ego 残差を検出 -> 有効化")
+        print("[build] detected semantic-ego residual -> enabling")
     if any(k.startswith("delta_stat.") for k in sd):
         from bevlane.model import enable_delta_stat
         enable_delta_stat(net)
-        print("[build] 時間差分 stat ヘッド検出 -> stationary は差分から出力")
+        print("[build] detected temporal-delta stat head -> stationary is output from the delta")
     if any(k.startswith("stat_head2.proj.") for k in sd):
         from bevlane.model import enable_quant_stat_head
         _cap = float((ck.get("args") or {}).get("stat_quant_head") or 8.0)
@@ -472,37 +472,37 @@ def build(ckpt, mv=None, seg_bias=""):
         print(f"[build] quant-robust stationary head detected (cap={_cap:g})")
 
     if any(k.startswith("stat_head2.proj.") for k in sd):
-        # v119 系: 停止判定ヘッドが学習時から有界形 (QuantRobustStatHead)。
-        # enable してから読まないと proj/out の重みが黙って捨てられる。
+        # v119 line: the stationary head is bounded (QuantRobustStatHead) from training.
+        # Enable it before loading, otherwise the proj/out weights are silently dropped.
         from bevlane.model import enable_quant_stat_head
         enable_quant_stat_head(net, 8.0)
-        print("[build] 有界 stat ヘッドを検出 (学習済み) -> 変換して読み込み")
+        print("[build] detected bounded stat head (trained) -> converting and loading")
     if any(k.startswith("paint_proj.") for k in sd):
-        # PointPainting (2026-08-17): ckpt が塗り射影を持つなら同じクラス集合で
-        # 経路を有効化してから読み込む。フックの softmax/gather/1x1 conv は
-        # トレース時にそのままグラフへ入る (BEV 幅 96・リフト境界は不変)。
+        # PointPainting (2026-08-17): if the ckpt carries the paint projection, enable
+        # the path with the same class set before loading. The hook's softmax/gather/1x1
+        # conv enter the traced graph as-is (BEV width 96 and the lift boundary are unchanged).
         _pc = (ck.get("args") or {}).get("paint_seg") or "2,3,4,5,6,7"
         net.enable_paint_seg([int(x) for x in str(_pc).split(",")])
-        print(f"[build] paint-seg 有効化 (classes={_pc})")
+        print(f"[build] paint-seg enabled (classes={_pc})")
     cur = net.state_dict()
     sd = {k: v for k, v in sd.items()
           if k in cur and cur[k].shape == v.shape}
     miss = net.load_state_dict(sd, strict=False)
     if seg_bias:
-        # 決定境界の較正 (probe_seg_bias で適合/検証分割の一致を確認済み)。
-        # ロジットから定数を引く = 最終 1x1 の bias から引く。実行時コスト 0。
+        # Decision-boundary calibration (probe_seg_bias confirmed fit/val splits agree).
+        # Subtracting a constant from the logits = subtracting from the final 1x1 bias. Zero runtime cost.
         with torch.no_grad():
             _b = net.dec.out[3].bias
             for _part in seg_bias.split(","):
                 _c, _v = _part.split(":")
                 _b[int(_c)] -= float(_v)
-        print(f"[build] seg-bias 焼き込み: {seg_bias}")
+        print(f"[build] seg-bias baked in: {seg_bias}")
     print(f"[build] {mv}: loaded, missing {len(miss.missing_keys)} "
           f"unexpected {len(miss.unexpected_keys)}")
     net.eval()
     if hasattr(net, "rvgg"):
-        # RepVGG 系は学習形 (3x3+1x1+identity 分岐) で保存される。デプロイは
-        # 再パラメータ化した純 3x3 スタック (Orin ラダーで実測した形) に変換。
+        # RepVGG-style nets are saved in training form (3x3+1x1+identity branches). Deploy
+        # converts to the re-parameterised pure 3x3 stack (the form measured on the Orin ladder).
         import timm.utils
         net.rvgg = timm.utils.reparameterize_model(net.rvgg)
         print("[build] rvgg reparameterized to deploy form")
@@ -552,9 +552,9 @@ def main():
                          "exported the wrong architecture for checkpoints that "
                          "do not carry args (the distillation output)")
     ap.add_argument("--seg-bias", default="",
-                    help="BEV Seg の決定境界較正を最終バイアスに焼き込む。"
-                         "例 4:0.75,5:1.0,6:0.5 (実測: mIoU +1.0-1.4%, "
-                         "laneline +7-15%, 線幅比 3.1->1.05)")
+                    help="bake the BEV Seg decision-boundary calibration into the final bias. "
+                         "e.g. 4:0.75,5:1.0,6:0.5 (measured: mIoU +1.0-1.4%, "
+                         "laneline +7-15%, line-width ratio 3.1->1.05)")
     ap.add_argument("--drop", default="",
                     help="comma-separated output names to leave out, e.g. "
                          "occ,pl,unk. Their subgraphs then get pruned.")
@@ -579,30 +579,30 @@ def main():
                     help="graph takes uint8 images and divides by 255 inside "
                          "(kills the ~30 ms CPU normalise and 4x of H2D)")
     ap.add_argument("--lane-logits", action="store_true",
-                    help="argmax 出力に加えレーン logit も末尾に出力 "
-                         "(Orin seg-fuse 完全版用)")
+                    help="also emit the lane logits at the tail in addition to the argmax output "
+                         "(for the full Orin seg-fuse)")
     ap.add_argument("--argmax-out", action="store_true",
                     help="lane/depth/seg2d leave the graph as uint8 argmax "
                          "(kills ~60 MB of D2H and the CPU argmax)")
     ap.add_argument("--quant-stat-head", type=float, default=0.0,
-                    help="stat_head2 を有界の等価形 (QuantRobustStatHead) に"
-                         "置換してから書き出す。relu(z)-relu(-z)=z なので"
-                         "|z|<=cap では機能保存。TensorRT に頭専用の活性範囲を"
-                         "与え、INT8 融合でロジットが潰れるのを防ぐ (cap 推奨 8)")
+                    help="replace stat_head2 with the bounded equivalent form (QuantRobustStatHead) "
+                         "before exporting. relu(z)-relu(-z)=z, so the function is "
+                         "preserved for |z|<=cap. Gives TensorRT a head-specific activation range "
+                         "and keeps INT8 fusion from crushing the logits (cap 8 recommended)")
     ap.add_argument("--split-hist", action="store_true",
-                    help="hist_bev [1,3,96,800,500] を hist_bev0/1/2 の 3 本に"
-                         "分ける。ランタイムがリングのアドレスを直接束ねられる"
-                         "ようになり、毎フレーム 230MB の D2D コピー "
-                         "(実測 6.2ms) が丸ごと消える。数値は完全に同一 "
-                         "(添字が入力の分割に変わるだけ)")
+                    help="split hist_bev [1,3,96,800,500] into 3 inputs hist_bev0/1/2. "
+                         "The runtime can then bind the ring addresses directly, "
+                         "which removes the per-frame 230MB D2D copy "
+                         "(measured 6.2ms) entirely. Numerically identical "
+                         "(indexing just becomes input splitting)")
     ap.add_argument("--with-lidar", action="store_true",
-                    help="任意入力 lidar_bev [1,4,400,250] fp32 を入力に含める (no-hist 専用, 2026-09-08)")
+                    help="include the optional input lidar_bev [1,4,400,250] fp32 (no-hist only, 2026-09-08)")
     ap.add_argument("--depth-mean", action="store_true",
-                    help="期待値深度 depth_mean [B,N,h,w] fp16 を末尾出力に追加 (unk2d 用, 2026-09-07)")
+                    help="append the expected depth depth_mean [B,N,h,w] fp16 to the tail outputs (for unk2d, 2026-09-07)")
     ap.add_argument("--no-hist", action="store_true",
-                    help="履歴入力なしで書き出す (履歴零固定 = 学習条件)。tgate/"
-                         "tfuse3 の先頭 96ch 重みだけを使う等価グラフ。grid_sample"
-                         " 3 本・hist_bev 入力・raw_bev 出力が消える (2026-09-05)")
+                    help="export without history inputs (history forced to zero = training condition). Equivalent graph "
+                         "using only the first 96ch of the tgate/tfuse3 weights. The 3 grid_samples,"
+                         " the hist_bev input and the raw_bev output disappear (2026-09-05)")
     ap.add_argument("--gather-lift", action="store_true",
                     help="export the lift in gather form (needs --frustum). "
                          "Aimed at Orin, where ScatterND atomics dominate.")
@@ -615,7 +615,7 @@ def main():
     if args.quant_stat_head > 0:
         from bevlane.model import enable_quant_stat_head
         enable_quant_stat_head(net, args.quant_stat_head)
-        print(f"[build] stat_head2 を有界形に置換 (cap={args.quant_stat_head:g})")
+        print(f"[build] stat_head2 replaced with the bounded form (cap={args.quant_stat_head:g})")
     dep = (MeteorDeploy(net) if args.legacy_wrapper
            else MeteorExport(net, drop_lg=args.no_lanegraph,
                              drop=[x for x in args.drop.split(',') if x],
@@ -658,7 +658,7 @@ def main():
         ex = (imgs, K, Tc, v0)
         _in_names = ["imgs", "K", "T_cam_ego", "v0"]
         if args.with_lidar:
-            # lidar_bev は forward の末尾引数 (hist 系は None のまま) → 位置引数で渡すため None を挟む
+            # lidar_bev is the last forward argument (hist args stay None) -> pass Nones to reach it positionally
             ex = (imgs, K, Tc, v0, None, None, None, None, torch.zeros(1, 4, 400, 250),
                   torch.ones(1))
             _in_names = ["imgs", "K", "T_cam_ego", "v0", "lidar_bev", "lidar_flag"]
@@ -680,8 +680,8 @@ def main():
         print(f"[pool] matmul adaptive-pool vs native: max|diff| {dmax:.3e}")
     os.makedirs(os.path.dirname(args.out) or ".", exist_ok=True)
     with _PatchPool():
-      # torch>=2.6 は既定が dynamo エクスポータに変わり、project_bev の
-      # トレースで失敗する (リモートの torch 2.11 で実害)。旧 tracer を明示する。
+      # torch>=2.6 defaults to the dynamo exporter, which fails tracing
+      # project_bev (bit us with torch 2.11 on the remote). Force the legacy tracer.
       _kw = {}
       import inspect as _ins
       if "dynamo" in _ins.signature(torch.onnx.export).parameters:

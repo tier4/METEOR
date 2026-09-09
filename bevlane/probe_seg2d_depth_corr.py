@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
-"""課題2 の実測: 2D Seg の乱れと Depth 誤差は相関するか。
+"""Measurement for issue 2: do 2D Seg disruption and depth error correlate?
 
-フレームごとに (a) seg2d の GT 一致率、(b) 深度の |誤差| 中央値を測り、
-相関係数を出す。悪条件 (Cosmos transfer_2) と通常 (val) の両方で見る。
-相関が強ければ「共有バックボーン特徴の乱れが両方を壊す」ことの証拠になり、
-対処は特徴の頑健化 (悪条件データで深度まで教える) が本命になる。
+Per frame, measure (a) seg2d agreement with GT and (b) median |depth error|, then
+compute the correlation. Checked on both adverse (Cosmos transfer_2) and normal (val).
+A strong correlation is evidence that disrupted shared backbone features break both,
+making feature robustification (teaching depth on adverse data too) the main fix.
 """
 import argparse
 import os
@@ -56,12 +56,12 @@ def main():
     sq, de = np.array(segq), np.array(derr)
     r = float(np.corrcoef(sq, de)[0, 1]) if len(sq) > 4 else float("nan")
     print(f"{a.tag}\t{len(sq)}\t{sq.mean():.4f}\t{de.mean():.3f}\t{r:+.3f}")
-    # 乱れの大きいフレームの深度悪化量 (下位 1/4 対 上位 1/4)
+    # depth degradation on heavily disrupted frames (bottom quarter vs top quarter)
     if len(sq) > 8:
         o = np.argsort(sq)
         lo, hi = de[o[:len(o)//4]].mean(), de[o[-len(o)//4:]].mean()
-        print(f"  seg2d 下位1/4 の深度誤差 {lo:.3f}m 対 上位1/4 {hi:.3f}m "
-              f"(比 {lo/max(hi,1e-9):.2f})")
+        print(f"  depth error on seg2d bottom quarter {lo:.3f}m vs top quarter {hi:.3f}m "
+              f"(ratio {lo/max(hi,1e-9):.2f})")
 
 
 if __name__ == "__main__":

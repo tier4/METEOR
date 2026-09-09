@@ -1,5 +1,5 @@
 #!/bin/bash
-# v157L (LiDAR 入力付き) の valday を LiDAR ON / OFF で録画 (C++)。Orin ジョブ完了を待つ。
+# Record valday with v157L (LiDAR input) with LiDAR ON / OFF (C++). Waits for the Orin job to finish.
 cd ~/meteor; L=out/record_lidar.log; : > $L
 until grep -q V142C3Z_DONE out/auto_v157Lc3Z.log 2>/dev/null; do sleep 60; done
 export METEOR_PLUGIN_SO=/home/nvidia/meteor/liftbench/plugin/build/libmeteor_lift.so METEOR_CUDAGRAPH=1 METEOR_TH2D=0.30 METEOR_2D_HIDE=7 METEOR_SEG2D_OVERLAY=0 METEOR_DEPTH_PANEL=1 METEOR_REC_FPS=10

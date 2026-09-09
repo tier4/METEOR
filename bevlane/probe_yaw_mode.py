@@ -1,11 +1,11 @@
-"""yaw が外れるとき、予測がどの向きに引き寄せられているかを調べる。
+"""When yaw is wrong, find out which direction the prediction is pulled toward.
 
-仮説の切り分け:
-  A. 自車平行 (0 度) に張り付く  -> GT の姿勢分布の偏りに引きずられている
-     (正対車が大多数なので、迷ったら 0 度と答えるのが損失的に得)
-  B. 視線方向 (自車から見た方位) に張り付く -> リフトの深度ビンが粗く、
-     足跡がレイ方向に潰れて姿勢の手がかりが消えている
-どちらが優勢かで対策が変わる (A なら重み付け/損失、B なら深度分解能)。
+Hypotheses:
+  A. snaps to ego-parallel (0 deg)  -> dragged by the skewed GT heading distribution
+     (most vehicles face along the road, so answering 0 deg when unsure is cheapest for the loss)
+  B. snaps to the line of sight (bearing from ego) -> lift depth bins are coarse,
+     footprints smear along the ray and the heading cue is lost
+The fix differs (A: weighting/loss, B: depth resolution).
 """
 import argparse
 import os
@@ -20,7 +20,7 @@ from bevlane.model import MODELS                                  # noqa: E402
 
 
 def fold(a):
-    """180 度対称の軸誤差 [rad]。"""
+    """Axis error with 180-degree symmetry [rad]."""
     d = abs((a + np.pi) % (2 * np.pi) - np.pi)
     return min(d, np.pi - d)
 
@@ -79,7 +79,7 @@ def main():
             if best is None:
                 continue
             py = best[1]
-            bearing = np.arctan2(ye, xe)          # 自車から見た方位
+            bearing = np.arctan2(ye, xe)          # bearing from ego
             rows.append((fold(py - yaw), fold(py - 0.0), fold(py - bearing),
                          fold(yaw - 0.0), fold(yaw - bearing), r))
         done += 1
@@ -88,27 +88,27 @@ def main():
 
     A = np.degrees(np.array(rows))
     if not len(A):
-        sys.exit("箱が取れなかった")
-    print(f"\n===== {a.tag or a.ckpt} ({len(A)} 箱) =====")
-    print("列: 予測-GT / 予測-0度 / 予測-視線 / GT-0度 / GT-視線")
-    print(f"全体 中央値: {np.median(A[:, 0]):5.1f} / {np.median(A[:, 1]):5.1f}"
+        sys.exit("no boxes obtained")
+    print(f"\n===== {a.tag or a.ckpt} ({len(A)} boxes) =====")
+    print("columns: pred-GT / pred-0deg / pred-LOS / GT-0deg / GT-LOS")
+    print(f"overall median: {np.median(A[:, 0]):5.1f} / {np.median(A[:, 1]):5.1f}"
           f" / {np.median(A[:, 2]):5.1f} / {np.median(A[:, 3]):5.1f}"
-          f" / {np.median(A[:, 4]):5.1f} 度")
-    # GT が斜めの箱だけを見る (ここが壊れている帯)
+          f" / {np.median(A[:, 4]):5.1f} deg")
+    # only boxes with oblique GT (this is the broken band)
     ob = A[A[:, 3] >= 15.0]
     if len(ob) >= 5:
-        print(f"\nGT が斜め (自車平行から 15 度以上) の {len(ob)} 箱:")
-        print(f"  予測-GT   中央値 {np.median(ob[:, 0]):5.1f} 度")
-        print(f"  予測-0度  中央値 {np.median(ob[:, 1]):5.1f} 度  "
-              f"(小さいほど自車平行に張り付いている)")
-        print(f"  予測-視線 中央値 {np.median(ob[:, 2]):5.1f} 度  "
-              f"(小さいほど視線方向に張り付いている)")
-        print(f"  参考: GT-0度 {np.median(ob[:, 3]):5.1f} 度 / "
-              f"GT-視線 {np.median(ob[:, 4]):5.1f} 度")
+        print(f"\n{len(ob)} boxes with oblique GT (>= 15 deg from ego-parallel):")
+        print(f"  pred-GT    median {np.median(ob[:, 0]):5.1f} deg")
+        print(f"  pred-0deg  median {np.median(ob[:, 1]):5.1f} deg  "
+              f"(smaller = more snapped to ego-parallel)")
+        print(f"  pred-LOS   median {np.median(ob[:, 2]):5.1f} deg  "
+              f"(smaller = more snapped to line of sight)")
+        print(f"  ref: GT-0deg {np.median(ob[:, 3]):5.1f} deg / "
+              f"GT-LOS {np.median(ob[:, 4]):5.1f} deg")
         n0 = int((ob[:, 1] < ob[:, 0]).sum())
         nb = int((ob[:, 2] < ob[:, 0]).sum())
-        print(f"  GT より 0 度に近い箱: {n0}/{len(ob)}  "
-              f"GT より視線に近い箱: {nb}/{len(ob)}")
+        print(f"  boxes closer to 0 deg than GT: {n0}/{len(ob)}  "
+              f"boxes closer to LOS than GT: {nb}/{len(ob)}")
 
 
 if __name__ == "__main__":

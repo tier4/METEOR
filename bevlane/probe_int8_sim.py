@@ -1,10 +1,10 @@
-"""PyTorch 内で INT8 相当の丸めを再現し、E2E (ego) が壊れる層を特定する。
+"""Emulate INT8 rounding inside PyTorch and locate the layer that breaks E2E (ego).
 
-2026-08-22: Orin の INT8 エンジンは ego 出力が凍結し (フレーム間差 0.06 vs
-fp16 2.05)、stationary のロジット幅も半減する。TensorRT 固有か
-モデルの性質かを切り分けるため、Conv 出力を対称 8bit に丸める fake
-quantization フックを入れて同じ現象が再現するか見る。
---scope で対象を絞り、どこを量子化すると壊れるかを二分探索できる。
+2026-08-22: the Orin INT8 engine freezes the ego output (frame-to-frame diff 0.06 vs
+2.05 in fp16) and halves the stationary logit range. To tell TensorRT-specific from
+model-inherent, insert fake-quantization hooks that round Conv outputs to symmetric
+8 bit and check whether the same symptom reproduces.
+--scope narrows the target so the breaking layer can be bisected.
 """
 import argparse, os, sys
 import numpy as np, torch
@@ -21,13 +21,13 @@ ap.add_argument("--scope", default="all",
                 help="all / none / backbone / ego / head / not-ego")
 ap.add_argument("--bits", type=int, default=8)
 ap.add_argument("--calib", default="dynamic",
-                help="dynamic(各テンソルの max) / static(較正で固定) ")
+                help="dynamic (per-tensor max) / static (fixed by calibration) ")
 ap.add_argument("--pct", type=float, default=100.0,
-                help="static 時の scale パーセンタイル。TensorRT の"
-                     "エントロピー較正は外れ値を切るので 99.9 等を試す")
+                help="scale percentile for static mode. TensorRT entropy "
+                     "calibration clips outliers, so try e.g. 99.9")
 ap.add_argument("--calib-frames", type=int, default=16)
 ap.add_argument("--quant-weight", action="store_true",
-                help="重みも per-channel INT8 に丸める (TensorRT と同じ)")
+                help="also round weights to per-channel INT8 (as TensorRT does)")
 a = ap.parse_args()
 
 scenes = [l.strip() for l in open(a.list) if l.strip()][:2]
@@ -41,7 +41,7 @@ m.load_state_dict({k: v for k, v in sd.items()
                    if k in cur and cur[k].shape == v.shape}, strict=False)
 
 QMAX = 2 ** (a.bits - 1) - 1
-SCALES = {}          # static 較正で決めた層ごとの scale
+SCALES = {}          # per-layer scales fixed by static calibration
 COLLECT = {"on": False}
 
 def fq(mod, inp, out):
@@ -82,7 +82,7 @@ def want(name):
                                          ("dec", "head", "out"))
     return False
 
-# 重みの per-channel 量子化 (TensorRT の既定と同じ方式)
+# per-channel weight quantization (same scheme as the TensorRT default)
 n_wq = 0
 if a.quant_weight:
     with torch.no_grad():
@@ -97,7 +97,7 @@ if a.quant_weight:
             sc = (mx / QMAX).clamp_min(1e-12)
             mod.weight.data = torch.round(w / sc).clamp(-QMAX, QMAX) * sc
             n_wq += 1
-    print(f"[weight] {n_wq} 層を per-channel INT8 に量子化")
+    print(f"[weight] {n_wq} layers quantized to per-channel INT8")
 
 hooks, n_hooked = [], 0
 for name, mod in m.named_modules():
@@ -115,8 +115,8 @@ if a.calib == "static":
         with torch.no_grad(), torch.autocast("cuda", torch.float16):
             m(b[0][None].cuda(), b[1][None].cuda(), b[2][None].cuda(), v0=v0)
     COLLECT["on"] = False
-    print(f"[calib] {len(SCALES)} 層の scale を {a.calib_frames} フレーム"
-          f"・パーセンタイル {a.pct} で決定")
+    print(f"[calib] scales for {len(SCALES)} layers fixed from {a.calib_frames} frames"
+          f" at percentile {a.pct}")
 
 ys, egos = [], []
 for i in range(a.frames):
@@ -135,7 +135,7 @@ for h in hooks:
     h.remove()
 E = np.array(egos)
 diffs = [float(np.abs(E[i] - E[i-1]).mean()) for i in range(1, len(E))]
-print(f"\n=== scope={a.scope} {a.calib} pct={a.pct} ({a.bits}bit, {n_hooked} 層) ===")
-print(f"  ego std={E.std():.3f}  フレーム間差 平均={np.mean(diffs) if diffs else 0:.4f}")
-print(f"  最終点 y: {[round(v,2) for v in ys]}")
+print(f"\n=== scope={a.scope} {a.calib} pct={a.pct} ({a.bits}bit, {n_hooked} layers) ===")
+print(f"  ego std={E.std():.3f}  mean frame-to-frame diff={np.mean(diffs) if diffs else 0:.4f}")
+print(f"  final-point y: {[round(v,2) for v in ys]}")
 print("INT8_SIM_DONE")

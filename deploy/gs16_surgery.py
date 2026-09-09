@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
-"""GridSample fp32 島の fp16 化手術 (2026-08-30, Orin GridSample コピー 2.04ms 対策)。
+"""Surgery to convert GridSample fp32 islands to fp16 (2026-08-30, vs 2.04 ms Orin GridSample copies).
 
-時間系 hist ワープの GridSample_2/3/4 は輸出時の明示 Cast(FLOAT) で fp32 島に
-なっている。特徴側 Cast を FLOAT16 へ付け替え、出力に Cast(FLOAT) を挿んで
-グラフの外側 dtype は不変に保つ (数学的差は特徴量の fp16 量子化のみ)。
-grid (座標) 側は fp32 のまま — 位置精度は落とさない。
-レバー4 の教訓により、採否は実機ビルドの等価チェック + bench でのみ判定する。
+GridSample_2/3/4 of the temporal hist warp are fp32 islands due to explicit
+Cast(FLOAT) at export. Switch the feature-side Cast to FLOAT16 and insert a
+Cast(FLOAT) on the output so the outer graph dtype is unchanged (the only math
+difference is fp16 quantization of features). grid (coords) stays fp32 - no positional loss.
+Per the lever-4 lesson, adopt only via on-device build equivalence check + bench.
 """
 import argparse
 import onnx
@@ -35,14 +35,14 @@ for n in list(g.node):
     n.output[0] = gs16_out
     back = helper.make_node("Cast", [gs16_out], [old_out],
                             name=n.name + "_castback", to=TensorProto.FLOAT)
-    # GridSample 直後に挿入 (トポロジカル順維持)
+    # insert right after GridSample (keeps topological order)
     idx = list(g.node).index(n)
     g.node.insert(idx + 1, back)
     n_done += 1
-print(f"[gs16] {n_done} GridSample を fp16 化 (grid は fp32 のまま)")
+print(f"[gs16] {n_done} GridSample converted to fp16 (grid stays fp32)")
 try:
     onnx.checker.check_model(m, full_check=False)
 except Exception as e:
-    print(f"[gs16] checker (元ファイルも非準拠): {str(e)[:80]}")
+    print(f"[gs16] checker (original file is non-compliant too): {str(e)[:80]}")
 onnx.save(m, a.out)
 print(f"[gs16] wrote {a.out}")

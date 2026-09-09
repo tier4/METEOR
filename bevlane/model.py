@@ -10,12 +10,12 @@ import os
 import torch
 import torch.nn as nn
 
-# 推論グラフ最適化 (2026-08-19, export 時のみ METEOR_EXPORT_FAST=1 で有効):
-#   1) seg2d の nan_to_num を省略 (学習時の fp16 発散対策。固定重みの推論では
-#      NaN は発生せず、Orin 実測で Isnan/Select 鎖が 4.0 ms を消費していた)
-#   2) 時系列ワープ有効判定の abs-sum を 96ch -> 16ch に簡約 (実測 4.0 ms)。
-#      ゼロ埋めスロット/ワープ外の検出という目的には十分。
-# どちらも採否は「出力一致 + パス/det 指標不変」のゲートで判定する。
+# Inference-graph optimizations (2026-08-19, export only, enabled with METEOR_EXPORT_FAST=1):
+#   1) skip nan_to_num on seg2d (a training-time fp16 divergence guard; with fixed
+#      weights at inference no NaN occurs, and on Orin the Isnan/Select chain cost 4.0 ms)
+#   2) reduce the abs-sum used to detect a valid temporal warp from 96ch -> 16ch (measured 4.0 ms).
+#      Sufficient for its purpose: detecting zero-filled slots / out-of-warp regions.
+# Both are accepted only via the "identical outputs + unchanged path/det metrics" gate.
 _EXPORT_FAST = os.environ.get("METEOR_EXPORT_FAST", "0") == "1"
 import torch.nn.functional as F
 import torchvision
@@ -359,11 +359,11 @@ class DepthGatedIPMNet(nn.Module):
     D = 64
     D_MIN, D_STEP = 1.0, 1.25      # bins 1.0 .. 79.75 m; last bin = sky/far
 
-    # D5 (2026-08-29): 対数ビン対応。enable_depth_logbins() が DEPTH_CENTERS
-    # を張ると、以下のヘルパ経由の全経路 (損失・リフト可視率・期待深度・
-    # LiDAR ブレンド) が対数間隔で動く。未設定なら従来式とビット同値。
+    # D5 (2026-08-29): log-spaced bin support. Once enable_depth_logbins() sets
+    # DEPTH_CENTERS, every path that goes through the helpers below (loss, lift
+    # visibility, expected depth, LiDAR blend) runs on log spacing. Unset = bit-identical to the legacy formula.
     def _d2b(self, x):
-        """metric 深度 -> 連続 bin 座標。"""
+        """metric depth -> continuous bin coordinate."""
         c = getattr(self, "DEPTH_CENTERS", None)
         if c is None:
             return (x - self.D_MIN) / self.D_STEP
@@ -482,7 +482,7 @@ class DepthSegIPMNet(nn.Module):
     D = 64
     D_MIN, D_STEP = 1.0, 1.25
 
-    # D5: 対数ビン対応ヘルパ (DepthGatedIPMNet と同一実装)
+    # D5: log-bin helpers (same implementation as DepthGatedIPMNet)
     def _d2b(self, x):
         c = getattr(self, "DEPTH_CENTERS", None)
         if c is None:
@@ -552,11 +552,11 @@ class DepthSegIPMNet(nn.Module):
             x2 = self.layer2(x1)
             x3 = self.layer3(x2)
             x4 = self.layer4(x3)
-        # FUSE_STRIDE=8 (R7 解像度軸): x2 入力を stride-8 で融合する。特徴
-        # グリッドは x1@stride4 と同じ 108x192 になり、lat2/3/4 の入力
-        # チャンネルも既存のまま = 成熟した重みを丸ごと引き継げる。
-        # クラス属性で切り替えるのは、image_feats を丸ごと上書きすると
-        # 上位クラスが積んだ副作用 (_last_f / tl_stem 残差) が消えるため。
+        # FUSE_STRIDE=8 (R7 resolution axis): fuse the x2 input at stride-8. The feature
+        # grid becomes 108x192, same as x1@stride4, and the lat2/3/4 input channels
+        # stay as they are = mature weights carry over wholesale.
+        # Switched via a class attribute because overriding image_feats outright
+        # would drop side effects stacked by parent classes (_last_f / tl_stem residual).
         if getattr(self, "FUSE_STRIDE", 4) == 8:
             sz = x2.shape[-2:]
             up = lambda t: F.interpolate(t, size=sz, mode="bilinear",
@@ -579,10 +579,10 @@ class DepthSegIPMNet(nn.Module):
         # +-30, so this changes nothing about what the loss sees while removing
         # the failure -- and since clamp has zero gradient outside the range it
         # also stops the head being pushed further out once it gets there.
-        # clamp だけでは NaN が素通しする (clamp(nan)=nan)。fp16 で head 内部が
-        # 一度 inf になると BN の (x-mean)/sqrt(var) で NaN が生まれ、
-        # 出力段の clamp では消せない。2026-08-17: nan_to_num を前置し、
-        # out[2] 由来の SKIP (r59 で 29%, r72 で 148 回, r73 で 16 回) を断つ。
+        # clamp alone lets NaN through (clamp(nan)=nan). Once the head goes inf
+        # internally under fp16, BN's (x-mean)/sqrt(var) produces NaN, which the
+        # output-stage clamp cannot remove. 2026-08-17: prepend nan_to_num to stop
+        # the SKIPs originating from out[2] (29% in r59, 148 in r72, 16 in r73).
         if _EXPORT_FAST:
             seg2d = self.seg_head(f).clamp(-30.0, 30.0)
         else:
@@ -699,15 +699,15 @@ class DepthSegIPMNetV14(DepthSegIPMNetS4):
             nn.Conv2d(128, self.D, 1))
 
     def depth_loss(self, dlog, depth_gt, ent_w=0.0, far_w=0.0, band_bal=0.0):
-        """深度 CE + 鋭化項 (2026-08-21 追加の ent_w / far_w)。
+        """Depth CE + sharpening terms (ent_w / far_w added 2026-08-21).
 
-        実測: 30-60 m 帯で深度分布の最大確率が 0.07-0.085、エントロピー
-        3.44-3.62 (64 ビン一様は 4.16) = 約 ±17 m に滲んでいる。リフトは
-        この分布に従って BEV セルへ特徴を配るので、遠方物体の証拠が
-        薄く塗り広げられ、ヒートマップのピークが立たない (cam-only の
-        veh recall 20-40m が 0.50 で頭打ちになる直接の原因)。
-        ent_w: 分布のエントロピーを罰して鋭くする。
-        far_w: 遠方画素の CE 重みを上げる (LiDAR 点は近傍に偏るため)。
+        Measured: in the 30-60 m band the depth distribution's max prob is 0.07-0.085 and
+        its entropy 3.44-3.62 (uniform over 64 bins = 4.16) = smeared over about ±17 m. The lift
+        distributes features to BEV cells following this distribution, so evidence for
+        far objects gets spread thin and heatmap peaks never form (the direct cause of
+        cam-only veh recall at 20-40m plateauing at 0.50).
+        ent_w: penalize the distribution's entropy to sharpen it.
+        far_w: raise the CE weight of far pixels (LiDAR points are biased to the near range).
         """
         logits = dlog.flatten(0, 1)                       # [BN,D,h,w]
         gt = depth_gt.flatten(0, 1)                       # [BN,h,w]
@@ -728,11 +728,11 @@ class DepthSegIPMNetV14(DepthSegIPMNetS4):
         g[:, 1:, :] = torch.maximum(g[:, 1:, :], gy)
         g[:, :-1, :] = torch.maximum(g[:, :-1, :], gy)
         wpx = 1.0 + 2.0 * (g / 3.0).clamp(max=1.0)
-        # カメラ別の重み (2026-08-17 登録): METEOR_DEPTH_CAM_W="6:3,7:3" の形式。
-        # 深度 CE は全カメラ・全画素の等価平均なので、8 台中 2 台の望遠 (特に
-        # BACK_NARROW) への圧力が路面画素に埋もれる。教師は箱と整合している
-        # (probe_depthgt_align: 整合率 71%) のにモデル側バイアスが +2.3->+2.66 m
-        # と学習で縮まなかったのはこのため。既定は未設定 = 従来と完全同一。
+        # Per-camera weights (registered 2026-08-17): METEOR_DEPTH_CAM_W="6:3,7:3" format.
+        # Depth CE is a uniform mean over all cameras and pixels, so pressure on the 2 of 8
+        # telephoto cameras (especially BACK_NARROW) drowns in road-surface pixels. This is
+        # why the model-side bias did not shrink with training (+2.3->+2.66 m) even though the
+        # teacher agrees with the boxes (probe_depthgt_align: 71% agreement). Default unset = identical to before.
         _spec = os.environ.get("METEOR_DEPTH_CAM_W", "")
         if _spec:
             _N = depth_gt.shape[1]
@@ -743,26 +743,26 @@ class DepthSegIPMNetV14(DepthSegIPMNetS4):
                     _wc[int(_i)] = float(_w)
             _B = depth_gt.shape[0]
             wpx = wpx * _wc.repeat(_B).view(-1, 1, 1)
-        # 鋭化を狙う場合は label smoothing を外す (平滑化と目的が逆)
+        # drop label smoothing when sharpening (smoothing works against that goal)
         _ls = 0.0 if ent_w > 0 else 0.05
         ce_px = F.cross_entropy(logits, tgt, ignore_index=-1,
                                 label_smoothing=_ls, reduction="none")
         if far_w > 0:
             wpx = wpx * (1.0 + far_w * (gt / 60.0).clamp(0.0, 1.0))
         if band_bal > 0:
-            # 距離帯の逆頻度重み (2026-08-22)。実測で深度 GT の有効画素は
-            # 0-10m が 58.9%、40-60m は合計 4.6% しかない (13 倍の不均衡)。
-            # far_w は最大でも 2 倍にしかならず釣り合わないので、10m 帯ごとに
-            # 「その帯の画素数の逆数」で正規化して各帯の寄与を揃える。
-            # バッチ自身のヒストグラムから作るので外部テーブルは不要。
+            # Inverse-frequency weighting by range band (2026-08-22). Measured: 58.9% of valid
+            # depth-GT pixels lie in 0-10m while 40-60m totals only 4.6% (a 13x imbalance).
+            # far_w tops out at 2x and cannot compensate, so normalize each 10m band by
+            # "the reciprocal of its pixel count" to equalize per-band contributions.
+            # Built from the batch's own histogram, so no external table is needed.
             _bi = (gt / 10.0).clamp(0, 7).long()
             _cnt = torch.bincount(_bi[valid].flatten(), minlength=8).float()
             _inv = valid.sum().float() / (8.0 * _cnt.clamp(min=1.0))
             _inv = _inv.clamp(0.2, 10.0)
-            _inv = 1.0 + band_bal * (_inv - 1.0)      # band_bal=1 で完全均等
-            # 平均重みを 1 に正規化する。これをしないと「配分を変える」と
-            # 「深度損失の係数を上げる」が同時に起きて A/B の変数が 2 つに
-            # なる (band_bal=1 で損失が 2.3 倍になっていた)。
+            _inv = 1.0 + band_bal * (_inv - 1.0)      # band_bal=1 = fully equalized
+            # Normalize the mean weight to 1. Without this, "changing the allocation" and
+            # "raising the depth-loss coefficient" happen at once and the A/B has two
+            # variables (with band_bal=1 the loss was 2.3x larger).
             _mean = (_cnt * _inv).sum() / valid.sum().clamp(min=1).float()
             _inv = _inv / _mean.clamp(min=1e-6)
             wpx = wpx * _inv[_bi]
@@ -811,10 +811,10 @@ class DepthSegIPMNetV15(DepthSegIPMNetV14):
         # +-30, so this changes nothing about what the loss sees while removing
         # the failure -- and since clamp has zero gradient outside the range it
         # also stops the head being pushed further out once it gets there.
-        # clamp だけでは NaN が素通しする (clamp(nan)=nan)。fp16 で head 内部が
-        # 一度 inf になると BN の (x-mean)/sqrt(var) で NaN が生まれ、
-        # 出力段の clamp では消せない。2026-08-17: nan_to_num を前置し、
-        # out[2] 由来の SKIP (r59 で 29%, r72 で 148 回, r73 で 16 回) を断つ。
+        # clamp alone lets NaN through (clamp(nan)=nan). Once the head goes inf
+        # internally under fp16, BN's (x-mean)/sqrt(var) produces NaN, which the
+        # output-stage clamp cannot remove. 2026-08-17: prepend nan_to_num to stop
+        # the SKIPs originating from out[2] (29% in r59, 148 in r72, 16 in r73).
         if _EXPORT_FAST:
             seg2d = self.seg_head(f).clamp(-30.0, 30.0)
         else:
@@ -949,7 +949,7 @@ class DepthSegIPMNetV16(DepthSegIPMNetV14):
         frustum, the table is valid for ONE rig only.
         """
         st = getattr(self, "_fr_static", None)
-        assert st is not None, "bake_frustum を先に呼ぶこと"
+        assert st is not None, "call bake_frustum first"
         G2 = self.bev_pts.shape[0]
         owners = [[] for _ in range(G2)]
         off = 0
@@ -1152,18 +1152,18 @@ class DepthSegIPMNetV16(DepthSegIPMNetV14):
         return bev                      # v32 adds the LiDAR pillar residual
 
     def enable_paint_seg(self, classes):
-        """PointPainting (2026-08-17): seg2d の確率をリフト前の ctx に注入する。
+        """PointPainting (2026-08-17): inject seg2d probabilities into ctx before the lift.
 
-        歩行者は 30 m で幅 1.4 特徴画素だが高さは 4 画素あり、2D セグは
-        その縦の柱を使って画素単位で塗れる。BEV への持ち上げは足跡 1 セルに
-        潰すため縦の証拠が消える -- 塗った確率をリフトで運べば BEV セルに
-        「ここは歩行者/車」の明示的な証拠が届く。
+        A pedestrian at 30 m is 1.4 feature pixels wide but 4 pixels tall, and 2D seg
+        can paint that vertical column pixel by pixel. Lifting to BEV collapses it into
+        a single footprint cell, so the vertical evidence is lost -- carrying the painted
+        probabilities through the lift delivers explicit "pedestrian/vehicle here" evidence to the BEV cell.
 
-        連結ではなく 1x1 ゼロ初期化射影の加算にする理由:
-          - ctx のチャネル数 (96) は hist_bev や時間融合など下流全体に波及
-            するので、幅を変えると機能保存にならず配布(リフトプラグインの
-            Cc=96)も壊れる。加算なら開始時は現行と完全同一。
-          - painter (seg_head) は detach し、自身の 2D セグ損失だけで学習させる。
+        Why a zero-initialized 1x1 projection added, rather than concatenation:
+            - the ctx channel count (96) propagates through everything downstream (hist_bev,
+                temporal fusion, ...), so changing the width is not function-preserving and
+                breaks deployment too (lift plugin Cc=96). Addition is identical to current at start.
+            - the painter (seg_head) is detached and trained only by its own 2D seg loss.
         """
         self._paint_cls = [int(c) for c in classes]
         _convs = [mm for mm in self.ctx.modules()
@@ -1172,8 +1172,8 @@ class DepthSegIPMNetV16(DepthSegIPMNetV14):
         self.paint_proj = nn.Conv2d(len(self._paint_cls), cc, 1)
         nn.init.zeros_(self.paint_proj.weight)
         nn.init.zeros_(self.paint_proj.bias)
-        # モデルが既に GPU 上にあるとき、新設の conv が CPU に残ると DDP が
-        # 「cpu と cuda が混在」で落ちる (v91 で実際に発生)
+        # When the model is already on the GPU, a new conv left on the CPU makes DDP
+        # fail with "cpu and cuda mixed" (actually happened in v91)
         self.paint_proj = self.paint_proj.to(next(self.parameters()).device)
 
         def _stash(_m, _i, _o):
@@ -1192,11 +1192,11 @@ class DepthSegIPMNetV16(DepthSegIPMNetV14):
                                    align_corners=False)
             if pb.shape[0] != _o.shape[0]:
                 if os.environ.get("METEOR_PAINT_DEBUG"):
-                    print(f"[paint] バッチ不一致 {pb.shape} 対 {_o.shape}")
+                    print(f"[paint] batch mismatch {pb.shape} vs {_o.shape}")
                 return _o
             _d = self.paint_proj(pb)
             if os.environ.get("METEOR_PAINT_DEBUG"):
-                print(f"[paint] pb={tuple(pb.shape)} 加算ノルム={float(_d.abs().mean()):.5f}")
+                print(f"[paint] pb={tuple(pb.shape)} add-norm={float(_d.abs().mean()):.5f}")
             return _o + _d
 
         self._paint_buf = None
@@ -1204,35 +1204,35 @@ class DepthSegIPMNetV16(DepthSegIPMNetV14):
         self.ctx.register_forward_hook(_mix)
 
     def convert_ego_pool(self, hw, mean=None, var=None, verbose=True):
-        """ego の大域平均プーリングを INT8 に耐える形へ置き換える (2026-08-24)。
+        """Replace ego's global average pooling with an INT8-tolerant form (2026-08-24).
 
-        **なぜ必要か** (Orin 実測): INT8 は値を 127 段階でしか表せず、目盛りの
-        間隔はそのテンソルの最大値で決まる。プーリング**手前**の特徴マップは
-        0-19.3 に散らばるので目盛りは 0.155。ところが 400 セルを平均すると
-        出力は 0-0.29 の狭い範囲に集まる (66 分の 1)。TensorRT は平均
-        プーリングの出力に**入力と同じ目盛りを流用する**ため、出力は 127 段階
-        のうち約 2 段階しか使えない。フレーム間の変化 0.0102 は 0.065 段階 =
-        四捨五入で完全に消える。だから真っ黒でも乱数でも ego 出力がビット一致
-        する「凍結」が起きていた。occ/traj/seg/det が無事なのは、空間ヘッドは
-        セルの値を直接読むから (ego だけが大域平均を取る唯一のヘッド)。
+        **Why** (measured on Orin): INT8 represents values in only 127 steps, and the step
+        size is set by the tensor's max. The feature map **before** pooling spans
+        0-19.3, so the step is 0.155. But averaging 400 cells squeezes the output into
+        the narrow 0-0.29 range (1/66). TensorRT **reuses the input scale** for the
+        average-pool output, so the output can only use about 2 of the 127 steps.
+        A frame-to-frame change of 0.0102 is 0.065 steps = rounds away completely.
+        That is why the ego output was bit-identical on all-black and on random input
+        (the "freeze"). occ/traj/seg/det survive because spatial heads read cell
+        values directly (ego is the only head that takes a global mean).
 
-        **対策**: 平均を「深さ方向畳み込み + BatchNorm」に置き換える。
-        畳み込みは INT32 で累算してから**自前の較正済み目盛り**で測り直すので
-        流用が起きない。さらに BN がチャネル毎に平均と分散を揃えるため、
-        一部の高水準チャネルが目盛りを独占しなくなる。
+        **Fix**: replace the mean with "depthwise conv + BatchNorm". The conv
+        accumulates in INT32 and is then requantized with **its own calibrated scale**,
+        so no reuse happens. BN additionally aligns per-channel mean and variance,
+        so a few high-level channels no longer monopolize the scale.
 
-        実測 (変動 / 1 段階): 現行 0.065 -> conv 化 4.41 -> conv+BN 23.51。
+        Measured (change / 1 step): current 0.065 -> conv 4.41 -> conv+BN 23.51.
 
-        **機能保存**: 畳み込みの重みを 1/(h*w) で初期化し、BN の統計を実測値
-        (mean/var) にしたうえで、ego_mlp の第 1 層を W'=W*sigma, b'=b+W@mu と
-        補正するので、**変換直後の出力は変換前と一致する**。
+        **Function-preserving**: the conv weights are initialized to 1/(h*w), BN stats
+        are set to the measured (mean/var), and the first layer of ego_mlp is corrected
+        to W'=W*sigma, b'=b+W@mu, so **the output right after conversion matches the output before**.
         """
         seq = self.ego_stem
         idx = [i for i, m in enumerate(seq)
                if isinstance(m, nn.AdaptiveAvgPool2d)]
         if not idx:
             if verbose:
-                print("[ego-pool] AdaptiveAvgPool が無い (変換済み?)", flush=True)
+                print("[ego-pool] no AdaptiveAvgPool found (already converted?)", flush=True)
             return False
         i = idx[-1]
         c = None
@@ -1243,16 +1243,16 @@ class DepthSegIPMNetV16(DepthSegIPMNetV14):
             if isinstance(m, nn.BatchNorm2d):
                 c = m.num_features
                 break
-        assert c is not None, "プール直前のチャネル数が取れない"
+        assert c is not None, "cannot determine channel count right before the pool"
         h, w = int(hw[0]), int(hw[1])
         dev = next(self.parameters()).device
-        # BatchNorm は使わない: 出力が 1x1 なのでバッチ内 1 チャネルあたり
-        # 標本が batch 数しか無く統計が取れない (batch=1 では例外になる)。
-        # 正規化は定数なので **畳み込みの重みとバイアスに畳み込める**:
-        #   出力 = (平均 - mu) / sigma
+        # No BatchNorm: the output is 1x1, so per channel there are only batch-many
+        # samples and the statistics cannot be estimated (batch=1 raises).
+        # The normalization is constant, so it **folds into the conv weight and bias**:
+        #   out = (mean - mu) / sigma
         #        = sum(x) * 1/(h*w*sigma)  +  (-mu/sigma)
-        # 1 層で済み、TensorRT はこの conv 出力に自前の較正スケールを付ける。
-        # 重み自体は学習可能なので、以後の微調整で自由に動く。
+        # One layer suffices, and TensorRT gives this conv output its own calibrated scale.
+        # The weights themselves are trainable, so later fine-tuning can move them freely.
         conv = nn.Conv2d(c, c, kernel_size=(h, w), groups=c, bias=True)
         with torch.no_grad():
             _mu = torch.zeros(c) if mean is None else torch.as_tensor(mean).float()
@@ -1261,7 +1261,7 @@ class DepthSegIPMNetV16(DepthSegIPMNetV14):
             conv.weight.copy_((1.0 / (h * w * _sig)).view(c, 1, 1, 1)
                               .expand(c, 1, h, w).contiguous())
             conv.bias.copy_(-_mu / _sig)
-            # ego_mlp の第 1 層で正規化を打ち消す (機能保存)
+            # cancel the normalization in the first layer of ego_mlp (function-preserving)
             lin = None
             for m in self.ego_mlp:
                 if isinstance(m, nn.Linear):
@@ -1274,34 +1274,34 @@ class DepthSegIPMNetV16(DepthSegIPMNetV14):
         seq[i] = conv.to(dev)
         self.to(dev)
         if verbose:
-            print(f"[ego-pool] 大域平均 ({h}x{w}) を depthwise conv + BN に置換 "
-                  f"(ch {c}, 機能保存)", flush=True)
+            print(f"[ego-pool] replaced global mean ({h}x{w}) with depthwise conv + BN "
+                  f"(ch {c}, function-preserving)", flush=True)
         return True
 
     def enable_pact(self, patterns, alpha_init=None, verbose=True):
-        """PACT (2026-08-23): 指定 ReLU を「学習可能な上限つき ReLU」に置換。
+        """PACT (2026-08-23): replace the given ReLUs with "ReLU with a learnable upper bound".
 
-        INT8 で ego が凍結する原因を実測で特定した結果: ego の直前にある
-        時間融合の ReLU が **外れ値比 48 倍** (tfuse3.3.5 は max 136.9 に対し
-        p99.9 が 2.86) だった。per-tensor の INT8 スケールは max で決まるので、
-        信号の 99.9% が 127 段階のうち 3 段階に潰れる。ego 出力が定数化する
-        一方で std だけ大きく見える現象と整合する。較正方式を 3 種
-        (entropy2 / MinMax / legacy) 試して ego 出力が小数第 5 位まで
-        一致したのは、スケールの選び方ではなく **活性の分布自体** が
-        原因だから。
+        Measured root cause of the INT8 ego freeze: the temporal-fusion ReLU right before
+        ego had an **outlier ratio of 48x** (tfuse3.3.5: max 136.9 vs p99.9 of 2.86).
+        Per-tensor INT8 scale is set by the max, so 99.9% of the signal collapses into
+        3 of the 127 steps. Consistent with the ego output becoming constant while
+        only its std looks large. Three calibration methods (entropy2 / MinMax / legacy)
+        gave ego outputs identical to the 5th decimal place, because the cause
+        is **the activation distribution itself**, not the choice of
+        scale.
 
-        ReLU6 (固定値 6) は使えない: 同じネットの中に p99.9 が 27 の層
-        (pl_head) と 2.9 の層 (tfuse) が同居しており、一律に切ると正常な
-        信号を壊す。よって層ごとに学習可能な上限 alpha を持たせる。
+        ReLU6 (fixed 6) is unusable: the same net has layers with p99.9 of 27 (pl_head)
+        and 2.9 (tfuse) side by side, and a uniform cut destroys healthy signal.
+        Hence a learnable per-layer upper bound alpha.
 
-        alpha は **実測 max x 1.10 で初期化する**ので、開始時点の出力は
-        素の ReLU と完全に一致する (機能保存)。そこから L1 の減衰
-        (--pact-w) で押し下げ、外れ値だけを刈る。
+        alpha is **initialized to measured max x 1.10**, so the output at the start
+        matches plain ReLU exactly (function-preserving). From there an L1 decay
+        (--pact-w) pushes it down and prunes only the outliers.
 
-        推論時は定数の Clip 1 個に落ちるので **レイテンシ増はゼロ**
-        (前段の conv+BN に融合される)。QAT と違い ONNX のグラフ構造も
-        量子化方式も変えないので、MeteorLift プラグイン経路のカーネル選択に
-        影響しない。
+        At inference it collapses to a single constant Clip, so **added latency is zero**
+        (fused into the preceding conv+BN). Unlike QAT it changes neither the ONNX graph
+        structure nor the quantization scheme, so kernel selection on the MeteorLift
+        plugin path is unaffected.
         """
         import fnmatch as _fn
         init = dict(alpha_init or {})
@@ -1326,14 +1326,14 @@ class DepthSegIPMNetV16(DepthSegIPMNetV14):
         dev = next(self.parameters()).device
         self.to(dev)
         if verbose:
-            print(f"[pact] {len(made)} 層を上限つき ReLU に置換 "
-                  f"(alpha は実測 max の安全率つきで初期化 = 機能保存)", flush=True)
+            print(f"[pact] replaced {len(made)} layers with bounded ReLU "
+                  f"(alpha initialized from measured max with a safety margin = function-preserving)", flush=True)
             for n_, a_ in made:
                 print(f"[pact]   {n_:<22} alpha_init {a_:8.2f}", flush=True)
         return made
 
     def pact_penalty(self):
-        """alpha の L1。これで上限を押し下げ、外れ値だけを刈る。"""
+        """L1 on alpha. Pushes the bound down, pruning only the outliers."""
         acc = None
         for m in self.modules():
             if isinstance(m, PACTReLU):
@@ -1343,18 +1343,18 @@ class DepthSegIPMNetV16(DepthSegIPMNetV14):
             self.parameters()).device)
 
     def enable_paint_det(self, classes):
-        """paint-det (2026-08-22): 2D 検出ヒートマップをリフト前の ctx へ注入。
+        """paint-det (2026-08-22): inject 2D detection heatmaps into ctx before the lift.
 
-        深度分布の鋭化は 30-60m で飽和し (ent_w 0.02 と 0.1 で最大確率
-        0.090/0.091、目標 0.15 に届かず)、cam-only の遠方 veh recall は
-        0.50 で頭打ち。一方 2D 画像では遠方車両は見えており、2D det の
-        ヒートマップはピークが立つ。その「ここに車がいる」証拠をリフトで
-        BEV セルへ届ける。paint-seg と同じくゼロ初期化 1x1 射影の加算なので
-        導入時点の出力は完全に不変 (BEV 幅 96ch もリフトプラグインも不変)。
+        Depth sharpening saturates at 30-60m (ent_w 0.02 and 0.1 give max prob
+        0.090/0.091, short of the 0.15 target) and cam-only far veh recall plateaus
+        at 0.50. Yet far vehicles are visible in the 2D image and the 2D det heatmap
+        does form peaks. Carry that "vehicle here" evidence through the lift to the
+        BEV cell. As with paint-seg this is a zero-initialized 1x1 projection added in,
+        so the output at introduction is exactly unchanged (BEV width 96ch and the lift plugin untouched).
 
-        det2d は本来 forward の最後で _last_f から計算されるが、ctx より
-        前に計算しても等価なので、ここで前倒しして結果をキャッシュし、
-        後段の det2d_forward がそれを再利用する (計算は 1 回だけ)。
+        det2d is normally computed from _last_f at the end of forward, but computing it
+        before ctx is equivalent, so it is moved forward here and the result cached;
+        the later det2d_forward reuses it (computed exactly once).
         """
         self._paint_det_cls = [int(c) for c in classes]
         _convs = [mm for mm in self.ctx.modules()
@@ -1372,7 +1372,7 @@ class DepthSegIPMNetV16(DepthSegIPMNetV14):
                 return _o
             d = self.det2d_stem(f)
             hm = self.hm2d_head(d)
-            self._det2d_cache = (d, hm)          # 後段で再利用
+            self._det2d_cache = (d, hm)          # reused downstream
             p = hm.sigmoid()[:, self._paint_det_cls].detach().to(_o.dtype)
             if p.shape[-2:] != _o.shape[-2:]:
                 p = F.interpolate(p, size=_o.shape[-2:], mode="bilinear",
@@ -1380,7 +1380,7 @@ class DepthSegIPMNetV16(DepthSegIPMNetV14):
             _d = self.paint_det_proj(p)
             if os.environ.get("METEOR_PAINT_DEBUG"):
                 print(f"[paint-det] p={tuple(p.shape)} "
-                      f"加算ノルム={float(_d.abs().mean()):.5f}")
+                      f"add-norm={float(_d.abs().mean()):.5f}")
             return _o + _d
 
         self._det2d_cache = None
@@ -1410,10 +1410,10 @@ class DepthSegIPMNetV16(DepthSegIPMNetV14):
         # +-30, so this changes nothing about what the loss sees while removing
         # the failure -- and since clamp has zero gradient outside the range it
         # also stops the head being pushed further out once it gets there.
-        # clamp だけでは NaN が素通しする (clamp(nan)=nan)。fp16 で head 内部が
-        # 一度 inf になると BN の (x-mean)/sqrt(var) で NaN が生まれ、
-        # 出力段の clamp では消せない。2026-08-17: nan_to_num を前置し、
-        # out[2] 由来の SKIP (r59 で 29%, r72 で 148 回, r73 で 16 回) を断つ。
+        # clamp alone lets NaN through (clamp(nan)=nan). Once the head goes inf
+        # internally under fp16, BN's (x-mean)/sqrt(var) produces NaN, which the
+        # output-stage clamp cannot remove. 2026-08-17: prepend nan_to_num to stop
+        # the SKIPs originating from out[2] (29% in r59, 148 in r72, 16 in r73).
         if _EXPORT_FAST:
             seg2d = self.seg_head(f).clamp(-30.0, 30.0)
         else:
@@ -1558,7 +1558,7 @@ class DepthSegIPMNetV16(DepthSegIPMNetV14):
             near_veh = 1.0 + 0.25 * (r < 20.0).float() + 0.25 * (r < 12.0).float()
             near_vru = 1.0 + (r < 20.0).float() + (r < 12.0).float()
             near = torch.stack([near_veh, near_vru])
-            # v131' (2026-08-28): VRU クラス重みをフラグ化 (既定 5.0 = 従来値)
+            # v131' (2026-08-28): VRU class weight made a flag (default 5.0 = legacy value)
             cw = torch.tensor([2.0, float(getattr(self, "VRU_CW", 5.0))],
                               device=hm.device).view(2, 1, 1)
             # far positives are unresolvable at 768x432 (a 60 m pedestrian is
@@ -1587,7 +1587,7 @@ class DepthSegIPMNetV16(DepthSegIPMNetV14):
             self._det_posw = (near * cw * damp).unsqueeze(0)
         _neg = (1 - pos) * neg_w
         if getattr(self, "_det_sup_km", None) is not None:
-            _neg = _neg * self._det_sup_km      # 窓外の負例も無監督に
+            _neg = _neg * self._det_sup_km      # negatives outside the window are unsupervised too
         floss = -(pos * self._det_posw * (1 - p) ** 2 * p.log()
                   + _neg * p ** 2 * (1 - p).log()).sum() \
             / (pos * self._det_posw).sum().clamp(min=1)
@@ -1596,26 +1596,26 @@ class DepthSegIPMNetV16(DepthSegIPMNetV14):
                 or self._reg_cw.device != hm.device:
             self._reg_cw = torch.tensor([1., 1., 1., 1., 3., 3.],
                                         device=hm.device).view(1, 6, 1, 1)
-        # yaw-balance (v68+ 事前登録): 予測が軸平行モードに崩壊した実測
-        # (斜めGT 15-75deg で誤差 31-43deg) への的絞りレバー。GT の斜め度で
-        # yaw チャネル (4:6) の重みを持ち上げる。
+        # yaw-balance (pre-registered v68+): targeted lever for the measured collapse of
+        # predictions to axis-aligned modes (31-43deg error on oblique GT at 15-75deg).
+        # Raises the weight of the yaw channels (4:6) by how oblique the GT is.
         #
-        # 2026-08-15 修正: 重みが sin(2*yaw)^2 = (2 sin cos)^2 だったため、
-        # 真横 (yaw=90deg, sin=1 cos=0) で 0 になり、自車と平行な車 (0deg) と
-        # 同じ「重み無し」扱いになっていた。ペア比較 (両モデルが検出できた
-        # 共通 801 箱) で軽量版の yaw 誤差中央値は 0-15deg 帯 2.1deg に対し
-        # 75-90deg 帯 39.4deg と、まさに重みが消える帯で最大に壊れている。
-        # 単調な sin^2 に直す (0deg -> 0, 45deg -> 0.5, 90deg -> 1.0)。
-        # これは「斜めほど重く」という登録済みの意図どおりの形であり、
-        # レバー自体は METEOR_YAW_BALANCE_W>0 のときだけ効く (既定は無効)。
-        # 形の指数は METEOR_YAW_BALANCE_P で選ぶ (既定 2 = sin^2)。
-        # p=1 の |sin| は 15-45deg 帯にも効くが正対帯への影響が大きい。
-        # どちらが良いかは実測で決める (out/probe_yawlever*.log)。
-        # 2026-08-15 追加: METEOR_YAW_BALANCE_SAT=<度> を指定すると、その角度
-        # 以上の斜めを一律で最大重みにする飽和形になる。v76 (p=1, w=2) の
-        # 本走行で真横 34.3->6.5 度と直った一方、15-45 度が 35.5->47.4 度へ
-        # 悪化した。|sin| は 90 度に重みが集中し 15-45 度に薄い (15 度で 0.26)
-        # ため。飽和形なら斜めの全帯を同じ重さで扱える。
+        # 2026-08-15 fix: the weight was sin(2*yaw)^2 = (2 sin cos)^2, which is 0 at
+        # broadside (yaw=90deg, sin=1 cos=0), so cars perpendicular to ego were treated
+        # the same as cars parallel to it (0deg): "no weight". In a paired comparison
+        # (801 common boxes detected by both models) the light model's median yaw error
+        # was 2.1deg in the 0-15deg band vs 39.4deg in 75-90deg -- worst exactly where the weight vanishes.
+        # Changed to a monotonic sin^2 (0deg -> 0, 45deg -> 0.5, 90deg -> 1.0).
+        # This matches the registered intent "the more oblique, the heavier", and the
+        # lever only acts when METEOR_YAW_BALANCE_W>0 (disabled by default).
+        # The exponent of the shape is chosen with METEOR_YAW_BALANCE_P (default 2 = sin^2).
+        # p=1 (|sin|) also acts on the 15-45deg band but affects the head-on band more.
+        # Which is better is decided by measurement (out/probe_yawlever*.log).
+        # 2026-08-15 addition: with METEOR_YAW_BALANCE_SAT=<deg>, every obliqueness at
+        # or above that angle gets the maximum weight uniformly (saturating form). The
+        # v76 production run (p=1, w=2) fixed broadside 34.3->6.5 deg but worsened 15-45 deg
+        # from 35.5->47.4 deg, because |sin| concentrates weight at 90 deg and is thin at
+        # 15-45 deg (0.26 at 15 deg). The saturating form weights all oblique bands equally.
         ybw = float(os.environ.get("METEOR_YAW_BALANCE_W", "0"))
         ybp = float(os.environ.get("METEOR_YAW_BALANCE_P", "2"))
         ybs = float(os.environ.get("METEOR_YAW_BALANCE_SAT", "0"))
@@ -1698,11 +1698,11 @@ class DepthSegIPMNetV16(DepthSegIPMNetV14):
 
 DET2D_S = 4                    # 2D det grid stride on the cached image (108x192)
 class PACTReLU(nn.Module):
-    """上限が学習可能な ReLU。y = clamp(x, 0, alpha)。
+    """ReLU with a learnable upper bound. y = clamp(x, 0, alpha).
 
-    学習時は 0.5*(|x| - |x-a| + a) の形で書く (これは clamp と数値的に
-    同一で、x > a の領域から alpha へ勾配が流れる = PACT の要点)。
-    推論時は定数の clamp にするので ONNX には Clip が 1 個出るだけ。
+    In training it is written as 0.5*(|x| - |x-a| + a) (numerically identical to
+    clamp, and it lets gradient flow to alpha from the x > a region = the point of PACT).
+    At inference it becomes a constant clamp, so ONNX gets just a single Clip.
     """
 
     def __init__(self, alpha_init=64.0, inplace=True):
@@ -1711,16 +1711,16 @@ class PACTReLU(nn.Module):
         self.inplace = bool(inplace)
 
     def forward(self, x):
-        # 値は必ず hardtanh の in-place 1 発で作る。置換元の ReLU が
-        # inplace=True なので、非 in-place にすると別名参照の見え方が変わり
-        # 補助ヘッドで相対 5-7% ずれる (実測)。hardtanh + inplace なら
-        # 素の ReLU と **ビット一致** することを確認済み。
-        # ONNX には Clip が 1 個出るだけなので TensorRT が前段の conv+BN に
-        # 融合する = 推論コストはゼロ。
+        # Always produce the value with a single in-place hardtanh. The replaced ReLU
+        # was inplace=True; going non-in-place changes how aliased references appear
+        # and shifts auxiliary heads by 5-7% relative (measured). hardtanh + inplace is
+        # confirmed **bit-identical** to plain ReLU.
+        # ONNX gets only a single Clip, which TensorRT fuses into the preceding
+        # conv+BN = zero inference cost.
         a = self.alpha.abs().clamp(min=1e-3)
         if self.training:
-            # alpha へ勾配を流す (PACT): 上限に当たった画素で d/da = 1。
-            # 値は 0 を足すだけなので数値は hardtanh と完全に同じ。
+            # Let gradient flow to alpha (PACT): d/da = 1 at pixels that hit the bound.
+            # Only adds 0 to the value, so numerically identical to hardtanh.
             with torch.no_grad():
                 clipped = (x > a).to(x.dtype)
             y = F.hardtanh(x, 0.0, float(a), inplace=self.inplace)
@@ -1756,7 +1756,7 @@ class DepthSegIPMNetV17(DepthSegIPMNetV16):
 
     def det2d_forward(self, f, B, N):
         _c = getattr(self, "_det2d_cache", None)
-        if _c is not None:               # paint-det が前倒し計算済み
+        if _c is not None:               # paint-det already computed it ahead of time
             d, hm2d = _c
             self._det2d_cache = None
         else:
@@ -1993,9 +1993,9 @@ class DepthSegIPMNetV19(DepthSegIPMNetV18):
             nn.Linear(256, EGO_OUT))
 
     def det2d_forward(self, f, B, N):
-        # paint-det が有効なときは s4 段 (det2d_stem + hm2d_head) をリフト前に
-        # 計算済み。同じ f から出るので等価であり、ここで再利用して二重計算を
-        # 避ける (キャッシュは 1 回で使い切る)。
+        # When paint-det is enabled the s4 stage (det2d_stem + hm2d_head) was already
+        # computed before the lift. It comes from the same f so it is equivalent; reuse
+        # it here to avoid double computation (the cache is consumed once).
         _c = getattr(self, "_det2d_cache", None)
         if _c is not None and _c[0].shape[0] == f.shape[0]:
             d4, _hm4 = _c
@@ -2267,8 +2267,8 @@ class QuantRobustStatHead(nn.Module):
 
 
 def enable_kinematic_anchor(net):
-    """v139: ego waypoint に等速直進項 g_t*[v0*t,0] をゲート付きで加算する。
-    ゼロ初期化で関数保存。学習後は近距離の速度バイアスを構造的に除去する。"""
+    """v139: add a gated constant-velocity straight-line term g_t*[v0*t,0] to the ego waypoints.
+    Zero-initialized, function-preserving. After training it structurally removes the near-range speed bias."""
     import torch.nn as nn
     if getattr(net, "kin_gate", None) is not None:
         return net
@@ -2277,25 +2277,25 @@ def enable_kinematic_anchor(net):
     return net
 
 def enable_semantic_ego(net, ch=64):
-    """ego の INT8 耐性化 (2026-08-25): ego_stem の入力を「意味出力」に変える。
+    """INT8-hardening of ego (2026-08-25): feed ego_stem "semantic outputs" instead.
 
-    根本原因 (実測): ego は融合 BEV の生特徴を大域平均で読む。INT8 では
-    (1) 平均後の値が入力スケールの流用で潰れ (真っ黒でも乱数でも出力が
-    ビット一致)、(2) 上流 tfuse 帯の微細信号も破壊される。層精度・較正・
-    PACT・conv 化のすべてが不合格で、fp16-keep 65 層 (+18.6ms) が唯一の
-    回避策だった。
-    対処: ego が読む量を **INT8 で健全と実証済みのテンソル** に変える ---
-    seg ロジット (9ch)・det ヒートマップ (2ch)・占有の接地面 (合計 14ch 程度)。
-    これらは意味の決定境界を持つためダイナミックレンジが大きく、量子化に
-    構造的に強い (occ/traj/seg/det が INT8 で健全な理由そのもの)。
-    旧 ego_stem/ego_mlp は残し、出力に**ゼロ初期化の残差**として加算する
-    (導入時点は機能保存。学習が意味経路へ重みを移せば、fp16-keep から
-    tfuse/ego を外しても E2E が生きる)。"""
+    Root cause (measured): ego reads raw features of the fused BEV via a global mean. Under INT8
+    (1) the post-mean values collapse because the input scale is reused (output bit-identical
+    on all-black and on random input), and (2) fine signal in the upstream tfuse band is
+    destroyed too. Layer precision, calibration, PACT and the conv conversion all failed;
+    fp16-keep on 65 layers (+18.6ms) was the only workaround.
+    Fix: change what ego reads to **tensors proven healthy under INT8** ---
+    seg logits (9ch), det heatmap (2ch), occupancy ground plane (about 14ch in total).
+    These carry semantic decision boundaries, so their dynamic range is large and they are
+    structurally robust to quantization (the very reason occ/traj/seg/det are healthy in INT8).
+    The old ego_stem/ego_mlp stay and this is added to the output as a **zero-initialized residual**
+    (function-preserving at introduction; if training shifts weight onto the semantic path,
+    E2E survives even with tfuse/ego removed from fp16-keep)."""
     if getattr(net, "sem_ego", None) is not None:
         return net
     dev = next(net.parameters()).device
-    # 入力: seg 9 (800x500 を 2x 平均して det 格子へ) + det hm 2 = 11ch
-    # (occ は BEV と座標範囲が異なるため使わない)
+    # input: seg 9 (800x500 2x-averaged onto the det grid) + det hm 2 = 11ch
+    # (occ is not used: its coordinate range differs from the BEV)
     net.sem_ego = nn.Sequential(
         nn.Conv2d(11, ch, 3, stride=4, padding=1, bias=False),
         nn.BatchNorm2d(ch), nn.ReLU(inplace=True),
@@ -2312,44 +2312,44 @@ def enable_semantic_ego(net, ch=64):
 
 
 def enable_delta_stat(net, ch=48):
-    """停止判定の時間差分ヘッド (2026-08-25)。
+    """Temporal-difference head for the stop decision (2026-08-25).
 
-    根本原因 (実測): stat_head2 が頼る微細な見えの差は INT8 バックボーンの
-    深部で破壊され、ヘッド近傍の対処 5 種 (margin / 有界ヘッド後付け /
-    有界ヘッド学習+拡張keep / traj 由来 / トラッキング=忠実代替) すべてが
-    ゲート不合格だった。
-    対処: 差分 |bev - warp(prev_bev)| を明示的にテンソルにし、そこから
-    停止判定を出す。静止物体は差分 ~0、移動物体は差分大 --- 量子化スケールが
-    動き信号そのもので決まるため、微小信号の目盛り消失が構造的に起きない。
-    ワープは時間融合の実装 (配備済み) を流用。追加計算は pool + 小 conv 3 層。
-    旧 stat_head2 は残す (fp16 実行では従来どおり比較できる)。"""
+    Root cause (measured): the subtle appearance differences stat_head2 relies on are
+    destroyed deep in the INT8 backbone, and all 5 head-side remedies (margin / bolt-on
+    bounded head / trained bounded head + extended keep / traj-derived / tracking as a
+    faithful substitute) failed the gate.
+    Fix: make the difference |bev - warp(prev_bev)| an explicit tensor and derive the
+    stop decision from it. Static objects give ~0 difference, moving ones a large one ---
+    the quantization scale is set by the motion signal itself, so the small signal cannot structurally fall below the step size.
+    The warp reuses the temporal-fusion implementation (already deployed). Extra compute: pool + 3 small convs.
+    The old stat_head2 stays (fp16 runs can still compare as before)."""
     if getattr(net, "delta_stat", None) is not None:
         return net
     dev = next(net.parameters()).device
     net.delta_stat = nn.Sequential(
-        nn.AvgPool2d(2),                       # 800x500 -> 400x250 (det 格子)
+        nn.AvgPool2d(2),                       # 800x500 -> 400x250 (det grid)
         nn.Conv2d(BEV_CH, ch, 3, padding=1, bias=False),
         nn.BatchNorm2d(ch), nn.ReLU(inplace=True),
         nn.Conv2d(ch, ch, 3, padding=1, bias=False),
         nn.BatchNorm2d(ch), nn.ReLU(inplace=True),
         nn.Conv2d(ch, 1, 1)).to(dev)
     nn.init.zeros_(net.delta_stat[-1].bias)
-    # out[10] を上書きされる stat_head2 は勾配を受けない。DDP は登録済みの
-    # 全 requires_grad パラメータに勾配を要求するので、凍結しないと step2 の
-    # reducer 再構築で落ちる (v124 初回起動で実害)。重みは fp16 比較用に残す。
+    # stat_head2, whose out[10] gets overwritten, receives no gradient. DDP demands a
+    # gradient for every registered requires_grad parameter, so without freezing it the
+    # reducer rebuild at step2 fails (real failure on v124 first launch). Weights kept for fp16 comparison.
     for _p in net.stat_head2.parameters():
         _p.requires_grad_(False)
     return net
 
 
 def enable_depth_slim(net, scale=0.75, widths=None):
-    """深度ヘッドの幅を縮める (Orin 100ms 台帳のレバー3, 2026-08-27)。
+    """Slim the depth head (lever 3 of the Orin 100ms ledger, 2026-08-27).
 
-    v125fp のプロファイルで深度ヘッド (conv 5 本) が 12.8 ms と最大の単一
-    ブロック。幅 256/256/192/128 を scale 倍 (8 の倍数へ丸め) にした新しい
-    ヘッドへ置き換える。重みは新規初期化 — LiDAR 由来の深度 GT 監督が
-    強いので蒸留は使わず、ラウンド内で学習し直す。
-    widths を渡した場合はそれをそのまま使う (チェックポイント自動検出用)。"""
+    In the v125fp profile the depth head (5 convs) is the largest single block at 12.8 ms.
+    Replace it with a new head whose widths 256/256/192/128 are multiplied by scale
+    (rounded to a multiple of 8). Weights are freshly initialized -- the LiDAR-derived
+    depth GT supervision is strong, so no distillation; retrain within the round.
+    If widths is given it is used as is (for checkpoint auto-detection)."""
     old = net.depth_head
     ch = old[0][0].in_channels
     D = old[-1].out_channels
@@ -2365,14 +2365,14 @@ def enable_depth_slim(net, scale=0.75, widths=None):
 
 
 def enable_traj_flow(net, ch=256):
-    """他車軌跡ヘッドへ flow 場を接続 (A レバー A1, 2026-08-27)。
+    """Wire the flow field into the agent-trajectory head (A lever A1, 2026-08-27).
 
-    実測 (probe_agent_cvflow): flow の向きは 11.3° と traj ヘッド (27°) より
-    大幅に良いのに、traj ヘッドは flow を読んでいない。flow (out[13],
-    ±40m クロップの occ 格子) を det/traj 格子へ再配置し、ゼロ初期化 1x1 の
-    残差として traj 特徴にのみ加算する (stat_head2 の入力は変えない)。
-    detach 供給なので flow ヘッド自身の学習は汚さない。A2 (--flow-w 1.0) は
-    flowerr 2.69m≈基準 2.64m で棄却 — 速度は損失重み律速ではない。"""
+    Measured (probe_agent_cvflow): flow heading (11.3°) is far better than the traj head's
+    (27°), yet the traj head does not read flow. Resample flow (out[13], occ grid of the
+    ±40m crop) onto the det/traj grid and add it as a zero-initialized 1x1 residual to
+    the traj features only (stat_head2 input unchanged).
+    Fed detached, so the flow head's own training is not polluted. A2 (--flow-w 1.0) was
+    rejected with flowerr 2.69m≈baseline 2.64m -- velocity is not loss-weight-limited."""
     if getattr(net, "traj_flow", None) is not None:
         return net
     dev = next(net.parameters()).device
@@ -2383,11 +2383,11 @@ def enable_traj_flow(net, ch=256):
 
 
 def enable_det_temporal(net, ch=64):
-    """D7 (2026-08-28): 3D 検出 hm へ時間特徴のゼロ初期化残差。
+    """D7 (2026-08-28): zero-initialized temporal-feature residual on the 3D detection hm.
 
-    遠方 recall と VRU は容量(D1)・露出(D2'/pV2)・重み(D3/pV1) の全レバーで
-    動かず、残る仮説は「単フレームの証拠不足」。unk_head2 が時間特徴化で
-    0.4m コーンを検出できるようになった前例と同型の接ぎ木。"""
+    Far recall and VRU did not move under any lever of capacity (D1), exposure (D2'/pV2)
+    or weighting (D3/pV1); the remaining hypothesis is "insufficient single-frame evidence".
+    Same graft as the precedent where unk_head2 became able to detect 0.4m cones once given temporal features."""
     if getattr(net, "det_tmp", None) is not None:
         return net
     dev = next(net.parameters()).device
@@ -2400,12 +2400,12 @@ def enable_det_temporal(net, ch=64):
 
 
 def enable_traj_cv(net):
-    """A6 (2026-08-28): 他車軌跡を CV(v̂)+残差 に再パラメータ化。
+    """A6 (2026-08-28): reparameterize agent trajectories as CV(v̂)+residual.
 
-    実測: agentADE 2.13m は oracle-CV 0.88m に大差負け = ヘッドが速度を
-    因数分解できていない。ゼロ初期化の速度予測 v̂ [2ch] を足し、
-    各モード k の waypoint に v̂*t_i を加算する (導入時は機能保存)。
-    残差学習で v̂ に運動が寄れば CV 構造が内在化される。"""
+    Measured: agentADE 2.13m loses badly to oracle-CV 0.88m = the head does not factor
+    out velocity. Add a zero-initialized velocity prediction v̂ [2ch] and add v̂*t_i to
+    the waypoints of every mode k (function-preserving at introduction).
+    If residual learning moves the motion into v̂, the CV structure becomes built in."""
     if getattr(net, "traj_vel", None) is not None:
         return net
     dev = next(net.parameters()).device
@@ -2416,9 +2416,9 @@ def enable_traj_cv(net):
 
 
 def enable_depth_logbins(net):
-    """D5 (2026-08-29): 深度ビンを対数間隔化 (geomspace 1.0..79.75m x64)。
-    遠方 recall の真因 (距離での深度証拠の質) への構造レバー。
-    注意: 配備時はリフトプラグインのテーブル再生成が必要。"""
+    """D5 (2026-08-29): log-spaced depth bins (geomspace 1.0..79.75m x64).
+    Structural lever on the true cause of far recall (quality of depth evidence vs range).
+    Note: deployment requires regenerating the lift plugin's tables."""
     import math
     ds = torch.exp(torch.linspace(math.log(1.0), math.log(79.75), 64))
     try:
@@ -2430,12 +2430,12 @@ def enable_depth_logbins(net):
 
 
 def enable_mode_scorer(net, ch=64):
-    """E3 (2026-08-29): 経路条件付きモード選択スコアラ。
+    """E3 (2026-08-29): path-conditioned mode-selection scorer.
 
-    実測: 選択ロス +0.15m は soft CE (tau 0.2/0.4) でも risk 積分でも回収
-    できず、「候補を識別する入力の欠如」が律速。各候補の waypoint 位置で
-    BEV 時間特徴を双線形サンプルし、小 MLP のスコアをモード logit へ
-    ゼロ初期化残差として加算する (導入時は機能保存)。"""
+    Measured: the +0.15m selection loss is recovered neither by soft CE (tau 0.2/0.4) nor
+    by risk integration; the limiter is "no input that discriminates candidates". Bilinearly
+    sample BEV temporal features at each candidate's waypoints and add a small MLP's score
+    to the mode logits as a zero-initialized residual (function-preserving at introduction)."""
     if getattr(net, "mode_scorer", None) is not None:
         return net
     dev = next(net.parameters()).device
@@ -3018,7 +3018,7 @@ class DepthSegIPMNetV29(DepthSegIPMNetV28):
             ce = F.cross_entropy(mlog, best, reduction="none")[:, None]
         cw = 1.0 + gt[:, 11:12].abs().clamp(max=6.0) / 1.5
         _sw = getattr(self, "EGO_SPEED_W", 0.0)
-        if _sw > 0:   # v139b: 高速フレーム (ego 教師の少数派) の重み押し上げ
+        if _sw > 0:   # v139b: upweight high-speed frames (the minority in the ego teacher)
             cw = cw * (1.0 + gt[:, 12:13].abs() / _sw).clamp(max=4.0)
         nw = (cw * valid).sum().clamp(min=1)
         wl = (wp_e * cw * valid).sum() / nw
@@ -3495,7 +3495,7 @@ class DepthSegIPMNetV35(DepthSegIPMNetV34):
                 cat.append(F.grid_sample(hb[:, i].to(bev.dtype), grid,
                                          align_corners=False))
         self._warped0 = cat[1]
-        self._prefuse_bev = bev                        # delta-stat が読む
+        self._prefuse_bev = bev                        # read by delta-stat
         g = self.tgate(torch.cat(cat, 1)).softmax(1)   # [B,4,H,W]
         cat = [c * (4.0 * g[:, i:i + 1]) for i, c in enumerate(cat)]
         return bev + self.tfuse3(torch.cat(cat, 1))
@@ -3512,16 +3512,16 @@ class DepthSegIPMNetV35(DepthSegIPMNetV34):
                               tok, tok)
         out[7] = out[7] + self.ego_delta(qa.flatten(1))
         if getattr(self, "sem_ego", None) is not None:
-            # 意味出力 (INT8 健全) から ego 残差。detach で painter 側と同じく
-            # 意味ヘッドの学習を汚さない。
+            # ego residual from semantic outputs (INT8-healthy). Detached, so as with the
+            # painter the semantic heads' training is not polluted.
             _sem = torch.cat([
                 F.avg_pool2d(out[0].detach().float().softmax(1), 2),  # seg 9ch @400x250
                 out[3].detach().float().sigmoid()], 1)                # hm 2ch @400x250
             out[7] = out[7] + self.sem_ego(_sem.to(out[7].dtype))
         if getattr(self, "kin_gate", None) is not None and v0 is not None:
-            # v139 運動学アンカー (2026-09-02): 全 K モードの waypoint に
-            # g_t * [v0*t, 0] を加算。g_t (6 個) はゼロ初期化 = 導入時関数保存。
-            # 根拠: 0.5s 目 waypoint の縦バイアスが v0 に比例 (8-15 m/s で −10%)。
+            # v139 kinematic anchor (2026-09-02): add g_t * [v0*t, 0] to the waypoints of
+            # all K modes. g_t (6 values) is zero-initialized = function-preserving at introduction.
+            # Rationale: the longitudinal bias of the 0.5s waypoint scales with v0 (−10% at 8-15 m/s).
             _t = torch.arange(1, 7, device=out[7].device, dtype=torch.float32) * 0.5
             _cv = (v0.view(-1, 1).float() * (_t * self.kin_gate.float()).view(1, 6))  # [B,6]
             _e = out[7].float()
@@ -3536,8 +3536,8 @@ class DepthSegIPMNetV35(DepthSegIPMNetV34):
         tf = self._tf[:, :256] + ctx
         tfq = tf
         if getattr(self, "traj_flow", None) is not None:
-            # A1: flow 場 (±40m クロップ, stride2) を traj 格子へ再配置し、
-            # ゼロ初期化 1x1 の残差として traj 入力にのみ加算 (stat は不変)。
+            # A1: resample the flow field (±40m crop, stride2) onto the traj grid and add it
+            # as a zero-initialized 1x1 residual to the traj input only (stat unchanged).
             _fl = out[13].detach().to(tf.dtype)
             _cv = tf.new_zeros(tf.shape[0], 2, tf.shape[2], tf.shape[3])
             _fr0, _ = bev_rows(40.0, -40.0)
@@ -3547,30 +3547,30 @@ class DepthSegIPMNetV35(DepthSegIPMNetV34):
         out[9] = self.traj_head(torch.cat(
             [tfq, self._det_reg[:, 4:6].detach()], 1))
         if getattr(self, "traj_vel", None) is not None:
-            # A6: CV 再パラメータ化 — 各モードの waypoint に v̂*t を加算
+            # A6: CV reparameterization -- add v̂*t to the waypoints of every mode
             _v = self.traj_vel(tfq)                       # [B,2,H,W]
             _o9 = out[9]
             _t = torch.arange(1, 7, device=_v.device,
                               dtype=_v.dtype) * 0.5      # 0.5..3.0s
-            # traj GT [6,2] の (dx_i, dy_i) 交互並びに合わせて 12ch を構成
+            # build 12ch to match the interleaved (dx_i, dy_i) layout of traj GT [6,2]
             _cvk = torch.stack([_v[:, 0] * s for s in _t]
                                + [_v[:, 1] * s for s in _t], 1)
             _idx = [i for p_ in range(6) for i in (p_, 6 + p_)]
-            _cvk = _cvk[:, _idx]                          # [B,12,H,W] (x,y)交互
+            _cvk = _cvk[:, _idx]                          # [B,12,H,W] (x,y) interleaved
             for _k in range(EGO_K):
                 _o9 = torch.cat([_o9[:, :_k * 12],
                                  _o9[:, _k * 12:(_k + 1) * 12] + _cvk,
                                  _o9[:, (_k + 1) * 12:]], 1)
             out[9] = _o9
         if getattr(self, "det_tmp", None) is not None:
-            # D7: hm へ時間特徴残差 (ゼロ初期化)
+            # D7: temporal-feature residual on hm (zero-initialized)
             out[3] = out[3] + self.det_tmp(tf)
         if getattr(self, "mode_scorer", None) is not None:
-            # E3: 各候補経路に沿った特徴でモード logit を補正
+            # E3: correct the mode logits with features along each candidate path
             _p7 = out[7]
             _B = _p7.shape[0]
             _wk = _p7[:, :12 * EGO_K].detach().view(_B, EGO_K, 6, 2)
-            # (x 前方, y 左) [m] -> det 格子 (row = (80-x)/0.4, col = (50-y)/0.4)
+            # (x forward, y left) [m] -> det grid (row = (80-x)/0.4, col = (50-y)/0.4)
             _H2, _W2 = tfq.shape[-2:]
             _gr = (80.0 - _wk[..., 0]) / 0.4 / max(_H2 - 1, 1) * 2 - 1
             _gc = (50.0 - _wk[..., 1]) / 0.4 / max(_W2 - 1, 1) * 2 - 1
@@ -3585,11 +3585,11 @@ class DepthSegIPMNetV35(DepthSegIPMNetV34):
             out[7] = _o7
         out[10] = self.stat_head2(tf)
         if getattr(self, "delta_stat", None) is not None:
-            # 時間差分ヘッド (2026-08-25): 停止判定を |bev - warp(prev_bev)|
-            # から出す。動きの信号がテンソルのレンジそのものになるため、
-            # INT8 の目盛りが動き信号で決まり「大きな DC に乗った微小 AC が
-            # 量子化で消える」構造 (stat_head2 が 5 段の対処すべてで死んだ
-            # 根本原因) が原理的に消える。
+            # Temporal-difference head (2026-08-25): derive the stop decision from
+            # |bev - warp(prev_bev)|. The motion signal becomes the tensor's range itself,
+            # so the INT8 step is set by the motion signal and the "small AC riding on a
+            # large DC vanishes under quantization" structure (the root cause that killed
+            # stat_head2 through all 5 remedies) disappears in principle.
             _d = (self._prefuse_bev - self._warped0).abs()
             out[10] = self.delta_stat(_d)
         # B1: query-decoder lane graph replaces out[14..16]
@@ -4542,13 +4542,13 @@ class DepthSegIPMNetV45(DepthSegIPMNetV44):
         super().__init__(*a, **k)
         self.quant_noise = 0.0
         self.bev_dropblock = 0.0       # r46: MAE-like BEV block masking
-        self.bev_wedgedrop = 0.0       # 2026-08-30: 角度セクタ欠損の模擬
+        self.bev_wedgedrop = 0.0       # 2026-08-30: simulated angular-sector loss
         self.fuse.register_forward_hook(self._qnoise_hook)
         self.tfuse3.register_forward_hook(self._qnoise_hook)
         self.tfuse3.register_forward_hook(self._dropblock_hook)
         self.tfuse3.register_forward_hook(self._wedgedrop_hook)
-        self.bev_ringdrop = 0.0        # 2026-08-30: 距離帯リング零化
-        self.bev_chandrop = 0.0        # 2026-08-30: チャネルドロップ
+        self.bev_ringdrop = 0.0        # 2026-08-30: range-band ring zeroing
+        self.bev_chandrop = 0.0        # 2026-08-30: channel drop
         self.tfuse3.register_forward_hook(self._ringdrop_hook)
         self.tfuse3.register_forward_hook(self._chandrop_hook)
 
@@ -4583,12 +4583,12 @@ class DepthSegIPMNetV45(DepthSegIPMNetV44):
         return out * m if hit else None
 
     def _wedgedrop_hook(self, module, inp, out):
-        """極座標くさびドロップ (2026-08-30): 自車を原点に 40-90° の角度
-        セクタを BEV 特徴ごと零化し、カメラ 1 本分の視野欠損を特徴レベルで
-        模擬する。入力レベルの cam-drop と違い、塗り込み済み LiDAR 特徴や
-        時間メモリ経由の残存も含めて「その方角が見えない」状態を作る。
-        GT は完全なまま = 周辺文脈と時間記憶からの補完を学習させる。
-        train のみ、サンプル毎確率 = self.bev_wedgedrop。"""
+        """Polar wedge drop (2026-08-30): zero out a 40-90° angular sector of BEV features
+        with ego at the origin, simulating the loss of one camera's field of view at the
+        feature level. Unlike input-level cam-drop, this also removes what survives via
+        painted LiDAR features or temporal memory, producing a true "that direction is unseen" state.
+        GT stays complete = trains completion from surrounding context and temporal memory.
+        Train only, per-sample probability = self.bev_wedgedrop."""
         if not self.training or getattr(self, "bev_wedgedrop", 0) <= 0:
             return None
         B, _, H, W = out.shape
@@ -4602,17 +4602,17 @@ class DepthSegIPMNetV45(DepthSegIPMNetV44):
             if torch.rand(()) >= self.bev_wedgedrop:
                 continue
             hit = True
-            c = (torch.rand(()) * 2 - 1) * torch.pi          # 中心角
-            half = torch.deg2rad(20 + torch.rand(()) * 25)   # 半幅 20-45°
+            c = (torch.rand(()) * 2 - 1) * torch.pi          # center angle
+            half = torch.deg2rad(20 + torch.rand(()) * 25)   # half-width 20-45°
             d = (ang - c + torch.pi) % (2 * torch.pi) - torch.pi
             m[b, 0][d.abs() < half] = 0
         return out * m if hit else None
 
     def _ringdrop_hook(self, module, inp, out):
-        """距離帯リング零化 (2026-08-30): 自車からの距離 r0..r0+w の帯を
-        BEV 特徴ごと零化。遠方ヘッドに「手前が見えない」補完を、近傍
-        ヘッドに「中間帯の欠損」への頑健性を要求する。GT は完全なまま。
-        train のみ、サンプル毎確率 = self.bev_ringdrop。"""
+        """Range-band ring zeroing (2026-08-30): zero out BEV features in the band r0..r0+w
+        from ego. Demands "near range unseen" completion from the far heads and robustness
+        to "mid-band gaps" from the near heads. GT stays complete.
+        Train only, per-sample probability = self.bev_ringdrop."""
         if not self.training or getattr(self, "bev_ringdrop", 0) <= 0:
             return None
         B, _, H, W = out.shape
@@ -4627,15 +4627,15 @@ class DepthSegIPMNetV45(DepthSegIPMNetV44):
             if torch.rand(()) >= self.bev_ringdrop:
                 continue
             hit = True
-            r0 = torch.rand(()) * rmax * 0.7                 # 内径 0-70%
-            w = (0.08 + torch.rand(()) * 0.12) * rmax        # 幅 8-20%
+            r0 = torch.rand(()) * rmax * 0.7                 # inner radius 0-70%
+            w = (0.08 + torch.rand(()) * 0.12) * rmax        # width 8-20%
             m[b, 0][(rr >= r0) & (rr < r0 + w)] = 0
         return out * m if hit else None
 
     def _chandrop_hook(self, module, inp, out):
-        """BEV チャネルドロップ (2026-08-30): tfuse3 出力のチャネルを
-        SpatialDropout 風にサンプル毎へ確率 self.bev_chandrop で零化
-        (面ではなく特徴軸の冗長性を強制)。生存チャネルは 1/(1-p) 補償。"""
+        """BEV channel drop (2026-08-30): zero out channels of the tfuse3 output per sample
+        with probability self.bev_chandrop, SpatialDropout-style (forces redundancy along
+        the feature axis rather than spatially). Surviving channels are scaled by 1/(1-p)."""
         if not self.training or getattr(self, "bev_chandrop", 0) <= 0:
             return None
         p = float(self.bev_chandrop)
@@ -5434,19 +5434,19 @@ class DepthSegIPMNetV64r50(DepthSegIPMNetV55):
 
 
 class DepthSegIPMNetV52s8(DepthSegIPMNetV52):
-    """R7 解像度軸 (2026-08-14, r34 のまま): x2 入力 (dataset --img-scale 2) を
-    stride-8 で融合。特徴グリッドは 108x192 のままなので depth/seg2d GT・
-    リフト・BEV 以降は無変更、lat2/3/4 の入力チャンネルも一致するため
-    成熟した r34 系列の重みを 100% 引き継げる (lat1 のみ未使用)。
-    RepVGG 実験 (r68) は seg -0.05 / veh R50 -0.12 で却下 — 遠方精度の
-    本命レバーは backbone アーキではなく解像度、という判断。"""
+    """R7 resolution axis (2026-08-14, r34 kept): fuse the x2 input (dataset --img-scale 2)
+    at stride-8. The feature grid stays 108x192, so depth/seg2d GT, the lift and everything
+    from the BEV on are unchanged, and the lat2/3/4 input channels match, so mature
+    r34-line weights carry over 100% (only lat1 is unused).
+    The RepVGG experiment (r68) was rejected at seg -0.05 / veh R50 -0.12 -- the judgment
+    being that the main lever for far accuracy is resolution, not backbone architecture."""
     FUSE_STRIDE = 8
 
     def __init__(self, *a, **k):
         super().__init__(*a, **k)
-        # lat1 (stride-4 タップ) は FUSE_STRIDE=8 では使わない。モジュールに
-        # 残すと DDP が未使用パラメータとして落ちる (find_unused_parameters は
-        # 履歴の多重 forward と両立しない) ので、ここで外す。
+        # lat1 (stride-4 tap) is unused at FUSE_STRIDE=8. Left in the module, DDP fails
+        # on it as an unused parameter (find_unused_parameters is incompatible with the
+        # multiple forwards of the history path), so drop it here.
         del self.lat1
 
 
@@ -5496,8 +5496,8 @@ class DepthSegIPMNetV52r50s8(DepthSegIPMNetV52r50):
 
 class _RepVGGStage(nn.Module):
     """Deploy-form RepVGG stage: N plain conv3x3+BN+ReLU blocks, first one
-    strided. Latency-ladder用 (学習時は timm の分岐形から再パラメータ化する
-    前提で、ここでは Orin での Δms 計測に使うデプロイ形のみ)。"""
+    strided. For the latency ladder (training assumes reparameterization from timm's
+    branched form; here only the deploy form used for Δms measurement on Orin)."""
 
     def __init__(self, cin, cout, n, stride=2):
         super().__init__()
@@ -5519,7 +5519,7 @@ class DepthSegIPMNetV64rv(DepthSegIPMNetV55):
     WIDTHS/BLOCKS are class attrs so A1/A2 variants subclass in two lines.
     Latency measurement first; training (with reparam + ImageNet init via
     timm) only if the ladder says the ms is worth it."""
-    WIDTHS = (48, 48, 96, 192, 384)     # ~A1 相当
+    WIDTHS = (48, 48, 96, 192, 384)     # ~A1-equivalent
     BLOCKS = (1, 2, 4, 14, 1)
 
     def __init__(self, *a, **k):
@@ -5543,28 +5543,28 @@ class DepthSegIPMNetV64rvA2(DepthSegIPMNetV64rv):
 
 
 class DepthSegIPMNetV64rvB0(DepthSegIPMNetV64rv):
-    """RepVGG-B0 相当 + 幅微増: r34 超の容量を密 3x3 で。"""
+    """RepVGG-B0-equivalent + slightly wider: capacity beyond r34 with dense 3x3."""
     WIDTHS = (64, 96, 192, 384, 768)
     BLOCKS = (1, 4, 6, 16, 1)
 
 
 class DepthSegIPMNetV64rvB1(DepthSegIPMNetV64rv):
-    """RepVGG-B1 相当: 明確に r34/r50 超の容量。"""
+    """RepVGG-B1-equivalent: clearly beyond r34/r50 capacity."""
     WIDTHS = (64, 128, 256, 512, 1024)
     BLOCKS = (1, 4, 6, 16, 1)
 
 
 class DepthSegIPMNetV64r34w(DepthSegIPMNetV55):
-    """幅広 r34: basic block のまま幅 x1.25 (80/160/320/640)。torchvision の
-    resnet34 を width スケールで自前構築 (ImageNet init なし — ladder 用)。"""
+    """Wide r34: basic blocks kept, width x1.25 (80/160/320/640). torchvision's
+    resnet34 built by hand with a width scale (no ImageNet init -- for the ladder)."""
 
     def __init__(self, *a, **k):
         super().__init__(*a, **k)
         from torchvision.models.resnet import BasicBlock, ResNet
         rn = ResNet(BasicBlock, [3, 4, 6, 3], width_per_group=64)
-        # torchvision ResNet は width スケール引数を basic に持たないため手動:
+        # torchvision ResNet has no width-scale argument for basic blocks, so by hand:
         def make(cin, cout, n, stride):
-            return _RepVGGStage(cin, cout, n, stride)  # 3x3 スタックで代替
+            return _RepVGGStage(cin, cout, n, stride)  # substitute with a 3x3 stack
         self.stem = nn.Sequential(nn.Conv2d(3, 80, 7, 2, 3, bias=False),
                                   nn.BatchNorm2d(80), nn.ReLU(inplace=True),
                                   nn.MaxPool2d(3, 2, 1))

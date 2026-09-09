@@ -1,18 +1,18 @@
-"""配布時 (INT8/最適化後) の精度を GT に対して測る。
+"""Measure deployment-time (INT8 / post-optimization) accuracy against GT.
 
-同じ指標コードを 2 つの経路で使う:
-  --engine  TensorRT エンジン (Orin 実機。torch 不要)
-  --ckpt    PyTorch の重み (ローカル GPU。基準値づくり)
-どちらも同じフレーム列・同じ GT・同じ判定で測るので、
-「PyTorch -> fp16 -> INT8 -> 各最適化」の劣化を段階ごとに切り分けられる。
+The same metric code is used through two paths:
+  --engine  TensorRT engine (real Orin; no torch needed)
+  --ckpt    PyTorch weights (local GPU; for producing reference values)
+Both measure the same frame sequence, the same GT and the same criteria, so the
+degradation along "PyTorch -> fp16 -> INT8 -> each optimization" can be isolated per stage.
 
-指標:
-  BEV Seg  クラス別 IoU と mIoU (255 は無視)
-  3D Det   車両/VRU の再現率・適合率・位置誤差・yaw 誤差
-           (しきい値を振って、誤検出率を揃えた比較ができるようにする)
+Metrics:
+  BEV Seg  per-class IoU and mIoU (255 ignored)
+  3D Det   vehicle/VRU recall, precision, position error, yaw error
+           (swept over thresholds so comparisons can be made at matched FP rates)
 
-GT の規約: bev_box の npz は [cls, x, y, l, w, yaw] で cls=1 が車両、
-cls=2 が VRU。モデルのヒートマップは 0=車両, 1=VRU なので cls-1 で対応する。
+GT convention: the bev_box npz is [cls, x, y, l, w, yaw] with cls=1 = vehicle,
+cls=2 = VRU. The model heatmap is 0=vehicle, 1=VRU, so cls-1 maps between them.
 """
 import argparse
 import json
@@ -27,14 +27,14 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 CAMS = ["CAM_FRONT_WIDE", "CAM_FRONT_LEFT", "CAM_FRONT_RIGHT",
         "CAM_BACK_WIDE", "CAM_BACK_LEFT", "CAM_BACK_RIGHT",
         "CAM_FRONT_NARROW", "CAM_BACK_NARROW"]
-SEG_NAMES = ["背景", "road", "sidewalk", "crosswalk", "laneline",
+SEG_NAMES = ["background", "road", "sidewalk", "crosswalk", "laneline",
              "stopline", "road_edge", "marking", "parking"]
 THS = [0.15, 0.25, 0.35, 0.45]
-MATCH_R = 2.0                       # GT と予測の対応付け半径 [m]
+MATCH_R = 2.0                       # GT-to-prediction matching radius [m]
 
 
 def frames(root, scenes, n_cams, stride, limit):
-    """(imgs uint8, K, Tc, v0, pose, gt_seg, boxes) を順に返す。"""
+    """Yield (imgs uint8, K, Tc, v0, pose, gt_seg, boxes) in order."""
     got = 0
     for s in scenes:
         d = os.path.join(root, s)
@@ -45,7 +45,7 @@ def frames(root, scenes, n_cams, stride, limit):
         cams = [c for c in CAMS[:n_cams] if c in m["cams"]]
         if len(cams) < n_cams:
             continue
-        # シーンの端は蓄積 LiDAR が無く GT が弱いので、学習側と同じく落とす
+        # scene edges have no accumulated LiDAR and weak GT; drop them as training does
         fr = m["frames"]
         if len(fr) > 20:
             fr = fr[3:len(fr) - 10]
@@ -63,7 +63,7 @@ def frames(root, scenes, n_cams, stride, limit):
             if gt is None:
                 continue
             K = np.stack([np.array(m["cams"][c]["K"], np.float32) for c in cams])
-            # マニフェストは T_ego_cam を持つので反転して T_cam_ego にする
+            # the manifest holds T_ego_cam, so invert it to get T_cam_ego
             Tc = np.stack([np.linalg.inv(np.array(m["cams"][c]["T_ego_cam"],
                                                   np.float32))
                            for c in cams])
@@ -86,7 +86,7 @@ def frames(root, scenes, n_cams, stride, limit):
 
 
 def seg_update(conf, pred, gt):
-    """pred/gt は同じ大きさのクラス index マップ。255 は無視。"""
+    """pred/gt are class-index maps of the same size. 255 is ignored."""
     h = min(pred.shape[0], gt.shape[0])
     p, g = pred[:h].ravel(), gt[:h].ravel()
     ok = g != 255
@@ -98,16 +98,16 @@ def seg_update(conf, pred, gt):
 
 def det_update(acc, dets, boxes, xf, xr):
     """dets: [(cls, score, x, y, l, w, yaw)], boxes: GT [cls,x,y,l,w,yaw]."""
-    for ci, gcls in ((0, 1), (1, 2)):                    # 0=車両, 1=VRU
-        # 判定窓は従来計測と同じ (前 50 m / 後 20 m, 半径 50 m 以内)。
-        # ここを広げると遠方の難しい箱が入って再現率が実力より低く出る。
+    for ci, gcls in ((0, 1), (1, 2)):                    # 0=vehicle, 1=VRU
+        # The evaluation window matches the legacy measurement (50 m front / 20 m rear, radius <= 50 m).
+        # Widening it pulls in hard far-away boxes and recall comes out below the true ability.
         gt = []
         for b in boxes:
             if int(b[0]) != gcls or float(b[3]) <= 0:
                 continue
             x, y = float(b[1]), float(b[2])
             r = (x * x + y * y) ** 0.5
-            # 2026-08-18: 後方 20 m 固定も旧測定の残骸。格子の実範囲で判定する
+            # 2026-08-18: the fixed 20 m rear is also a legacy-measurement leftover; judge by the grid's actual extent
             if x > 78 or x < -(xr - 2.0) or r > 78:
                 continue
             gt.append(b)
@@ -141,7 +141,7 @@ def new_acc():
 
 
 def report(conf, acc, nfr, tag):
-    print(f"\n===== {tag} ({nfr} フレーム) =====")
+    print(f"\n===== {tag} ({nfr} frames) =====")
     inter = np.diag(conf).astype(np.float64)
     union = conf.sum(1) + conf.sum(0) - np.diag(conf)
     iou = np.where(union > 0, inter / np.maximum(union, 1), np.nan)
@@ -149,20 +149,20 @@ def report(conf, acc, nfr, tag):
     print(f"BEV Seg mIoU={np.nanmean(iou[present]):.3f}  " +
           "  ".join(f"{SEG_NAMES[i]}={iou[i]:.3f}"
                     for i in range(len(iou)) if present[i]))
-    for ci, nm in ((0, "車両"), (1, "VRU")):
+    for ci, nm in ((0, "vehicle"), (1, "VRU")):
         g = acc[ci]["gt"]
         if not g:
             continue
-        print(f"  {nm} (GT {g} 箱)")
+        print(f"  {nm} (GT {g} boxes)")
         for t in THS:
             a = acc[ci][t]
             r = a["hit"] / max(g, 1)
             p = a["hit"] / max(a["hit"] + a["fp"], 1)
             pos = np.median(a["pos"]) if a["pos"] else float("nan")
             yaw = np.median(a["yaw"]) if a["yaw"] else float("nan")
-            print(f"    th={t:.2f}  再現率 {r:5.3f}  適合率 {p:5.3f}  "
-                  f"誤検出/フレーム {a['fp'] / max(nfr, 1):5.2f}  "
-                  f"位置誤差 {pos:.2f}m  yaw {yaw:5.1f}度")
+            print(f"    th={t:.2f}  recall {r:5.3f}  precision {p:5.3f}  "
+                  f"FP/frame {a['fp'] / max(nfr, 1):5.2f}  "
+                  f"pos err {pos:.2f}m  yaw {yaw:5.1f}deg")
 
 
 def main():
@@ -175,7 +175,7 @@ def main():
     ap.add_argument("--stride", type=int, default=4)
     ap.add_argument("--limit", type=int, default=150)
     ap.add_argument("--scenes-file",
-                    help="評価するシーン名の一覧 (Orin と同一フレームで測るため)")
+                    help="list of scene names to evaluate (to measure the same frames as Orin)")
     ap.add_argument("--tag", default="")
     a = ap.parse_args()
 
@@ -201,8 +201,8 @@ def main():
             if lane.ndim == 3:
                 lane = lane.argmax(0)
             seg_update(conf, lane.astype(np.int64), gt.astype(np.int64))
-            # ランタイムの decode_boxes は dict を返すので、指標側の
-            # (クラス番号, スコア, x, y, l, w, yaw) に揃える。
+            # The runtime's decode_boxes returns dicts; convert to the metric
+            # side's (class index, score, x, y, l, w, yaw) tuples.
             dets = [(0 if d["cls"] == "vehicle" else 1, d["score"],
                      d["x"], d["y"], d["l"], d["w"], d["yaw"])
                     for d in decode_boxes(o["hm"], o["reg"], thresh=min(THS))]

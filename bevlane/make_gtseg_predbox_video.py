@@ -1,9 +1,9 @@
-"""GT の BEV Seg ラスタに推論 BBox を重ねた検証動画 (単一パネル)。
+"""Verification video overlaying predicted BBoxes on the GT BEV Seg raster (single panel).
 
-土台 = GT (gt_cons) のレーン地図。そこに
-  黄 = 推論 3D BBox / 白 = GT 3D BBox
-だけを描く。推論箱が GT レーンの車線中央に収まるか (=箱は正しいか) を
-GT 地図の上で直接確認するための映像。
+Base = the GT (gt_cons) lane map. On top, draw only
+  yellow = predicted 3D BBox / white = GT 3D BBox
+so that whether predicted boxes sit in the lane center of the GT lanes (= are the boxes
+right) can be checked directly on the GT map.
 """
 import argparse
 import os
@@ -81,7 +81,7 @@ for si, s in enumerate(scenes):
             r = int((80.0 - x_m) / 0.2)
             if 0 <= r < img.shape[0]:
                 cv2.line(img, (0, r), (img.shape[1], r), (80, 80, 80), 1)
-        # 自車マーク
+        # ego marker
         cv2.drawMarker(img, (250, 400), (0, 255, 0),
                        cv2.MARKER_TRIANGLE_UP, 14, 2)
         head = np.zeros((52, img.shape[1], 3), np.uint8)
@@ -96,7 +96,7 @@ for si, s in enumerate(scenes):
                                  a.fps, (frame.shape[1], frame.shape[0]))
         vw.write(frame)
         n_out += 1
-    print(f"scene {si+1}/{len(scenes)} {s} 済 (計 {n_out} フレーム)",
+    print(f"scene {si+1}/{len(scenes)} {s} done ({n_out} frames total)",
           flush=True)
 if vw is not None:
     vw.release()

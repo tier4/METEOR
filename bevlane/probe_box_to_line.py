@@ -1,8 +1,8 @@
-"""GT 車両箱の中心から最寄りレーン線までの横距離: 予測線 vs GT 線。
+"""Lateral distance from GT vehicle box centers to the nearest lane line: predicted lines vs GT lines.
 
-車線中央を走る車両なら線まで ~1.5-1.7 m のはず。予測線でこの距離が
-0.3-0.5 m 程度に潰れていれば「箱がレーン線スレスレに見える」を定量的に
-裏付けられる (箱は正しく、線の位置がずれている)。
+A vehicle in the lane center should be ~1.5-1.7 m from the line. If that distance
+collapses to ~0.3-0.5 m for predicted lines, it quantitatively backs the "boxes hug
+the lane line" impression (boxes are right, line position is off).
 """
 import argparse
 import os
@@ -68,8 +68,8 @@ for i in range(0, len(ds), step):
     if done >= a.frames:
         break
 
-print(f"\n=== {a.tag or a.ckpt} 車両箱中心→最寄りレーン線の距離 ({done} 枚) ===")
-print("帯       n(pred/gt)   予測線まで(中央値)   GT線まで(中央値)")
+print(f"\n=== {a.tag or a.ckpt} vehicle box center -> nearest lane line distance ({done} frames) ===")
+print("band     n(pred/gt)   to pred line (median)   to GT line (median)")
 for nm, *_ in BANDS:
     P, G = np.array(d_pred[nm]), np.array(d_gt[nm])
     if len(P) >= 10 and len(G) >= 10:

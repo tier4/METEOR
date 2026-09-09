@@ -1,12 +1,12 @@
-"""BEV Seg の細クラス (laneline/stopline/road_edge) のロジット・バイアスを掃引する。
+"""Sweep the logit bias of the thin BEV Seg classes (laneline/stopline/road_edge).
 
-r61 で「細クラスのロジットから定数を引くと線幅が正しくなり IoU も上がる」
-ことが実測されている (calibrate_seg_bias.py の記録: mIoU +1.5%, laneline
-+10%, 線幅比 3.05->1.07)。その較正が現行ラウンドにも効くのか、効くなら
-どの値が最適かを、適合用と検証用でシーンを分けて確かめる。
+r61 showed that subtracting a constant from the thin-class logits fixes line width
+and raises IoU (calibrate_seg_bias.py record: mIoU +1.5%, laneline +10%,
+width ratio 3.05->1.07). Check whether that calibration still helps the current
+round and which value is optimal, with fit and verify scenes kept separate.
 
-1 フレームにつきロジットを 1 回だけ計算し、候補バイアスごとに argmax を
-取り直すので、掃引を増やしても推論コストは増えない。
+Logits are computed once per frame and the argmax is redone per candidate bias,
+so a larger sweep costs no extra inference.
 """
 import argparse
 import itertools
@@ -20,7 +20,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from bevlane.dataset import BevLaneDataset                        # noqa: E402
 from bevlane.model import MODELS                                  # noqa: E402
 
-NAMES = ["背景", "road", "sidewalk", "crosswalk", "laneline",
+NAMES = ["background", "road", "sidewalk", "crosswalk", "laneline",
          "stopline", "road_edge", "marking", "parking"]
 THIN = [4, 5, 6]                       # laneline / stopline / road_edge
 
@@ -50,7 +50,7 @@ def main():
                        if k in cur and cur[k].shape == v.shape}, strict=False)
 
     C = 9
-    # 適合用 / 検証用でシーンを分ける (較正か過学習かを見分けるため)
+    # split scenes into fit / verify (to tell calibration from overfitting)
     conf = {"fit": {c: torch.zeros(C, C, dtype=torch.long, device="cuda")
                     for c in combos},
             "ver": {c: torch.zeros(C, C, dtype=torch.long, device="cuda")
@@ -102,20 +102,20 @@ def main():
                      float(v[4]), float(v[5]), float(v[6]),
                      area["ver"][cb][0] / max(area["ver"][cb][1], 1)))
     rows.sort(reverse=True)
-    print(f"=== {a.ckpt} ({done} フレーム, 適合/検証で交互分割) ===")
-    print("バイアス(lane/stop/edge)  検証mIoU  適合mIoU  laneline  stopline  "
-          "road_edge  lane面積比")
+    print(f"=== {a.ckpt} ({done} frames, alternating fit/verify split) ===")
+    print("bias(lane/stop/edge)      verify mIoU  fit mIoU  laneline  stopline  "
+          "road_edge  lane area ratio")
     base = [r for r in rows if r[1] == (0.0, 0.0, 0.0)]
     for sc, cb, fmi, i4, i5, i6, ar in rows[:8]:
-        mark = " <- 現状" if cb == (0.0, 0.0, 0.0) else ""
+        mark = " <- current" if cb == (0.0, 0.0, 0.0) else ""
         print(f"  {cb[0]:.2f}/{cb[1]:.2f}/{cb[2]:.2f}        {sc:.4f}   "
               f"{fmi:.4f}   {i4:.4f}    {i5:.4f}    {i6:.4f}     "
               f"{ar:5.2f}{mark}")
     if base and rows[0][1] != (0.0, 0.0, 0.0):
         b0 = base[0]
-        print(f"\n  現状 (0/0/0): 検証mIoU {b0[0]:.4f} laneline {b0[3]:.4f} "
-              f"面積比 {b0[6]:.2f}")
-        print(f"  最良       : 検証mIoU {rows[0][0]:.4f} "
+        print(f"\n  current (0/0/0): verify mIoU {b0[0]:.4f} laneline {b0[3]:.4f} "
+              f"area ratio {b0[6]:.2f}")
+        print(f"  best           : verify mIoU {rows[0][0]:.4f} "
               f"({100*(rows[0][0]-b0[0])/max(b0[0],1e-9):+.1f}%) "
               f"laneline {rows[0][3]:.4f} "
               f"({100*(rows[0][3]-b0[3])/max(b0[3],1e-9):+.1f}%)")

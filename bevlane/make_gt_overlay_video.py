@@ -1,10 +1,10 @@
-"""予測 BEV に GT レーン線・GT 箱を重ねた検証動画。
+"""Verification video overlaying GT lane lines and GT boxes on the predicted BEV.
 
-「他車両が左レーン線スレスレに見える」件の証拠映像:
-  左パネル: 予測 seg + 予測箱(黄) + GT 箱(白)   … デモ動画と同じ見え方
-  右パネル: 同じ予測 seg に GT レーン線(緑)・GT 停止線(赤)を上書き
-右パネルで、白= GT 箱が緑= GT 線の車線中央に収まる一方、予測の白線が
-そこからずれている(=線側の誤差)ことを 1 本の動画で確認できる。
+Evidence video for the "other vehicles hug the left lane line" issue:
+  left panel: predicted seg + predicted boxes (yellow) + GT boxes (white) ... same look as the demo video
+  right panel: same predicted seg with GT lane lines (green) and GT stop lines (red) drawn on top
+In the right panel the white GT boxes sit in the lane center of the green GT lines while
+the predicted white lines are offset from it (= line-side error), all in one video.
 """
 import argparse
 import os
@@ -70,7 +70,7 @@ for si, s in enumerate(scenes):
         gt = np.where(gt == 255, 0, gt).astype(np.uint8)
         base = PALETTE[pred][:, :, ::-1].astype(np.uint8)
         L, R = base.copy(), base.copy()
-        # 右パネル: GT 線を上書き (緑=レーン線, 赤=停止線, 橙=道路端)
+        # right panel: draw GT lines on top (green=lane line, red=stop line, orange=road edge)
         R[gt == 4] = (0, 255, 0)
         R[gt == 5] = (0, 0, 255)
         R[gt == 6] = (0, 165, 255)
@@ -108,7 +108,7 @@ for si, s in enumerate(scenes):
                                  a.fps, (frame.shape[1], frame.shape[0]))
         vw.write(frame)
         n_out += 1
-    print(f"scene {si+1}/{len(scenes)} {s} 済 (計 {n_out} フレーム)",
+    print(f"scene {si+1}/{len(scenes)} {s} done ({n_out} frames total)",
           flush=True)
 if vw is not None:
     vw.release()

@@ -310,14 +310,14 @@ torch.load(ckpt, map_location="cpu")["args"]   # trim_end, val_batch, gt_key, ..
 `[valE2Ed]` prints, every epoch:
 
 ```
-oracle=<best-of-K> (選択ロス +<gap>) 走行=<moving> 停車=<stopped> 等速直進=<CV baseline>
+oracle=<best-of-K> (selection loss +<gap>) moving=<moving> stopped=<stopped> const-vel-straight=<CV baseline>
 ```
 
 - **oracle** — best of the K=3 hypotheses. The gap to ADE is what mode
   *selection* costs; on one round that was about a fifth of the error.
-- **走行 / 停車** — moving (v0 > 2 m/s) and stopped. A quarter of val frames are
+- **moving / stopped** — moving (v0 > 2 m/s) and stopped. A quarter of val frames are
   stationary and they are a different problem.
-- **等速直進** — constant velocity, the do-nothing baseline. On one round the model beat
+- **const-vel-straight** — constant velocity, the do-nothing baseline. On one round the model beat
   it by less than a quarter. Without this column an ADE looks better than it is.
 
 ### Time an engine on an idle GPU

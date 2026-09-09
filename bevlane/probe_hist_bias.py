@@ -1,14 +1,14 @@
-"""時系列メモリ (履歴) が E2E 軌道を右に押していないかをペア比較で測る。
+"""Paired test of whether temporal memory (history) pushes the E2E trajectory to the right.
 
-Orin 実測: 履歴あり −1.15 m / 履歴なし −0.29 m (r64 重み、同一フレーム)。
-同じことを torch でも再現できるなら、原因はエンジンではなく
-履歴ワープ (make_warp_theta / rel_pose) の規約そのもの。
+Orin measurement: with history -1.15 m / without -0.29 m (r64 weights, same frames).
+If torch reproduces this, the cause is not the engine but the history-warp
+convention itself (make_warp_theta / rel_pose).
 
-方法: 同一シーンを時系列順に流し、各フレームで
-  (A) 実履歴 (t-0.4/1.2/2.8s の raw_bev + ego ワープ) を与えた推論
-  (B) ゼロ履歴の推論
-を実行。選択モードの軌道 y (点2/4/6) の平均差 = 履歴が押す量。
-どちらも同じ画像・同じ重みなので、差は履歴経路の寄与だけになる。
+Method: run the same scene in time order and at each frame infer
+  (A) with real history (raw_bev at t-0.4/1.2/2.8 s + ego warp)
+  (B) with zero history
+The mean difference in selected-mode trajectory y (points 2/4/6) = the push from history.
+Same images and weights for both, so the difference is the history path alone.
 """
 import argparse
 import os
@@ -31,8 +31,8 @@ def main():
     ap.add_argument("--root", default="out/bevlane")
     ap.add_argument("--scenes", type=int, default=12)
     ap.add_argument("--offs", default="2,6,14",
-                    help="履歴オフセット (フレーム)。Orin path_orin は stride2 "
-                         "で流すため実効 4,12,28 相当になる仮説の検証用")
+                    help="history offsets (frames). Orin path_orin runs at stride 2, "
+                         "so this tests the hypothesis that the effective offsets are 4,12,28")
     ap.add_argument("--tag", default="")
     a = ap.parse_args()
 
@@ -52,7 +52,7 @@ def main():
         by_scene.setdefault(s, []).append((int(f["frame"]), i))
 
     HOR = [1, 3, 5]
-    ya, yb, dgt = [], [], []          # 履歴あり y / なし y / GT y
+    ya, yb, dgt = [], [], []          # y with history / y without / GT y
     n_hist = 0
     for s, lst in by_scene.items():
         lst.sort()
@@ -126,13 +126,13 @@ def main():
             n_hist += 1
 
     ya, yb, dgt = map(np.array, (ya, yb, dgt))
-    print(f"\n=== {a.tag or a.ckpt} 履歴ペア比較 ({n_hist} 枚) ===")
-    print("(+y = 左 / -y = 右)")
+    print(f"\n=== {a.tag or a.ckpt} history paired comparison ({n_hist} frames) ===")
+    print("(+y = left / -y = right)")
     for j, h in enumerate(HOR):
         d = ya[:, j] - yb[:, j]
-        print(f"[点{h+1}/6] 履歴あり {ya[:, j].mean():+.3f}"
-              f" | 履歴なし {yb[:, j].mean():+.3f}"
-              f" | 差(あり-なし) {d.mean():+.3f}±{d.std():.3f}"
+        print(f"[pt{h+1}/6] with hist {ya[:, j].mean():+.3f}"
+              f" | no hist {yb[:, j].mean():+.3f}"
+              f" | diff(with-no) {d.mean():+.3f}±{d.std():.3f}"
               f" | GT {dgt[:, j].mean():+.3f}")
     print("PROBE_HIST_BIAS_DONE")
 

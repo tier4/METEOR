@@ -1,10 +1,10 @@
-"""BEV 出力の系統的な横ずれを GT 基準で測る (torch 不要、エンジン/ckpt 共用は不可,
-エンジン専用)。指摘「rtv_r73 がやや右にオフセット」の定量化。
+"""Measure systematic lateral offset of BEV outputs against GT (no torch needed; not
+shared engine/ckpt, engine only). Quantifies the report "rtv_r73 is offset slightly right".
 
-  1) 検出箱: GT と 3 m でマッチした車両の (予測 y - GT y) の平均。
-     画面の右 = y 負方向なので、右オフセットなら負の平均が出る。
-  2) 路面ラスタ: lane argmax の road クラスを GT (gt_cons) と列方向に
-     ずらしながら IoU を取り、最良シフトを求める (0.2 m/列)。
+  1) Detection boxes: mean (pred y - GT y) of vehicles matched to GT within 3 m.
+     Screen right = negative y, so a rightward offset yields a negative mean.
+  2) Road raster: shift the road class of lane argmax column-wise against GT
+     (gt_cons), take IoU at each shift, and pick the best (0.2 m/column).
 """
 import argparse, os, sys
 import numpy as np
@@ -46,7 +46,7 @@ for imgs, K, Tc, v0, pose, gt, bx in frames(a.root, scenes, 8, 2, a.limit):
     shifts.append(max(ious)[1])
 dys = np.array(dys); shifts = np.array(shifts)
 print(f"=== {a.tag or a.engine} ===")
-print(f"検出箱の横ずれ (n={len(dys)}): 平均 {dys.mean():+.3f} m / 中央値 {np.median(dys):+.3f} m"
-      f"  (負 = 右へオフセット)")
-print(f"路面ラスタの最良列シフト (n={len(shifts)}): 平均 {shifts.mean():+.2f} 列"
-      f" = {0.2*shifts.mean():+.2f} m (正 = 予測を右へずらすと合う = 予測は左寄り)")
+print(f"box lateral offset (n={len(dys)}): mean {dys.mean():+.3f} m / median {np.median(dys):+.3f} m"
+      f"  (negative = offset to the right)")
+print(f"road raster best column shift (n={len(shifts)}): mean {shifts.mean():+.2f} cols"
+      f" = {0.2*shifts.mean():+.2f} m (positive = shifting pred right fits = pred is left-biased)")

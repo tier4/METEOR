@@ -1,11 +1,11 @@
-"""ego_stem の conv->BN 対だけを再スケールする (2026-08-20)。
+"""Rescale only the conv->BN pairs in ego_stem (2026-08-20).
 
-v98 は INT8 で ego 出力が凍結する (活性 std が fp16 比 4 倍に膨張し
-入力感度を喪失)。原因は ego_stem の BN running_var が v95 の 1.6 倍
-(134->228) にドリフトしたこと。conv->BN のスケールは自由度なので、
-関数を変えずに正規化して INT8 の量子化ステップを有効活用させる。
-全層を触る renorm_convbn.py は lane_branch を s=21 で潰して fp16 誤差を
-増幅したため、ego_stem に限定する。
+v98 freezes its ego output in INT8 (activation std inflates 4x vs fp16 and input
+sensitivity is lost). Cause: the BN running_var in ego_stem drifted to 1.6x that of
+v95 (134->228). The conv->BN scale is a free degree of freedom, so normalize it
+without changing the function and let INT8 use its quantization steps well.
+renorm_convbn.py, which touches every layer, squashed lane_branch with s=21 and
+amplified fp16 error, hence the restriction to ego_stem.
 """
 import argparse
 import torch
@@ -29,8 +29,8 @@ for k in keys:
     if float(var.max()) < a.min_var:
         continue
     base = k[: -len("running_var")]
-    # 直前の conv を探す (同じ親モジュールの .{idx-1} など命名規則に依存
-    # しないよう、weight/bias の形が合う conv を後方から探索)
+    # find the preceding conv (search backwards for a conv whose weight/bias shape
+    # matches, rather than relying on naming like .{idx-1} in the same parent)
     ch = var.numel()
     cand = None
     for j in range(keys.index(k) - 1, -1, -1):
@@ -57,4 +57,4 @@ if "model" in ck:
 else:
     ck = sd
 torch.save(ck, a.out)
-print(f"{n} 対を再スケール -> {a.out}")
+print(f"{n} pairs rescaled -> {a.out}")

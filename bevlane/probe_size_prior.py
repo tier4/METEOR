@@ -1,14 +1,14 @@
 #!/usr/bin/env python3
-"""「箱の画素高から距離を出す」幾何事前が、いまの深度ヘッドより当たるか。
+"""Is the geometric prior "range from box pixel height" more accurate than the current depth head?
 
-paint 系の自己注入が効かない理由は、注入する量が同じバックボーン特徴 f の
-関数だから (情報が増えない)。それに対し Z = f_x * H_real / h_px は
-  - 箱の広がり h_px という **非局所量**
-  - カメラ内部行列の f_x という **特徴写像に無い量**
-から決まるので、深度ヘッドが自力で計算できる量ではない。ここでは投入前に
-「その式が実際どれだけ当たるか」を LiDAR 深度 GT に対して測る。
+Paint-style self-injection fails because the injected quantity is a function of the
+same backbone feature f (no new information). Z = f_x * H_real / h_px, by contrast,
+  - depends on the box extent h_px, a **non-local quantity**
+  - and on the intrinsic f_x, a **quantity absent from the feature map**
+so the depth head cannot compute it on its own. Before adding it, measure how
+accurate that formula really is against LiDAR depth GT.
 
-比較: Z_geo (箱の画素高) 対 Z_pred (深度分布の期待値) 対 Z_gt (LiDAR)。
+Comparison: Z_geo (box pixel height) vs Z_pred (depth-distribution expectation) vs Z_gt (LiDAR).
 """
 import argparse
 import os
@@ -22,7 +22,7 @@ from bevlane.dataset import BevLaneDataset          # noqa: E402
 from bevlane.model import MODELS                    # noqa: E402
 from bevlane.ckpt_load import load_net              # noqa: E402
 
-# 2D instance 10 クラスの実寸高 [m] (箱は画像上の外接矩形なので車高+α)
+# real-world height [m] of the 10 2D instance classes (boxes are image-space AABBs, so vehicle height + a bit)
 H_REAL = {1: 1.55, 2: 3.2, 3: 3.3, 4: 1.7, 5: 1.7, 6: 1.7}
 BANDS = ((0, 20), (20, 40), (40, 60), (60, 80))
 
@@ -44,7 +44,7 @@ def main():
                         gt_key="gt_cons", max_per_scene=a.per_scene, n_cams=8,
                         with_depth=True, with_bbox2d=True)
     x0 = ds[0]
-    print(f"[ds] 要素数 {len(x0)}: " +
+    print(f"[ds] {len(x0)} elements: " +
           ", ".join(str(tuple(t.shape)) for t in x0 if torch.is_tensor(t)))
 
     D_MIN, D_STEP = net.D_MIN, net.D_STEP
@@ -57,7 +57,7 @@ def main():
             continue
         img, K, T, _gt, dgt, b2, c2 = x[0], x[1], x[2], x[3], x[4], x[-2], x[-1]
         if dgt.dim() != 3:
-            print("[skip] 深度 GT の形が想定外", dgt.shape)
+            print("[skip] unexpected depth GT shape", dgt.shape)
             break
         with torch.no_grad(), torch.autocast("cuda", torch.float16):
             out = net(img[None].to(dev), K[None].to(dev), T[None].to(dev))
@@ -91,16 +91,16 @@ def main():
                 err[band]["geo"].append(abs(z_geo - z_gt))
                 err[band]["pred"].append(abs(z_pr - z_gt))
 
-    print("\n物体中心での距離誤差の中央値 [m] (GT 2D 箱を使った上限性能)")
-    print("   帯域      n    幾何 Z_geo   深度ヘッド Z_pred   勝者")
+    print("\nmedian range error at object centers [m] (upper bound using GT 2D boxes)")
+    print("   band      n    geom Z_geo   depth head Z_pred   winner")
     for b in BANDS:
         g, p_ = err[b]["geo"], err[b]["pred"]
         if not g:
             continue
         mg, mp = float(np.median(g)), float(np.median(p_))
-        win = "幾何" if mg < mp else "深度ヘッド"
+        win = "geom" if mg < mp else "depth head"
         print(f"  {b[0]:>2}-{b[1]:<2}m  {len(g):>4}   {mg:>7.2f}      "
-              f"{mp:>7.2f}        {win} ({abs(mg-mp):.2f} m 差)")
+              f"{mp:>7.2f}        {win} ({abs(mg-mp):.2f} m diff)")
 
 
 if __name__ == "__main__":

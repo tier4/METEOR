@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""2D BBox を低閾値でダンプ (閾値掃引用, 2026-09-06)。使い方: python3 det2d_dump.py <engine> <root> <out.json> [stride]"""
+"""Dump 2D BBoxes at a low threshold (for threshold sweeps, 2026-09-06). Usage: python3 det2d_dump.py <engine> <root> <out.json> [stride]"""
 import sys, os, json, numpy as np, cv2
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from deploy.runtime import MeteorRT

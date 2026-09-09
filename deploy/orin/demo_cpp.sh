@@ -1,5 +1,5 @@
 #!/bin/bash
-# C++ ランタイム版デモ (2026-09-06)。demo.sh と同じ既定 (valday, TH2D 0.30, パネル省略, 10 fps 録画)。
+# C++ runtime demo (2026-09-06). Same defaults as demo.sh (valday, TH2D 0.30, panel omitted, 10 fps recording).
 #   ./demo_cpp.sh [ROOT=valday] [LIMIT=0] [OUT=out/demo_cpp_<root>.mp4]
 cd ~/meteor
 ROOT=${1:-valday}; LIMIT=${2:-0}; OUT=${3:-out/demo_cpp_${ROOT}.mp4}

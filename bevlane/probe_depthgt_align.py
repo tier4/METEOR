@@ -1,13 +1,13 @@
-"""depth_gt4n (望遠 2 台の深度教師) が GT 箱と整合しているかを検証する。
+"""Verify that depth_gt4n (depth labels for the 2 telephoto cameras) agrees with the GT boxes.
 
-v1 は全カメラで |差| 16-27 m と出た: これは教師ではなく検証側の投影が
-壊れている値 (FRONT_WIDE ですら 25 m)。外部パラメータの向き (T_ego_cam が
-ego->cam か cam->ego か) と深度の定義 (z 深度か光線距離か) を仮定せず、
-既知の正解 (前方カメラには前方の点が写る) で規約を自動判定してから測る。
+v1 gave |diff| 16-27 m on every camera: that is a broken projection on the checking
+side, not the labels (even FRONT_WIDE was 25 m). Instead of assuming the extrinsic
+direction (T_ego_cam as ego->cam or cam->ego) or the depth definition (z depth vs
+ray distance), auto-detect the convention from a known fact (front cams see points ahead).
 
-occlusion 対策: 箱中心の画素が手前の別車で隠れることがあるので、
-|差| < 4 m を「整合」とみなし、整合率と整合集合の系統ずれを報告する。
-教師のずれは「整合集合の中央値の前後差」に現れる。
+Occlusion: the box-center pixel may be hidden by a nearer vehicle, so
+|diff| < 4 m counts as consistent; report the consistent fraction and its systematic bias.
+A label offset shows up as a front/rear difference in the consistent-set median.
 """
 import argparse
 import json
@@ -22,8 +22,8 @@ DS = 4
 
 
 def pick_convention(M, K, is_front):
-    """ego->cam 行列を返す。前方カメラなら (20,0,1)、後方なら (-20,0,1) が
-    Z>0 かつ画像内に入る向きを選ぶ。"""
+    """Return the ego->cam matrix. Pick the direction for which (20,0,1) for front cams,
+    (-20,0,1) for rear cams, lands at Z>0 and inside the image."""
     p = np.array([20.0 if is_front else -20.0, 0.0, 1.0, 1.0])
     for cand in (M, np.linalg.inv(M)):
         q = cand @ p
@@ -45,7 +45,7 @@ def main():
     a = ap.parse_args()
 
     scenes = [l.strip() for l in open(a.list) if l.strip()][:a.scenes]
-    # (カメラ, 深度定義) 別の差分。定義: "z" = z 深度, "ray" = 光線距離
+    # diffs per (camera, depth definition). "z" = z depth, "ray" = ray distance
     diffs = {(c, m): [] for c in CHECK for m in ("z", "ray")}
     conv_note = {}
     nfr = 0
@@ -68,7 +68,7 @@ def main():
                 break
             Ms[c], Ks[c] = M, K
             conv_note.setdefault(c, "inv" if not np.allclose(
-                M, np.array(man["cams"][c]["T_ego_cam"])) else "そのまま")
+                M, np.array(man["cams"][c]["T_ego_cam"])) else "as-is")
         if not ok:
             continue
         fr = man["frames"]
@@ -117,10 +117,10 @@ def main():
         if nfr >= a.frames:
             break
 
-    print(f"=== 外部パラメータの規約判定 ===")
+    print(f"=== extrinsic convention detection ===")
     for c, note in conv_note.items():
-        print(f"  {c:<20} T_ego_cam を {note} 使用")
-    # 深度の定義は FRONT_WIDE の整合率が高い方を採用し、全カメラに適用
+        print(f"  {c:<20} T_ego_cam used {note}")
+    # depth definition: take whichever gives FRONT_WIDE the higher consistent fraction, apply to all cams
     def inl(v):
         v = np.array(v)
         m = np.abs(v) < 4.0
@@ -128,16 +128,16 @@ def main():
     fz, _ = inl(diffs[("CAM_FRONT_WIDE", "z")])
     fray, _ = inl(diffs[("CAM_FRONT_WIDE", "ray")])
     mode = "z" if fz >= fray else "ray"
-    print(f"\n深度の定義: {'z 深度' if mode == 'z' else '光線距離'} を採用 "
-          f"(FRONT_WIDE の整合率 z={100*fz:.0f}% / ray={100*fray:.0f}%)")
+    print(f"\ndepth definition: using {'z depth' if mode == 'z' else 'ray distance'} "
+          f"(FRONT_WIDE consistent fraction z={100*fz:.0f}% / ray={100*fray:.0f}%)")
 
-    print(f"\n=== 深度教師と GT 箱距離の整合 ({nfr} フレーム, 15-45 m の車両) ===")
-    print("カメラ                 n    整合率(|差|<4m)  整合集合の系統ずれ")
-    print("  ※ LiDAR は車体の手前面に当たるため -1〜-2 m の負が正常")
+    print(f"\n=== depth labels vs GT box range ({nfr} frames, vehicles at 15-45 m) ===")
+    print("camera                 n    consistent(|d|<4m)  bias of consistent set")
+    print("  note: LiDAR hits the near face of the body, so -1 to -2 m is normal")
     for c in CHECK:
         v = np.array(diffs[(c, mode)])
         if len(v) < 10:
-            print(f"  {c:<20} {len(v):5d}  標本不足")
+            print(f"  {c:<20} {len(v):5d}  too few samples")
             continue
         frac, iv = inl(v)
         print(f"  {c:<20} {len(v):5d}   {100*frac:5.1f}%          "

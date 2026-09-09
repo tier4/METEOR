@@ -1,9 +1,9 @@
-"""1 フレームの pred BEV と GT を並べて描く検証画像。
+"""Verification image showing the pred BEV and GT of one frame side by side.
 
-左: 予測 seg + 予測箱(黄) + GT 箱(白)
-右: GT ラスタ + 同じ箱
-「他車両が左レーン線スレスレ」に見える現象が pred / GT のどちら由来かを
-目視で確定する。
+Left: predicted seg + predicted boxes (yellow) + GT boxes (white)
+Right: GT raster + the same boxes
+Settles by eye whether the "other vehicles hug the left lane line" effect comes
+from pred or from GT.
 """
 import argparse
 import os
@@ -86,5 +86,5 @@ for fi in a.frames:
     cat = np.concatenate([L, np.full((L.shape[0], 6, 3), 60, np.uint8), R], 1)
     p = f"{a.out}_{fi:03d}.png"
     cv2.imwrite(p, cat)
-    print("saved", p, f"(pred箱={len(dets)} GT箱={nb})")
+    print("saved", p, f"(pred boxes={len(dets)} GT boxes={nb})")
 print("VIZ_DONE")

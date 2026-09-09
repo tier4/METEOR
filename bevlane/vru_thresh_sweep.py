@@ -56,7 +56,7 @@ def run(tag, ckpt, model, n_cams, scenes, THRESH=0.25):
         det_by_cls = {0: [], 1: []}
         for d in dets:
             det_by_cls[int(d[0])].append((d[2], d[3], d[1]))
-        # precision 側: 各検出が GT (前方窓) に 2m 以内でマッチするか
+        # precision side: does each detection match a GT (front window) within 2 m
         gt_by_cls = {0: [], 1: []}
         for k in range(max(int(b[bx_idx + 1]), 0)):
             cls_, xe_, ye_, l_ = [float(v) for v in b[bx_idx][k][:4]]

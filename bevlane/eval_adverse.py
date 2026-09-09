@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
-"""悪条件 (Cosmos transfer_2) での汎化評価。
+"""Generalization evaluation under adverse conditions (Cosmos transfer_2).
 
-問い: Cosmos データを学習に混ぜると、悪条件への頑健性は上がるのか。
-通常条件の val では v116a (実データのみ) 対 v116c (+Cosmos) は score が
-0.351 対 0.348 とむしろ僅差で負けており、Cosmos の本来の狙い (悪条件の
-頑健化) は晴天中心の val では測れない。ここでは**完全未見の 2 ベース
-シーン × 6 悪条件** (transfer_2、変換画像は全モデル未学習) で測る。
+Question: does mixing Cosmos data into training improve robustness to adverse conditions?
+On the normal-condition val, v116a (real data only) vs v116c (+Cosmos) scores
+0.351 vs 0.348, a slight loss; the real goal of Cosmos (adverse-condition
+robustness) cannot be measured on a mostly-clear val. Here we measure on **2 fully
+unseen base scenes x 6 adverse conditions** (transfer_2; no model saw the converted images).
 
-指標: BEV Seg mIoU (走行面/レーン系) と 車両 recall (3m マッチ)。
+Metrics: BEV Seg mIoU (drivable surface / lane classes) and vehicle recall (3 m match).
 """
 import argparse
 import json
@@ -33,6 +33,8 @@ def main():
     ap.add_argument("--scenes", nargs="+", required=True)
     ap.add_argument("--stride", type=int, default=3)
     ap.add_argument("--tag", default="")
+    ap.add_argument("--lidar", action="store_true",
+                    help="feed the scene's lidar_bev/NNNN.npz (pillar raster) as optional input (LiDAR-ON evaluation, 2026-09-09)")
     a = ap.parse_args()
 
     net = MODELS["v52"](n_seg=21).cuda().eval()
@@ -47,8 +49,17 @@ def main():
         x = ds[i]
         if x is None:
             continue
+        lb = None
+        if a.lidar:
+            s_, f_ = ds.items[i]
+            lp = f_.get("lidar_bev") or f"lidar_bev/{int(f_['frame']):04d}.npz"
+            try:
+                lb = torch.from_numpy(np.load(os.path.join(a.root, s_, lp))["lb"].astype(np.float32))[None].cuda()
+            except Exception:
+                lb = None
         with torch.no_grad(), torch.autocast("cuda", torch.float16):
-            out = net(x[0][None].cuda(), x[1][None].cuda(), x[2][None].cuda())
+            out = net(x[0][None].cuda(), x[1][None].cuda(), x[2][None].cuda(),
+                      **({"lidar_bev": lb} if lb is not None else {}))
         p = out[0].float().argmax(1)[0].cpu().numpy()
         g = x[3].numpy()
         valid = g != 255
@@ -57,7 +68,7 @@ def main():
             gm = np.isin(g, ks) & valid
             inter[nm] += int((pm & gm).sum())
             union[nm] += int((pm | gm).sum())
-        # 車両 recall (bev_box GT, 3m)
+        # vehicle recall (bev_box GT, 3m)
         bx, nb = x[4], int(x[5])
         dets = net.decode_boxes(out[3].float().cpu(), out[4].float().cpu(),
                                 thresh=0.25)[0]

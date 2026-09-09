@@ -1,12 +1,12 @@
-"""paint-seg 経路の Gather をpaint_proj Conv に畳み込む (2026-08-27)。
+"""Fold the paint-seg path Gather into the paint_proj Conv (2026-08-27).
 
-Orin プロファイルで Softmax+Gather が Myelin ForeignNode に固まり、その
-入出力 Reformat が 3.78 + 0.69x3 ms を食っていた。Gather(axis=1, 定数
-インデックス) + 1x1 Conv は「入力チャネルを並べ替えた 1x1 Conv」と恒等
-なので、paint_proj の重みを [96, 8] -> [96, C_full] (未選択列ゼロ) に
-拡張して Gather/Cast_1/Constant を削除する。数学的に同値・精度影響ゼロ。
+In the Orin profile Softmax+Gather froze into a Myelin ForeignNode whose
+in/out Reformats ate 3.78 + 0.69x3 ms. Gather(axis=1, constant
+indices) + 1x1 Conv is identical to "a 1x1 Conv with permuted input channels",
+so we expand the paint_proj weight [96, 8] -> [96, C_full] (unselected columns
+zero) and delete Gather/Cast_1/Constant. Mathematically equivalent, zero accuracy impact.
 
-使い方: python3 deploy/fold_paint_gather.py <in.onnx> <out.onnx>
+Usage: python3 deploy/fold_paint_gather.py <in.onnx> <out.onnx>
 """
 import sys
 
@@ -26,9 +26,9 @@ pp = nodes["/net/paint_proj/Conv"]
 const = next(n for n in g.node if ga.input[1] in n.output)
 idx = numpy_helper.to_array(next(a.t for a in const.attribute
                                  if a.name == "value"))
-sm_out = ga.input[0]                      # Softmax_1 の出力
+sm_out = ga.input[0]                      # output of Softmax_1
 
-# softmax のチャネル数 = softmax へ至る conv の出力チャネル (確実な出所)
+# softmax channel count = output channels of the conv feeding it (reliable source)
 prod = {o: n for n in g.node for o in n.output}
 cur = prod[sm_out]                       # Softmax_1
 while cur.op_type != "Conv":
@@ -48,7 +48,7 @@ for i, t in enumerate(g.initializer):
         g.initializer.insert(i, new_w)
         break
 
-pp.input[0] = sm_out                       # Cast_1 を飛ばして直結
+pp.input[0] = sm_out                       # skip Cast_1, connect directly
 for n in (ga, c1, const):
     g.node.remove(n)
 onnx.save(m, dst)

@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-"""ReLU 出力の外れ値比 (max / p99.9) を測る。PACT の効きを見る中間チェック用。
+"""Measure the outlier ratio (max / p99.9) of ReLU outputs. Intermediate check on PACT effectiveness.
 
-per-tensor の INT8 スケールは max で決まるので、この比が大きい層ほど
-本体の信号が潰れる。「INT8 実効段階数 = 127 / 比」が実質の分解能。
+The per-tensor INT8 scale is set by the max, so the larger this ratio, the more the
+main signal is crushed. Effective INT8 steps = 127 / ratio is the real resolution.
 """
 import argparse
 import os
@@ -24,9 +24,9 @@ def main():
     ap.add_argument("--list", default="val.lst")
     ap.add_argument("--frames", type=int, default=16)
     ap.add_argument("--scenes", type=int, default=12)
-    ap.add_argument("--prefix", default="", help="この接頭辞の層だけ表示")
-    ap.add_argument("--pact", default="", help="PACT を有効化する層 (ckpt に "
-                                               "alpha があるなら不要)")
+    ap.add_argument("--prefix", default="", help="show only layers with this prefix")
+    ap.add_argument("--pact", default="", help="layers to enable PACT on (not needed if "
+                                               "the ckpt has alpha)")
     ap.add_argument("--root", default="out/bevlane")
     a = ap.parse_args()
 
@@ -37,7 +37,7 @@ def main():
         pats = sorted({k.rsplit(".alpha", 1)[0] for k in sd
                        if k.endswith(".alpha") and "lid_alpha" not in k})
         net.enable_pact(pats, alpha_init={}, verbose=False)
-        print(f"[probe] ckpt に alpha あり -> {len(pats)} 層を PACT 化して読む")
+        print(f"[probe] ckpt has alpha -> loading {len(pats)} layers as PACT")
     elif a.pact:
         net.enable_pact(a.pact, alpha_init={}, verbose=False)
     load_net(net, a.ckpt, verbose=False)
@@ -79,8 +79,8 @@ def main():
         mx, p = float(np.mean(d["max"])), float(np.mean(d["p999"]))
         rows.append((mx / max(p, 1e-6), p, mx, alphas.get(n), n))
     rows.sort(reverse=True)
-    print(f"\n{c} フレーム / {len(rows)} 層。外れ値比 = max / p99.9")
-    print(f"{'比':>7} {'INT8実効段':>10} {'p99.9':>9} {'max':>9} {'alpha':>9}  層")
+    print(f"\n{c} frames / {len(rows)} layers. outlier ratio = max / p99.9")
+    print(f"{'ratio':>7} {'INT8 steps':>10} {'p99.9':>9} {'max':>9} {'alpha':>9}  layer")
     for r in rows[:20]:
         al = f"{r[3]:9.2f}" if r[3] is not None else "        -"
         print(f"{r[0]:>7.1f} {127 / max(r[0], 1e-9):>10.1f} {r[1]:>9.2f} "

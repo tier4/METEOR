@@ -290,7 +290,7 @@ int main(int argc, char** argv) {
     double mean = 0;
     for (double x : ts) mean += x;
     mean /= ts.size();
-    std::printf("[bench C++] %s: 中央値 %.1f ms  平均 %.1f ms  (n=%d, graph=%s, "
+    std::printf("[bench C++] %s: median %.1f ms  mean %.1f ms  (n=%d, graph=%s, "
                 "zero-copy in, out_slots=%d)\n",
                 engine.c_str(), median(ts), mean, bench,
                 rt.graphActive() ? "on" : "off", N_SLOTS);

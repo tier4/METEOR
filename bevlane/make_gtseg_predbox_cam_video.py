@@ -1,10 +1,10 @@
-"""GT BEV Seg + 推論/GT BBox に FRONT_WIDE / FRONT_NARROW を並べた検証動画。
+"""Verification video: GT BEV Seg + predicted/GT BBoxes alongside FRONT_WIDE / FRONT_NARROW.
 
-左列: FRONT_WIDE (上) / FRONT_NARROW (下) に 3D 箱を投影
-      (黄 = 推論、白 = GT。z=0 接地・高さ 1.8 m の近似ワイヤーフレーム)
-右列: GT BEV Seg + 同じ箱
-「GT Seg 上でも箱が左車線寄りに見える」件を、実画像の車両位置と
-突き合わせて確認するための映像。
+Left column: 3D boxes projected onto FRONT_WIDE (top) / FRONT_NARROW (bottom)
+      (yellow = prediction, white = GT; approximate wireframe grounded at z=0, 1.8 m tall)
+Right column: GT BEV Seg + the same boxes
+Cross-checks the "boxes look left-of-lane even on GT Seg" issue against the
+vehicle positions in the real images.
 """
 import argparse
 import json
@@ -55,12 +55,12 @@ def corners3d(xe, ye, ln, wd, yw, h):
         x, y = xe + c * dx - s2 * dy, ye + s2 * dx + c * dy
         pts.append((x, y, 0.0))
         pts.append((x, y, h))
-    return np.array(pts)                       # [8,3] 下上交互
+    return np.array(pts)                       # [8,3] alternating bottom/top
 
 
-EDGES = [(0, 2), (2, 4), (4, 6), (6, 0),       # 底面
-         (1, 3), (3, 5), (5, 7), (7, 1),       # 天面
-         (0, 1), (2, 3), (4, 5), (6, 7)]       # 柱
+EDGES = [(0, 2), (2, 4), (4, 6), (6, 0),       # bottom face
+         (1, 3), (3, 5), (5, 7), (7, 1),       # top face
+         (0, 1), (2, 3), (4, 5), (6, 7)]       # pillars
 
 
 def draw_cam_box(img, pts_ego, K, T_cam_ego, col, th=2):
@@ -121,7 +121,7 @@ for si, s in enumerate(scenes):
             cls, xe, ye, ln, wd, yw = [float(v) for v in bx[k][:6]]
             if ln > 0 and cls < 1.5:
                 gt_boxes.append([xe, ye, ln, wd, yw])
-        # --- カメラパネル
+        # --- camera panel
         cam_imgs = []
         fmeta = frames_by_fi[fi]
         for c in CAM2:
@@ -141,7 +141,7 @@ for si, s in enumerate(scenes):
                         cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
             cam_imgs.append(im)
         cam_col = np.concatenate(cam_imgs, 0)          # 768x864
-        # --- BEV パネル (GT seg)
+        # --- BEV panel (GT seg)
         gt = b[3].numpy()
         gt = np.where(gt == 255, 0, gt).astype(np.uint8)
         bev = PALETTE[gt][:, :, ::-1].astype(np.uint8).copy()
@@ -155,7 +155,7 @@ for si, s in enumerate(scenes):
                 cv2.line(bev, (0, r), (bev.shape[1], r), (80, 80, 80), 1)
         cv2.drawMarker(bev, (250, 400), (0, 255, 0),
                        cv2.MARKER_TRIANGLE_UP, 14, 2)
-        # --- 合成
+        # --- compose
         H = max(cam_col.shape[0], bev.shape[0])
         canvas = np.zeros((H + 52, cam_col.shape[1] + bev.shape[1] + 8, 3),
                           np.uint8)
@@ -171,7 +171,7 @@ for si, s in enumerate(scenes):
                                  a.fps, (canvas.shape[1], canvas.shape[0]))
         vw.write(canvas)
         n_out += 1
-    print(f"scene {si+1}/{len(scenes)} {s} 済 (計 {n_out} フレーム)",
+    print(f"scene {si+1}/{len(scenes)} {s} done ({n_out} frames total)",
           flush=True)
 if vw is not None:
     vw.release()

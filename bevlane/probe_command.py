@@ -1,13 +1,13 @@
-"""運転コマンドが軌道を動かしているか、K=3 モードが分離しているかを測る。
+"""Measure whether the driving command moves the trajectory and whether the K=3 modes separate.
 
-参照実装 (VLA 版 eval_vla_command.py) と同じ問い方をする:
-  直進する GT フレームに「左」「右」コマンドを強制入力し、3 秒後の横変位を見る。
-  コマンドが効いていれば、その場面が直進を許していても横に押されるはず。
-  参照実装の CNN 目標は 1 m 以上、モード結合前の実測は 0.2 m。
+Same question as the reference implementation (VLA eval_vla_command.py):
+  force a left / right command on straight-driving GT frames and read the lateral offset at 3 s.
+  If the command works, the path should be pushed sideways even where the scene allows straight.
+  Reference CNN target is >= 1 m; measured 0.2 m before mode fusion.
 
-あわせて選択器の健全性も測る:
-  モード間の距離 (3 本が似ていないか)、選択の的中率 (最良モードを選べているか)、
-  選択ロス (選んだモードの誤差 - 最良モードの誤差)。
+Also checks selector health:
+  spread between modes (are the 3 distinct), selection hit rate (is the best mode picked),
+  selection loss (error of the chosen mode - error of the best mode).
 """
 import argparse
 import os
@@ -32,7 +32,7 @@ def main():
     ap.add_argument("--scenes", type=int, default=60)
     ap.add_argument("--frames", type=int, default=200)
     ap.add_argument("--straight", type=float, default=0.5,
-                    help="直進とみなす 3 秒後横変位の上限 [m]")
+                    help="max lateral offset at 3 s to count as straight [m]")
     ap.add_argument("--tag", default="")
     a = ap.parse_args()
 
@@ -46,7 +46,7 @@ def main():
     m.load_state_dict({k: v for k, v in sd.items()
                        if k in cur and cur[k].shape == v.shape}, strict=False)
 
-    CMD = {"コマンド無し": None, "直進": 0, "左": 1, "右": 2}
+    CMD = {"none": None, "straight": 0, "left": 1, "right": 2}
     lat = {k: [] for k in CMD}
     mode_sel = {k: [] for k in CMD}
     spread, sel_gap, sel_hit = [], [], []
@@ -56,12 +56,12 @@ def main():
         b = ds[i]
         if b is None:
             continue
-        # ego GT: 先頭 12 要素が 6 点の (x,y)。最終点の横位置で直進判定
+        # ego GT: first 12 elements are 6 (x,y) points. Straight = lateral position of the last point
         eg = b[4] if len(b) > 4 and torch.is_tensor(b[4]) and b[4].numel() >= 12 else None
         if eg is None:
             continue
         gt_lat = float(eg[11])
-        if abs(gt_lat) > a.straight:            # 直進フレームだけを使う
+        if abs(gt_lat) > a.straight:            # straight frames only
             continue
         ims = b[0][None][:, :a.n_cams].cuda()
         Kk = b[1][None][:, :a.n_cams].cuda()
@@ -79,10 +79,10 @@ def main():
             lat[name].append(float(wp[k, -1, 1]))
             mode_sel[name].append(k)
             if idx is None:
-                # モードの散らばり (最終点の横位置の最大差)
+                # mode spread (max difference in final lateral position)
                 ys = wp[:, -1, 1].cpu().numpy()
                 spread.append(float(ys.max() - ys.min()))
-                # 選択の良否: GT に対する各モードの ADE
+                # selection quality: ADE of each mode vs GT
                 g = eg[:12].view(6, 2).cuda()
                 ade = ((wp - g[None]) ** 2).sum(-1).sqrt().mean(1)
                 best = int(ade.argmin())
@@ -92,9 +92,9 @@ def main():
         if done >= a.frames:
             break
 
-    print(f"\n=== {a.tag or a.ckpt} (直進フレーム {done} 枚) ===")
-    base = np.mean(lat["コマンド無し"]) if lat["コマンド無し"] else 0.0
-    print("コマンド      3秒後の横変位(平均)   コマンド無しとの差   選択モード分布")
+    print(f"\n=== {a.tag or a.ckpt} ({done} straight frames) ===")
+    base = np.mean(lat["none"]) if lat["none"] else 0.0
+    print("command     lateral@3s (mean)    delta vs none      selected-mode histogram")
     for name in CMD:
         if not lat[name]:
             continue
@@ -103,16 +103,16 @@ def main():
         print(f"  {name:<10} {v:+6.2f} m            {v - base:+6.2f} m        "
               f"{list(cnt)}")
     if spread:
-        print(f"\nモード間の散らばり (最終点横位置の最大差): "
-              f"中央値 {np.median(spread):.2f} m / 平均 {np.mean(spread):.2f} m")
-        print(f"選択の的中率: {100 * np.mean(sel_hit):.1f}% "
-              f"(3択のあてずっぽうは 33.3%)")
-        print(f"選択ロス (選んだモード - 最良モードの ADE): "
+        print(f"\nmode spread (max difference in final lateral position): "
+              f"median {np.median(spread):.2f} m / mean {np.mean(spread):.2f} m")
+        print(f"selection hit rate: {100 * np.mean(sel_hit):.1f}% "
+              f"(random 3-way guess is 33.3%)")
+        print(f"selection loss (ADE of chosen mode - best mode): "
               f"{np.mean(sel_gap):.3f} m")
-    dl = np.mean(lat["左"]) - base if lat["左"] else float("nan")
-    dr = base - np.mean(lat["右"]) if lat["右"] else float("nan")
-    print(f"\nコマンド応答量: 左 {dl:+.2f} m / 右 {dr:+.2f} m "
-          f"(参照実装の目標は 1 m 以上、モード結合前の実測は 0.2 m)")
+    dl = np.mean(lat["left"]) - base if lat["left"] else float("nan")
+    dr = base - np.mean(lat["right"]) if lat["right"] else float("nan")
+    print(f"\ncommand response: left {dl:+.2f} m / right {dr:+.2f} m "
+          f"(reference target >= 1 m; measured 0.2 m before mode fusion)")
 
 
 if __name__ == "__main__":

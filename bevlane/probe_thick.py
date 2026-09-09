@@ -114,11 +114,11 @@ def main():
         if n >= a.frames:
             break
 
-    print(f"\n{os.path.basename(a.ckpt)}  n={n} フレーム")
-    print("勾配の符号: ring が負 = そのセルのロジットを上げる方向 = 太らせる\n")
+    print(f"\n{os.path.basename(a.ckpt)}  n={n} frames")
+    print("gradient sign: negative ring = pushes that cell's logit up = thickens\n")
     for c in CLS:
         print(f"--- {CLS[c]} (class {c}) ---")
-        print(f"{'損失項':22s} {'core':>12s} {'ring':>12s} {'far':>12s}")
+        print(f"{'loss term':22s} {'core':>12s} {'ring':>12s} {'far':>12s}")
         tot = np.zeros(3)
         for name in ("CE(+boundary,far)", "dice", "lovasz", "tversky"):
             d = acc.get((name, c))
@@ -126,9 +126,9 @@ def main():
                 continue
             d = d / n
             tot += d
-            flag = "  ★太らせる" if d[1] < -1e-9 else ""
+            flag = "  * thickens" if d[1] < -1e-9 else ""
             print(f"{name:22s} {d[0]:12.3e} {d[1]:12.3e} {d[2]:12.3e}{flag}")
-        print(f"{'合計':22s} {tot[0]:12.3e} {tot[1]:12.3e} {tot[2]:12.3e}\n")
+        print(f"{'total':22s} {tot[0]:12.3e} {tot[1]:12.3e} {tot[2]:12.3e}\n")
 
 
 def _ce(lg, gt, a, H2):

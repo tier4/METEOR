@@ -1,4 +1,4 @@
-"""3D BBox の位置誤差を前後・距離帯別に出す (世代比較用)。"""
+"""3D BBox position error per front/rear range band (for cross-generation comparison)."""
 import argparse, os, sys
 import numpy as np, torch
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -26,8 +26,8 @@ cur = m.state_dict()
 m.load_state_dict({k: v for k, v in sd.items()
                    if k in cur and cur[k].shape == v.shape}, strict=False)
 
-BANDS = [("前 0-20m", 0, 20, 1), ("前 20-40m", 20, 40, 1), ("前 40-80m", 40, 80, 1),
-         ("後 0-20m", 0, 20, -1), ("後 20-40m", 20, 40, -1)]
+BANDS = [("front 0-20m", 0, 20, 1), ("front 20-40m", 20, 40, 1), ("front 40-80m", 40, 80, 1),
+         ("rear 0-20m", 0, 20, -1), ("rear 20-40m", 20, 40, -1)]
 err = {b[0]: [] for b in BANDS}
 dx_e = {b[0]: [] for b in BANDS}
 step = max(1, len(ds) // a.frames); done = 0
@@ -52,12 +52,12 @@ for i in range(0, len(ds), step):
         for nm, lo, hi, sgn in BANDS:
             if lo <= r < hi and (xe > 0) == (sgn > 0):
                 err[nm].append(best[0] ** 0.5)
-                dx_e[nm].append(abs(best[1] - xe))    # 縦方向 (距離) の誤差
+                dx_e[nm].append(abs(best[1] - xe))    # longitudinal (range) error
     done += 1
     if done >= a.frames: break
 
-print(f"=== {a.tag or a.ckpt} ({done} フレーム) ===")
-print("帯          n    位置誤差中央値  距離(縦)誤差中央値")
+print(f"=== {a.tag or a.ckpt} ({done} frames) ===")
+print("band        n    median pos err  median range err")
 for nm, *_ in BANDS:
     e, d = err[nm], dx_e[nm]
     if len(e) >= 3:

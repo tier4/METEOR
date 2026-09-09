@@ -25,16 +25,16 @@ cv2.setNumThreads(1)
 ROOT = os.environ.get("BEVLANE_ROOT",
                       "data/t4dataset")
 PROD = "out/production"
-# 出力先は環境変数で差し替え可能 (2026-08-16): 新規コーパスを別ディスクに
-# 置いたまま gt_cons などの後段生成を回せるようにする。
+# Output root can be overridden via env var (2026-08-16): lets downstream generation
+# (gt_cons etc.) run while a new corpus lives on a different disk.
 OUT = os.environ.get("METEOR_BEVLANE_OUT", "out/bevlane")
 CAMS = ["CAM_FRONT_WIDE", "CAM_FRONT_LEFT", "CAM_FRONT_RIGHT",
         "CAM_BACK_WIDE", "CAM_BACK_LEFT", "CAM_BACK_RIGHT"]
 BEV_RES = 0.2
 BEV_XH, BEV_YH = 80.0, 50.0        # +-80 m fwd, +-50 m lateral
 BEV_H, BEV_W = int(2 * BEV_XH / BEV_RES), int(2 * BEV_YH / BEV_RES)  # 800x500
-# R プログラム (2026-08-30): 保存解像度は env で切替可能。既定 768x432 は
-# 4K ソース (3840x2160) の 1/5。真解像度パイロットは 1536x864 (1/2.5) を使う。
+# R program (2026-08-30): stored resolution switchable via env. Default 768x432 is
+# 1/5 of the 4K source (3840x2160). The full-res pilot uses 1536x864 (1/2.5).
 IMG_W = int(os.environ.get("METEOR_IMG_W", 768))
 IMG_H = int(os.environ.get("METEOR_IMG_H", 432))
 

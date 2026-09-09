@@ -106,7 +106,7 @@ inline NpyArray parseNpy(const std::vector<uint8_t>& b) {
       std::memcpy(&v, d + 8 * i, 8);
       a.data[i] = (float)v;
     }
-  } else if (descr == "<f2") {          // float16 (lidar_bev "lb" は fp16)
+  } else if (descr == "<f2") {          // float16 (lidar_bev "lb" is fp16)
     need(n * 2);
     for (size_t i = 0; i < n; ++i) {
       uint16_t h;

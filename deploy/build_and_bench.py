@@ -31,11 +31,11 @@ N_CLASSES = 9
 
 
 def _denorm_u8(t):
-    """正規化済み float 画像 [1,N,3,H,W] -> 生の uint8 画素。
+    """Normalized float image [1,N,3,H,W] -> raw uint8 pixels.
 
-    uint8-in グラフは正規化を自分の中に持つ。正規化済みテンソルを uint8 へ
-    キャストすると値がほぼ 0/255 に潰れ、BEV Seg は「それらしく」出るのに
-    3D 検出だけ静かに壊れる (orin_render.py で 2026-08-24 に実害)。"""
+    The uint8-in graph carries normalization itself. Casting an already-normalized
+    tensor to uint8 squashes values to ~0/255; BEV Seg still looks "plausible" while
+    only 3D detection silently breaks (bit us in practice in orin_render.py, 2026-08-24)."""
     import numpy as _np
     from bevlane.dataset import MEAN as _M, STD as _S
     mm = torch.tensor(_np.asarray(_M), dtype=t.dtype).view(1, 1, 3, 1, 1)
@@ -65,8 +65,8 @@ def sample_inputs(root, val_list, n, hist_ckpt=None, hist_model="v50",
         from bevlane.model import MODELS
         from bevlane.ckpt_load import load_net
         net = MODELS[hist_model](n_seg=n_seg2d).cuda().eval()
-        # ckpt_load 経由で depth-slim / sem_ego / delta-stat 等を自動検出
-        # (素の v52 への strict なし load は slim ckpt で形状不一致に落ちる)
+        # auto-detect depth-slim / sem_ego / delta-stat etc. via ckpt_load
+        # (a non-strict load into plain v52 fails on shape mismatch with slim ckpts)
         load_net(net, hist_ckpt)
         net = net.cuda().eval()
     st = max(1, len(ds) // n)

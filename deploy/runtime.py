@@ -26,12 +26,12 @@ DET_RES = 0.4
 STAT_LOGIT_THRESH = float(os.environ.get("METEOR_STAT_LOGIT_THRESH", "0"))
 
 try:                                     # imported lazily so decode utils
-    # pycuda.autoinit は使わない (2026-08-25): autoinit は make_context() で
-    # **新規**コンテキストを作るが、TensorRT (cudart) は**プライマリ**
-    # コンテキストで動く。別コンテキストのストリームを execute_async_v3 に
-    # 渡すと "Cuda Runtime (invalid resource handle)" が全リフォーマット層で
-    # 出る (ノート PC の GPU で実害)。Orin では pycuda が無く cudart
-    # シムに落ちるため発症しなかった。プライマリを retain して共有する。
+    # pycuda.autoinit is not used (2026-08-25): autoinit creates a **new**
+    # context via make_context(), but TensorRT (cudart) runs on the **primary**
+    # context. Passing a stream from another context to execute_async_v3
+    # raises "Cuda Runtime (invalid resource handle)" in every reformat layer
+    # (bit us on a laptop GPU). Orin has no pycuda and falls back to the cudart
+    # shim, so it never showed there. Retain the primary context and share it.
     import pycuda.driver as cuda
     cuda.init()
     _pyc_ctx = cuda.Device(0).retain_primary_context()
@@ -99,7 +99,7 @@ except Exception:                        # pragma: no cover
 INPUTS = ["imgs", "K", "T_cam_ego", "v0", "hist_bev", "hist_theta", "lidar_bev", "lidar_flag"]
 _ZERO_HIST = os.environ.get("METEOR_ZERO_HIST", "0") == "1"
 if _ZERO_HIST:
-    print("[rt] METEOR_ZERO_HIST=1: 履歴スロットを零固定 (学習条件に一致)", flush=True)
+    print("[rt] METEOR_ZERO_HIST=1: history slots forced to zero (matches training condition)", flush=True)
 OUTPUTS = ["lane", "depth", "seg2d", "hm", "reg",
            "hm2d_s0", "hm2d_s1", "hm2d_s2",
            "reg2d_s0", "reg2d_s1", "reg2d_s2",
@@ -151,11 +151,11 @@ _RT_T = {}
 
 
 def _rt_mark(rt, key, t0):
-    """METEOR_RT_PROFILE=1 のときだけ段階時間を積む。
+    """Accumulate per-stage times only when METEOR_RT_PROFILE=1.
 
-    90ms 目標に対し GPU 計算 92.2ms / 実ランタイム 109.2ms と 17ms の開きが
-    あり、その内訳を取るために入れた。同期を挟むので重なりは潰れるが、
-    「どの段階が何 ms 使うか」はこれでしか分からない。
+    Added to get the breakdown of the 17ms gap between GPU compute 92.2ms
+    and real runtime 109.2ms against the 90ms target. The syncs kill
+    overlap, but this is the only way to see which stage takes how many ms.
     """
     if not _RT_PROF:
         return t0
@@ -169,13 +169,13 @@ def _rt_mark(rt, key, t0):
 
 def rt_profile_report(reset=True):
     if not _RT_T:
-        return "(プロファイル無効)"
+        return "(profiling disabled)"
     tot = sum(v[0] / max(v[1], 1) for v in _RT_T.values())
-    lines = [f"{'段階':<22}{'平均 ms':>10}{'割合':>8}"]
+    lines = [f"{'stage':<22}{'mean ms':>10}{'share':>8}"]
     for k, v in sorted(_RT_T.items(), key=lambda kv: -kv[1][0] / max(kv[1][1], 1)):
         m = v[0] / max(v[1], 1)
         lines.append(f"{k:<22}{m:>10.2f}{m / max(tot, 1e-9) * 100:>7.1f}%")
-    lines.append(f"{'合計':<22}{tot:>10.2f}")
+    lines.append(f"{'total':<22}{tot:>10.2f}")
     if reset:
         _RT_T.clear()
     return "\n".join(lines)
@@ -212,9 +212,9 @@ class MeteorRT:
             self.engine = rt_.deserialize_cuda_engine(f.read())
         if self.engine is None:
             raise RuntimeError(
-                "エンジンのデシリアライズに失敗 (直前の TRT エラーを参照)。"
-                "典型: TensorRT の版違い (パッチ版まで一致が必要)。"
-                "同梱の ONNX + 較正キャッシュから現地ビルドすること")
+                "Engine deserialisation failed (see the TRT error above). "
+                "Typical cause: TensorRT version mismatch (must match down to the patch). "
+                "Rebuild locally from the bundled ONNX + calibration cache")
         self.ctx = self.engine.create_execution_context()
         self.host, self.dev, self.shapes = {}, {}, {}
         self._zeroed = False
@@ -228,22 +228,22 @@ class MeteorRT:
             self.dev[nm] = cuda.mem_alloc(self.host[nm].nbytes)
             self.ctx.set_tensor_address(nm, int(self.dev[nm]))
         # extra host slots for the outputs the caller reads (slot 0 = host)
-        # --split-hist で焼いたエンジンは hist_bev0/1/2 の 3 入力を持つ。
-        # このときリングのスロットをそのままバインドできるので、毎フレーム
-        # 230MB (fp16) の D2D コピー (実測 6.2 ms) が丸ごと不要になる。
+        # An engine built with --split-hist has the 3 inputs hist_bev0/1/2.
+        # The ring slots can then be bound directly, which removes the per-frame
+        # 230MB (fp16) D2D copy (measured 6.2 ms) entirely.
         self._split_hist = all(f"hist_bev{i}" in self.shapes for i in range(3))
-        # --no-hist エンジン (2026-09-05): 履歴入力を持たない。splice も
-        # hist_theta も raw_bev リングも不要 (学習条件 = 履歴零に一致)。
+        # --no-hist engine (2026-09-05): no history inputs. No splice, no
+        # hist_theta, no raw_bev ring (training condition = history zero).
         self._no_hist = ("hist_bev" not in self.shapes
                          and "hist_bev0" not in self.shapes)
         if self._no_hist:
-            print("[rt] 履歴入力なしエンジンを検出 (no-hist)", flush=True)
-        # 履歴が無いスロットに束ねる 0 バッファ。hist_bev0 用に確保済みの
-        # 領域をそのまま使う (初回 infer の一括ゼロ化で 0 になる。以後は
-        # アドレスを差し替えるだけなので中身は書き換わらない)。
+            print("[rt] detected engine without history inputs (no-hist)", flush=True)
+        # Zero buffer bound to slots with no history. Reuses the region already
+        # allocated for hist_bev0 (zeroed by the bulk memset on the first infer;
+        # afterwards only addresses are swapped, so its contents never change).
         self._zero_slot = self.dev["hist_bev0"] if self._split_hist else None
         if self._split_hist:
-            print("[rt] hist_bev 分割入力を検出 -> D2D コピーを省く", flush=True)
+            print("[rt] detected split hist_bev inputs -> skipping D2D copy", flush=True)
         self.host_slots = [self.host]
         out_names = [nm for nm in OUTPUTS if nm in self.shapes
                      and nm != "raw_bev" and nm not in self.skip_outputs]
@@ -265,22 +265,22 @@ class MeteorRT:
         self._ring_disabled = False
         self._ring_pose = [None] * self._ring_n
         self._ring_t = [-1] * self._ring_n
-        # 分割版エンジンは hist_bev ではなく hist_bev0/1/2 を持つ。
-        # スロット長はどちらから測っても同じ (1 スロット分)。
+        # The split engine has hist_bev0/1/2 instead of hist_bev.
+        # The slot size is the same measured from either (one slot's worth).
         _hb_name = "hist_bev" if "hist_bev" in self.shapes else "hist_bev0"
         if "raw_bev" in self.shapes and _hb_name in self.shapes:
-            # スロット長は hist_bev 側から決める。fp16 IO を hist_bev だけに
-            # 指定したエンジンでは raw_bev が fp32 のまま残り、raw_bev 基準だと
-            # 2 倍の長さで memset して cudaErrorInvalidValue になる
-            # (2026-08-14, 8cam エンジンで実害)。
+            # Slot size is taken from the hist_bev side. In an engine with fp16 IO
+            # set only on hist_bev, raw_bev stays fp32; sizing from raw_bev would
+            # memset twice the length and hit cudaErrorInvalidValue
+            # (2026-08-14, bit us on the 8cam engine).
             _hb = self.host[_hb_name].nbytes
-            if _hb_name == "hist_bev":          # 3 スロットが 1 本に入っている
+            if _hb_name == "hist_bev":          # 3 slots packed in one tensor
                 _hb //= max(len(HIST_OFFS), 1)
             self._slot_bytes = _hb
             if self.host["raw_bev"].nbytes != _hb:
-                print(f"[rt] raw_bev({self.host['raw_bev'].dtype}) と "
-                      f"{_hb_name}({self.host[_hb_name].dtype}) の型が不一致 "
-                      f"-> 時系列リングを無効化 (履歴ゼロで動作)", flush=True)
+                print(f"[rt] dtype mismatch between raw_bev({self.host['raw_bev'].dtype}) and "
+                      f"{_hb_name}({self.host[_hb_name].dtype}) "
+                      f"-> disabling temporal ring (running with zero history)", flush=True)
                 self._ring_disabled = True
             if not self._ring_disabled:
                 self._ring = [cuda.mem_alloc(self._slot_bytes)
@@ -291,8 +291,8 @@ class MeteorRT:
         self._t = 0
 
     def pinned_input_slots(self, n):
-        """imgs 用の pinned スロットを n 個返す ([1,N,3,H,W] のエンジン dtype)。
-        デコード側がここへ直接書けば infer() の CPU コピーが消える。"""
+        """Return n pinned slots for imgs ([1,N,3,H,W] in the engine dtype).
+        If the decoder writes here directly, the CPU copy in infer() disappears."""
         shp = tuple(self.shapes["imgs"]); dt = self.host["imgs"].dtype
         slots = []
         for _ in range(n):
@@ -345,17 +345,17 @@ class MeteorRT:
             valid = (self._ring is not None and ti >= 0
                      and self._ring_t[slot] == ti and pose is not None
                      and self._ring_pose[slot] is not None)
-            # METEOR_ZERO_HIST=1: 履歴スロットを常に零 (学習条件に一致)。
-            # 2026-09-04 に判明: dataset.py の ego キャッシュ衝突で E2E 全ラウンドの
-            # 学習・検証は履歴零だった。実履歴を流すと同一フレームで E2E ADE が
-            # 約 35% 悪化 (v132 0.611→0.806)。実履歴で学習した世代 (v144〜) までは
-            # 零固定が学習条件の再現になる。
+            # METEOR_ZERO_HIST=1: history slots always zero (matches training condition).
+            # Found 2026-09-04: an ego cache collision in dataset.py meant every E2E
+            # round trained and validated with zero history. Feeding real history makes
+            # E2E ADE ~35% worse on the same frames (v132 0.611->0.806). Until a generation
+            # trained on real history (v144+), forcing zero reproduces the training condition.
             if _ZERO_HIST:
                 valid = False
             dst = hb_base + i * self._slot_bytes
             _hb = self.shapes["hist_bev0" if self._split_hist else "hist_bev"]
             if self._split_hist:
-                # コピーせず、そのスロット (無効なら 0 バッファ) を束ねる
+                # no copy: bind that slot (or the zero buffer if invalid)
                 src = int(self._ring[slot]) if valid else int(self._zero_slot)
                 self.ctx.set_tensor_address(f"hist_bev{i}", src)
                 ht[0, i] = (make_warp_theta(self._ring_pose[slot], pose,
@@ -374,16 +374,16 @@ class MeteorRT:
                 "v0": np.array([v0], np.float32)}
         if ht is not None:
             feed["hist_theta"] = ht
-        if "lidar_bev" in self.shapes:          # --with-lidar エンジン: 無ければ零 (= カメラのみ)
+        if "lidar_bev" in self.shapes:          # --with-lidar engine: zeros if absent (= camera-only)
             feed["lidar_bev"] = (lidar_bev if lidar_bev is not None
                                  else np.zeros(self.shapes["lidar_bev"], np.float32))
-        if "lidar_flag" in self.shapes:         # ホスト側フラグ (グラフ内縮約の 14.8 ms を回避)
+        if "lidar_flag" in self.shapes:         # host-side flag (avoids the 14.8 ms in-graph reduction)
             feed["lidar_flag"] = np.array([1.0 if lidar_bev is not None else 0.0], np.float32)
         for nm, v in feed.items():
-            # ゼロコピー入力 (2026-09-05): imgs が pinned_input_slots() の
-            # スロットそのものなら CPU コピー (実測 4.6 ms) を省き、その
-            # スロットから直接 H2D する (0.4 ms)。呼び出し側はデコード時に
-            # スロットへ書き、infer() が返るまでスロットを再利用しない。
+            # Zero-copy input (2026-09-05): if imgs is one of the slots from
+            # pinned_input_slots(), skip the CPU copy (measured 4.6 ms) and H2D
+            # straight from that slot (0.4 ms). The caller writes into the slot
+            # while decoding and does not reuse it until infer() returns.
             if nm == "imgs" and self._is_input_slot(v):
                 cuda.memcpy_htod_async(self.dev[nm], v.reshape(-1), self.stream)
                 _t0 = _rt_mark(self, "C1_imgs_zerocopy", _t0)
@@ -397,21 +397,21 @@ class MeteorRT:
                 _t0 = _rt_mark(self, "C1_imgs_copyto", _t0)
             cuda.memcpy_htod_async(self.dev[nm], self.host[nm], self.stream)
         _t0 = _rt_mark(self, "C_input_H2D", _t0)
-        # CUDA Graph (2026-08-14 実測: 65.71 -> 62.55 ms, -3.2 ms):
-        # refiner だけで 522 レイヤある本エンジンでは、Orin の弱い CPU での
-        # カーネル起動が実測できる量を占める。形状は静的なので 1 回だけ
-        # キャプチャして以後は再生する。入出力アドレスは固定 (self.dev) の
-        # ままなので、グラフは毎フレーム同じバッファを読み書きする。
+        # CUDA Graph (measured 2026-08-14: 65.71 -> 62.55 ms, -3.2 ms):
+        # this engine has 522 layers in the refiner alone, so kernel launches on
+        # Orin's weak CPU take a measurable share. Shapes are static, so capture
+        # once and replay. Input/output addresses stay fixed (self.dev), so the
+        # graph reads and writes the same buffers every frame.
         if self._graph is not None:
             _ck(_rt.cudaGraphLaunch(self._graph, self.stream.handle))
         elif (self._graph_warm >= 2
               and os.environ.get("METEOR_CUDAGRAPH") == "1"):
-            # 既定 OFF (2026-08-15): 本エンジンは補助ストリームを 6 本使うため、
-            # enqueueV3 を単純にストリームキャプチャすると一部の処理がグラフに
-            # 入らず、出力が更新されない (デモ映像が固定される実害を確認)。
-            # trtexec 側の --useCudaGraph は独自にストリームを整えており
-            # 同じ問題は出ない。ランタイムで使うには補助ストリームを 1 本に
-            # した専用エンジンでの数値検証が必要。
+            # OFF by default (2026-08-15): this engine uses 6 auxiliary streams, so
+            # naively stream-capturing enqueueV3 leaves some work out of the graph
+            # and the outputs stop updating (confirmed: the demo video froze).
+            # trtexec's --useCudaGraph arranges its streams itself and does not
+            # hit this. Using it in the runtime needs numerical validation on a
+            # dedicated engine built with a single auxiliary stream.
             try:
                 _ck(_rt.cudaStreamBeginCapture(
                     self.stream.handle,
@@ -421,8 +421,8 @@ class MeteorRT:
                 self._graph = _ck(_rt.cudaGraphInstantiate(g, 0))
                 _ck(_rt.cudaGraphLaunch(self._graph, self.stream.handle))
                 print("[rt] CUDA Graph captured", flush=True)
-            except Exception as e:                    # 失敗したら通常実行へ
-                print(f"[rt] CUDA Graph 不可 ({e}); 通常実行", flush=True)
+            except Exception as e:                    # fall back to normal execution
+                print(f"[rt] CUDA Graph unavailable ({e}); running normally", flush=True)
                 self._graph = None
                 self._graph_warm = -10**9
                 self.ctx.execute_async_v3(self.stream.handle)
@@ -462,9 +462,9 @@ def _sigmoid(x):
     return 1.0 / (1.0 + np.exp(-x))
 
 
-# topk 64 -> 128 (2026-08-17): 混雑シーンで弱いピークが枠から溢れ、
-# しきい値 0.10 で前後とも約 5pt の未検出を作っていた (実測)。学習側の
-# 評価デコードは既存ラウンドとの比較可能性のため 64 のまま変えない。
+# topk 64 -> 128 (2026-08-17): in crowded scenes weak peaks overflowed the
+# budget, causing ~5pt of misses front and rear at threshold 0.10 (measured).
+# The training-side eval decode stays at 64 for comparability with earlier rounds.
 def stationary_head_healthy(stationary, min_std=0.05, min_range=0.20):
     """Return False when an INT8 stationary output has collapsed.
 
@@ -548,10 +548,10 @@ def decode_boxes(hm, reg, stationary=None, thresh=0.3, topk=128, traj=None):
 
 
 def _box_nms(boxes, shrink=0.8, margin=0.2):
-    """箱レベル NMS (2026-08-27)。3x3 ピーク NMS はセル間 1.2m までしか
-    抑制できず、大型車で複数ピーク→多重箱が出る (ユーザー指摘)。
-    スコア降順を前提に、既採用の同クラス箱の内側 (shrink 倍 + margin[m])
-    に中心が入る箱を落とす。回転は既採用箱の yaw 座標系で判定。"""
+    """Box-level NMS (2026-08-27). The 3x3 peak NMS only suppresses up to 1.2m
+    between cells, so large vehicles produce multiple peaks -> duplicate boxes (user report).
+    Assumes descending score; drops boxes whose centre falls inside an already kept
+    same-class box (shrink factor + margin[m]). Rotation is judged in the kept box's yaw frame."""
     kept = []
     for b in boxes:
         dup = False

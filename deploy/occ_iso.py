@@ -1,8 +1,8 @@
-"""cube_render_fast の自己完結版 (Orin 用)。
+"""Self-contained version of cube_render_fast (for Orin).
 
-bevlane パッケージは __init__ が torch を import するため、torch の無い
-Orin システム python では読めない。OCC パレットごとここへ切り出した
-(元: bevlane/extract_occ.py OCC_PAL / bevlane/demo_occ_gt.py cube_render_fast)。
+The bevlane package imports torch in __init__, so it cannot be loaded by the
+torch-less Orin system python. Extracted here together with the OCC palette
+(from: bevlane/extract_occ.py OCC_PAL / bevlane/demo_occ_gt.py cube_render_fast).
 """
 import cv2
 import numpy as np

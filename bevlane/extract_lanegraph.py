@@ -5,7 +5,7 @@ vector_map.json stores connected polylines per class in map-frame metres.
 Per frame: transform to ego, clip to the ROI (x -10..60, |y| <= 25 m),
 resample each piece to P=12 points, keep the M=24 nearest chains over
 {laneline, road_edge, stopline}; adjacency links consecutive pieces of one
-source chain and近接 endpoints (< 1 m).
+source chain and nearby endpoints (< 1 m).
 
 Saved per scene: lanegraph.npz {pts[F,M,P,2] f16, cls[F,M] u8 (255 empty),
 n[F] u8, adj[F,M,M] u8}; manifest key "lanegraph".

@@ -36,21 +36,21 @@ from deploy.viz_np import (DEMO_PALETTE, PALETTE, crop_bev_np, decode_boxes2d_ms
                            draw_boxes2d, draw_boxes_on_rgb, draw_path_ribbon)
 
 _DBINS = int(os.environ.get("METEOR_DEPTH_BINS", "64"))
-_GROUND_Z = float(os.environ.get("METEOR_GROUND_Z", "0.0"))   # 路面の ego z [m] (base_link 基準なら 0)
+_GROUND_Z = float(os.environ.get("METEOR_GROUND_Z", "0.0"))   # road-surface ego z [m] (0 if base_link-referenced)
 CAMS = ["CAM_FRONT_WIDE", "CAM_FRONT_LEFT", "CAM_FRONT_RIGHT",
         "CAM_BACK_WIDE", "CAM_BACK_LEFT", "CAM_BACK_RIGHT",
         "CAM_FRONT_NARROW"]
 EGO_K = 3
-# CAM8 は **画面のタイル配置用** の並び (左-中央-右に見えるように並べたもの)。
-# モデルの入力順ではない。混同すると、リフトのプラグインがスロット毎に
-# 幾何テーブルを焼き込んでいるため各カメラの画素が BEV の誤ったセルへ飛び、
-# BEV Seg も E2E も崩れる (2026-08-24 に実害。動画を作り直した)。
+# CAM8 is the **screen tile layout** order (arranged to read left-centre-right).
+# It is NOT the model input order. Mixing them up sends each camera's pixels
+# to the wrong BEV cells, because the lift plugin bakes a geometry table per
+# slot, and both BEV Seg and E2E collapse (bit us on 2026-08-24; video was redone).
 CAM8 = ["CAM_FRONT_LEFT", "CAM_FRONT_WIDE", "CAM_FRONT_RIGHT",
         "CAM_FRONT_NARROW", "CAM_BACK_LEFT", "CAM_BACK_WIDE",
         "CAM_BACK_RIGHT", "CAM_BACK_NARROW"]
-# モデルの入力順 = 学習側 bevlane/dataset.py の CAMS と同一。
+# Model input order = identical to CAMS in the training-side bevlane/dataset.py.
 CAM_IN8 = CAMS + ["CAM_BACK_NARROW"]
-# 描画側が参照するカメラ一覧 (main() がエンジンの本数に合わせて差し替える)
+# Camera list the rendering side refers to (main() swaps it to match the engine's count)
 CAM_DRAW = list(CAMS)
 CW, CH = 375, 210
 VW, VH = 1920, 1080
@@ -62,36 +62,36 @@ VIEW_F, VIEW_R, YH = 60.0, min(60.0, XR), 25.0
 _SEG2D_OVERLAY = os.environ.get("METEOR_SEG2D_OVERLAY", "0") == "1"
 
 def set_bev_extent(bev_h, cell=0.2):
-    """BEV ラスタの行数から後方の範囲を決める (2026-08-15)。
+    """Derive the rear extent from the BEV raster row count (2026-08-15).
 
-    軽量版は 600 行 = 前 80 / 後 40 m、ベースラインは 800 行 = 前後 80 m。
-    ここを軽量版の値 (XR=40) で固定していたため、8 カメラ版のデモでも
-    BEV の後方が 40 m で切れて表示されていた。前方 80 m は不変。
+    Light variant is 600 rows = 80 m front / 40 m rear; baseline is 800 rows = 80 m both.
+    This used to be hard-wired to the light-variant value (XR=40), so even the
+    8-camera demo showed the BEV cut off at 40 m behind. Front 80 m is unchanged.
     """
     global XR, VIEW_R
     XR = max(0.0, float(bev_h) * cell - XF)
-    # 表示範囲は **モデルが実際に出している範囲** をそのまま映す。
-    # 学習データの都合 (BEV Seg の GT は後方 40m までしか無い) で描画を
-    # 切るのは配備側で判断することではない。後方 40-80m が不安定に見えるのは
-    # 教師が無いためで、直すなら GT 生成側 (the training server)。ここで隠すと限界が見えなくなる。
+    # The view shows **the range the model actually outputs** as-is.
+    # Clipping the rendering for training-data reasons (BEV Seg GT only exists
+    # to 40 m rear) is not a deployment-side decision. Rear 40-80 m looks unstable
+    # because there is no supervision; fix it on the GT side (the training server). Hiding it here hides the limit.
     VIEW_R = min(60.0, XR)
-    print(f"[render] BEV {bev_h} 行 -> 前 {XF:.0f} m / 後 {XR:.0f} m "
-          f"(表示は前 {VIEW_F:.0f} / 後 {VIEW_R:.0f} m = Seg GT のある範囲)",
+    print(f"[render] BEV {bev_h} rows -> front {XF:.0f} m / rear {XR:.0f} m "
+          f"(view is front {VIEW_F:.0f} / rear {VIEW_R:.0f} m = range with Seg GT)",
           flush=True)
 
 
-OCC_XY = 40.0                  # occ グリッドの片側範囲 [m] (±40 m)
-OCC_RES = 0.4                  # occ グリッドの分解能 [m/セル]
+OCC_XY = 40.0                  # occ grid half-extent [m] (+-40 m)
+OCC_RES = 0.4                  # occ grid resolution [m/cell]
 
 
 _SEGF = {}
 
 
 def seg_fuse_logit(cur, logits, pose):
-    """seg-fuse 完全版 (2026-08-19)。エンジンの lane_logit 出力を使い、
-    ローカル demo と同じ log_softmax + 0.7*ワープ累積で面クラスを融合する。
-    細線クラス (3,4,5,6) は生の現フレームで保護、適用は x<=45m (row>=175)。
-    logits: [1,9,800,500] または [9,800,500] (fp16 可)。"""
+    """Full seg-fuse (2026-08-19). Uses the engine's lane_logit output and
+    fuses area classes with the same log_softmax + 0.7*warp accumulation as the local demo.
+    Thin-line classes (3,4,5,6) are protected from the raw current frame; applied for x<=45m (row>=175).
+    logits: [1,9,800,500] or [9,800,500] (fp16 OK)."""
     if pose is None:
         _SEGF.pop("acc", None)
         return cur
@@ -131,16 +131,16 @@ def seg_fuse_logit(cur, logits, pose):
 
 
 def seg_fuse_np(cur, pose):
-    """ローカル demo の seg-fuse (ego ワープ log-odds 融合) の argmax 版近似。
+    """argmax approximation of the local demo's seg-fuse (ego-warp log-odds fusion).
 
-    エンジンは argmax 出力のみなので、クラスラスタを ego 運動でワープし
-    「面クラス (road/sidewalk/parking) の持続投票」で時間融合する。
-    細線クラス (crosswalk/lane/stop/edge) は常に生の現フレームを保護
-    (ローカルの thin 保護と同じ規約)。適用は x<=45 m (row>=175) のみ。
-    2 ワーカー間で状態が 1 フレーム古く読まれ得るのは mode ヒステリシスと
-    同じ許容 (ワープは保存したポーズから計算するので幾何は正しい)。
-    完全一致 (ロジット融合) は次回エンジン再ビルドでレーン logit を
-    出力に追加してから。
+    The engine only outputs argmax, so warp the class raster by ego motion and
+    fuse over time via "persistence voting of area classes (road/sidewalk/parking)".
+    Thin-line classes (crosswalk/lane/stop/edge) always keep the raw current frame
+    (same convention as the local thin protection). Applied for x<=45 m (row>=175) only.
+    State being read one frame stale between the 2 workers is tolerated just like
+    the mode hysteresis (the warp is computed from the stored pose, so geometry is right).
+    Exact parity (logit fusion) comes once the next engine rebuild adds the lane
+    logits to the outputs.
     """
     if pose is None:
         _SEGF.clear()
@@ -154,9 +154,9 @@ def seg_fuse_np(cur, pose):
         dx, dy = pose[0] - pp[0], pose[1] - pp[1]
         tx, ty = cp * dx + sp * dy, -sp * dx + cp * dy
         dyaw = float(pose[2] - pp[2])
-        if abs(tx) + abs(ty) < 10.0 and abs(dyaw) < 0.5:   # シーン跨ぎ guard
+        if abs(tx) + abs(ty) < 10.0 and abs(dyaw) < 0.5:   # scene-boundary guard
             c, s2 = np.cos(dyaw), np.sin(dyaw)
-            # (u,v)=(col,row)。出力(現)画素 -> 入力(前)画素 (WARP_INVERSE_MAP)
+            # (u,v)=(col,row). Output (current) pixel -> input (previous) pixel (WARP_INVERSE_MAP)
             M = np.array([[c, s2, -250 * c - 400 * s2 - 5 * ty + 250],
                           [-s2, c, 250 * s2 - 400 * c - 5 * tx + 400]],
                          np.float32)
@@ -178,7 +178,7 @@ def seg_fuse_np(cur, pose):
             fused[fill] = wcls[fill]
             conf[fill] = wconf[fill] - 1
             out = cur.copy()
-            out[175:] = fused[175:]              # 近傍のみ (x <= 45 m)
+            out[175:] = fused[175:]              # near range only (x <= 45 m)
             _SEGF["st"] = (fused, conf, tuple(pose))
             return out
     conf0 = np.where(np.isin(cur, AREA), 3, 0).astype(np.uint8)
@@ -187,11 +187,11 @@ def seg_fuse_np(cur, pose):
 
 
 def thin_road_edge_np(pred):
-    """road_edge 帯の最内 1px だけ残す (bevlane/postproc.py の自己完結版)。
+    """Keep only the innermost 1 px of the road_edge band (self-contained port of bevlane/postproc.py).
 
-    ローカル demo は既定でこれを適用しており、Orin だけ帯が太く出ていた
-    (2026-08-19)。drivable (road/crosswalk/lane/stop) に 4 近傍で接する
-    edge 画素のみ残し、残りは背景へ落とす。800x500 で ~1 ms。
+    The local demo applies this by default; only the Orin showed a fat band
+    (2026-08-19). Keep only edge pixels 4-adjacent to drivable (road/crosswalk/lane/stop)
+    and drop the rest to background. ~1 ms at 800x500.
     """
     edge = (pred == 6).astype(np.uint8)
     if edge.sum() == 0:
@@ -206,10 +206,10 @@ def thin_road_edge_np(pred):
 
 
 def _zs_thin(mask, max_iter=6):
-    """Zhang-Suen 細線化 (numpy ベクトル化)。線幅 2-5px なら 2-3 反復で収束。
+    """Zhang-Suen thinning (numpy vectorised). Converges in 2-3 iterations for 2-5 px lines.
 
-    cv2.ximgproc はローカルにも Orin にも入っていないため自前実装。
-    800x500 の細線クラス 1 枚で ~10ms。"""
+    cv2.ximgproc is installed neither locally nor on the Orin, hence the own implementation.
+    ~10ms for one 800x500 thin-line class."""
     img = mask.astype(np.uint8)
     for _ in range(max_iter):
         changed = False
@@ -238,11 +238,11 @@ def _zs_thin(mask, max_iter=6):
 
 
 def thin_lane_lines_np(pred, classes=(4,)):
-    """レーン線(4) を 1px 骨格に細線化 (METEOR_THIN_LANES=1)。
-    停止線(5) は面で見えるのが自然なので対象外 (2026-08-27 ユーザー判断)。
+    """Thin lane lines (4) to a 1 px skeleton (METEOR_THIN_LANES=1).
+    Stop lines (5) are excluded; they naturally read as areas (user decision 2026-08-27).
 
-    生ラスタのシャギー対策の試験表示。落とした画素は周囲に road があれば
-    road へ、なければ背景へ戻す。既定 OFF (ローカル表示との等価性維持)。"""
+    Experimental view to counter the jaggies of the raw raster. Dropped pixels revert to
+    road if road is nearby, else to background. Default OFF (keeps parity with the local view)."""
     pred = pred.copy()
     road_near = cv2.dilate((pred == 1).astype(np.uint8),
                            np.ones((5, 5), np.uint8)) > 0
@@ -256,7 +256,7 @@ def thin_lane_lines_np(pred, classes=(4,)):
         pred[drop] = 0
         pred[drop & road_near] = 1
         if width >= 2:
-            # 骨格を width px へ (2026-08-27: 1px は細すぎとの判断で既定 2px)
+            # grow the skeleton to width px (2026-08-27: 1px judged too thin, default 2px)
             k = np.ones((2, 2), np.uint8) if width == 2 \
                 else np.ones((3, 3), np.uint8)
             grow = (cv2.dilate(sk.astype(np.uint8), k) > 0) \
@@ -269,12 +269,12 @@ _OCC_CACHE = {}
 
 
 def draw_occ(bev, occ, sy2, sx2, alpha=0.35, thresh=0.0):
-    """占有格子 (occ) を BEV パネルに重ねる。
+    """Overlay the occupancy grid (occ) on the BEV panel.
 
-    occ は [C, Z, H, W] = (10 クラス, 16 高さビン, 200, 200) で、
-    クラス 0 が free。高さ方向は最大値で潰し、free 確率が低いセルだけを
-    「占有」として色付けする。BEV パネルは前 VIEW_F / 後 VIEW_R / 横 ±YH を
-    covers するので、occ の ±40 m をその画素座標に貼り込む。
+    occ is [C, Z, H, W] = (10 classes, 16 height bins, 200, 200), with
+    class 0 = free. Collapse the height axis by max and colour only cells whose
+    free probability is low as "occupied". The BEV panel covers front VIEW_F / rear VIEW_R /
+    lateral +-YH, so paste the +-40 m of occ into those pixel coordinates.
     """
     if occ is None:
         return
@@ -283,23 +283,23 @@ def draw_occ(bev, occ, sy2, sx2, alpha=0.35, thresh=0.0):
         o = o[0]
     if o.ndim != 4:
         return
-    # softmax を取ると 10x16x200x200 の exp で描画が 90 ms 増えたので、
-    # ロジットの大小比較だけで判定する (結果は argmax と同じ)。
+    # Taking a softmax cost 90 ms of rendering via the exp over 10x16x200x200, so
+    # decide by comparing logits only (result is identical to argmax).
     o = o.astype(np.float32)
     free = o[0]                                       # [Z,H,W]
     rest = o[1:]                                      # [C-1,Z,H,W]
-    best = rest.max(0)                                # クラス方向の最大
-    occ_z = best - free                               # >0 なら占有
-    zi = occ_z.argmax(0)                              # 最も占有らしい高さ
+    best = rest.max(0)                                # max over classes
+    occ_z = best - free                               # >0 means occupied
+    zi = occ_z.argmax(0)                              # most-occupied height
     ii = np.indices(zi.shape)
-    occupied = occ_z[zi, ii[0], ii[1]]                # [H,W] マージン
-    cls = rest.argmax(0)[zi, ii[0], ii[1]] + 1        # 代表クラス
+    occupied = occ_z[zi, ii[0], ii[1]]                # [H,W] margin
+    cls = rest.argmax(0)[zi, ii[0], ii[1]] + 1        # representative class
     H, W = occupied.shape
     col = PALETTE[cls % len(PALETTE)][:, :, ::-1].astype(np.uint8)
     m = occupied > thresh
     if not m.any():
         return
-    # occ セル (r, c) -> 自車座標: x = +40 - r*0.4, y = +40 - c*0.4
+    # occ cell (r, c) -> ego coords: x = +40 - r*0.4, y = +40 - c*0.4
     y0 = int(round((VIEW_F - OCC_XY) * sy2))
     y1 = int(round((VIEW_F + OCC_XY) * sy2))
     x0 = int(round((YH - OCC_XY) * sx2))
@@ -309,7 +309,7 @@ def draw_occ(bev, occ, sy2, sx2, alpha=0.35, thresh=0.0):
     tx0, tx1 = max(0, x0), min(bw, x1)
     if ty1 <= ty0 or tx1 <= tx0:
         return
-    # occ 側の対応範囲を切り出してからパネル解像度へ拡大する
+    # crop the matching range on the occ side, then upscale to panel resolution
     sr0 = int(round((ty0 - y0) / max(y1 - y0, 1) * H))
     sr1 = int(round((ty1 - y0) / max(y1 - y0, 1) * H))
     sc0 = int(round((tx0 - x0) / max(x1 - x0, 1) * W))
@@ -356,7 +356,7 @@ def _rot_iou(a, b):
         return 0.0, 0.0          # (IoU, containment) — callers unpack two values
     inter = cv2.contourArea(cv2.convexHull(pts))
     union = a[2] * a[3] + b[2] * b[3] - inter
-    # (IoU, 交差 / 小さい方の面積): 大箱に内包される小箱は IoU が小さいので後者で捕まえる
+    # (IoU, intersection / smaller area): a small box inside a big one has low IoU, so the latter catches it
     return float(inter / max(union, 1e-6)), float(inter / max(min(a[2] * a[3], b[2] * b[3]), 1e-6))
 
 
@@ -378,12 +378,12 @@ def bev_box_nms(det, iou_th=0.3, cont_th=0.6):
 
 
 def ground_point(u, v, Kc, Tce, ground_z=0.0):
-    """画素 (u,v) を通る視線と路面 (ego z=ground_z) の交点 [ego x,y] (無ければ None)。
-    Tce = T_cam_ego (ego->cam)。カメラ中心 c = -R^T t、方向 d = R^T K^-1 [u,v,1]。"""
+    """Intersection of the ray through pixel (u,v) with the road surface (ego z=ground_z) as [ego x,y] (None if none).
+    Tce = T_cam_ego (ego->cam). Camera centre c = -R^T t, direction d = R^T K^-1 [u,v,1]."""
     R = Tce[:3, :3]; t = Tce[:3, 3]
     c = -R.T @ t
     d = R.T @ np.linalg.solve(Kc, np.array([u, v, 1.0]))
-    if d[2] >= -1e-6:              # 視線が下を向いていない
+    if d[2] >= -1e-6:              # ray does not point downwards
         return None
     lam = (ground_z - c[2]) / d[2]
     if lam <= 0:
@@ -406,22 +406,22 @@ def compose_frame(raw, K, Tc, v0, out, dt, fps_now=None, pose=None):
     Shared by the offline renderer below and deploy/orin_realtime.py, so the
     realtime pipeline draws EXACTLY what the offline video shows.
     """
-    # per-class decode threshold (2026-08-13 実測採用): veh 0.45 / vru 0.15
-    # -- v63b スイープで vru R 0.33->0.41, P 0.57 (下限 0.55 ルール合格)
+    # per-class decode threshold (2026-08-13, adopted from measurements): veh 0.45 / vru 0.15
+    # -- v63b sweep: vru R 0.33->0.41, P 0.57 (passes the 0.55 floor rule)
     det = [(b["cls"] == "vru" and 1 or 0, b["score"], b["x"],
             b["y"], b["l"], b["w"], b["yaw"]) for b in
            decode_boxes(out["hm"], out["reg"], thresh=0.15)
            if b["score"] > (0.35 if b["cls"] == "vehicle" else 0.15)
-           # 2026-08-18 修正: -28..50 の固定クリップは軽量版 (rear-40, det 監督
-           # 窓 前50/後28) の残骸。8 カメラの全域エンジンでは後方 28 m 超と
-           # 前方 50 m 超の検出が「表示だけ」消えており、デモを見る限り
-           # 「後方車両が改善しない」ように見えていた。格子の実範囲へ追従させる。
+           # 2026-08-18 fix: the fixed -28..50 clip was a leftover of the light variant (rear-40,
+           # det supervision window front 50 / rear 28). On the 8-camera full-range engine,
+           # detections beyond 28 m rear and 50 m front vanished "in the display only", which
+           # in the demo looked like "rear vehicles never improve". Follow the real grid extent.
            and -(XR - 2.0) <= b["x"] <= (XF - 2.0)]
-    # BEV 回転箱 IoU による NMS (2026-09-08 ユーザー指摘「BEV 上で NMS が効いていない」):
-    # decode の中心内包則は横並び・向き違いの重複を落とせない。IoU > 0.3 を抑制。
+    # NMS by BEV rotated-box IoU (2026-09-08, user report "NMS is not working in BEV"):
+    # the centre-containment rule in decode cannot drop side-by-side / differently oriented duplicates. Suppress IoU > 0.3.
     det = bev_box_nms(det, iou_th=float(os.environ.get("METEOR_BEV_NMS_IOU", "0.3")))
-    # 時系列 yaw 平滑化 (2026-08-13): 前フレーム箱と 2.5m マッチ ->
-    # 180°フリップ抑止 + EMA a=0.6。特徴の薄い真横/真後ろの回転を抑える。
+    # Temporal yaw smoothing (2026-08-13): match previous-frame boxes within 2.5m ->
+    # suppress 180 deg flips + EMA a=0.6. Damps rotation of feature-poor broadside/rear-on boxes.
     _tr = getattr(compose_frame, "_yaw_tracks", [])
     _sm = []
     for d in det:
@@ -457,10 +457,10 @@ def compose_frame(raw, K, Tc, v0, out, dt, fps_now=None, pose=None):
     if prev is not None:
         lg[prev] += 0.35
     k = int(lg.argmax())
-    # 直進優先 (2026-08-18 実測採用): コマンド無しのデモでは、旋回モードの
-    # ロジットが直進を 1.0 以上上回らない限り直進を選ぶ。INT8 は量子化で
-    # 右モードを 2 倍選ぶ (29 対 15) 実測があり、この規則でパス平均 y が
-    # -1.012 -> -0.902 m、対GT ADE も 5.60 -> 5.33 と改善。fp16 では無害。
+    # Prefer straight (2026-08-18, adopted from measurements): in the command-free demo, pick
+    # straight unless a turning mode's logit beats it by >= 1.0. INT8 measurably picked the
+    # right mode 2x as often due to quantisation (29 vs 15); with this rule the mean path y
+    # went -1.012 -> -0.902 m and ADE vs GT improved 5.60 -> 5.33. Harmless under fp16.
     if k != 0 and (lg[k] - lg[0]) < 1.0:
         k = 0
     compose_frame._prev_mode = k
@@ -488,9 +488,9 @@ def compose_frame(raw, K, Tc, v0, out, dt, fps_now=None, pose=None):
     for k8, chn in enumerate(CAM8):
         x0 = 8 + (k8 % 4) * (CW + 6)
         y0 = 34 + (k8 // 4) * (CH + 26)
-        # BACK_NARROW は 7 カメラ構成には存在しないので空白のままにするが、
-        # 8 カメラのエンジン (ベースライン系) では実際に入力として使うので
-        # 他のカメラと同じように描く (2026-08-15)。
+        # BACK_NARROW does not exist in the 7-camera rig, so leave it blank there, but
+        # 8-camera engines (baseline line) really use it as an input, so draw it
+        # like every other camera (2026-08-15).
         if chn not in CAM_DRAW:
             cv2.putText(canvas, f"{chn} (blank)",
                         (x0 + 70, y0 + CH // 2),
@@ -499,8 +499,8 @@ def compose_frame(raw, K, Tc, v0, out, dt, fps_now=None, pose=None):
             continue
         i = CAM_DRAW.index(chn)
         img = cv2.resize(raw[chn], (CW, CH))
-        # 2026-09-05 ユーザー指示: 2D タイルへの seg マスク重畳は既定で行わない
-        # (METEOR_SEG2D_OVERLAY=1 で従来表示)。描画コストも下がる。
+        # 2026-09-05 user instruction: no seg-mask overlay on the 2D tiles by default
+        # (METEOR_SEG2D_OVERLAY=1 restores the old view). Also cuts rendering cost.
         if _SEG2D_OVERLAY:
             ov = PALETTE[cv2.resize(segp[i], (CW, CH),
                          interpolation=cv2.INTER_NEAREST)
@@ -516,7 +516,7 @@ def compose_frame(raw, K, Tc, v0, out, dt, fps_now=None, pose=None):
                     (200, 200, 200), 1, cv2.LINE_AA)
         canvas[y0:y0 + CH, x0:x0 + CW] = img
     # Depth block: same tile size and CAM8 order as the RGB block
-    # (METEOR_DEPTH_PANEL=0 で省略: 2026-09-05 「10 FPS 以上」指示の軽量描画)
+    # (skipped with METEOR_DEPTH_PANEL=0: lightweight rendering for the 2026-09-05 "10 FPS or more" instruction)
     for k8, chn in (enumerate(CAM8) if os.environ.get("METEOR_DEPTH_PANEL", "1") != "0" else ()):
         x0 = 8 + (k8 % 4) * (CW + 6)
         y0 = 34 + (2 + k8 // 4) * (CH + 26)
@@ -530,10 +530,10 @@ def compose_frame(raw, K, Tc, v0, out, dt, fps_now=None, pose=None):
         d8 = cv2.resize(dep[i], (CW, CH),
                         interpolation=cv2.INTER_NEAREST)
         canvas[y0:y0 + CH, x0:x0 + CW] = cv2.applyColorMap(
-            # 深度ビン数に合わせて色域を張る。旧実装は 64 bin 前提の x4 固定で、
-            # 32 bin モデル (v63b/v67 系) では色域の下半分しか使われず
-            # 「側方 Depth が汚い/平坦」に見えていた (2026-08-14, 実機動画で確認)。
-            # METEOR_DEPTH_BINS で指定 (既定 64)。
+            # Stretch the colour range to the depth bin count. The old code assumed 64 bins (fixed x4),
+            # so 32-bin models (v63b/v67 line) used only the lower half of the range and
+            # "side Depth looks dirty/flat" (2026-08-14, confirmed in on-device video).
+            # Set via METEOR_DEPTH_BINS (default 64).
             (d8.astype(np.float32) * (255.0 / max(_DBINS - 1, 1))
              ).clip(0, 255).astype(np.uint8), cv2.COLORMAP_TURBO)
 
@@ -544,9 +544,9 @@ def compose_frame(raw, K, Tc, v0, out, dt, fps_now=None, pose=None):
     if os.environ.get("METEOR_SEG_FUSE", "1") != "0":
         _ll = out.get("lane_logit")
         if _ll is not None:
-            lane = seg_fuse_logit(lane, _ll, pose)   # 完全版 (logit 融合)
+            lane = seg_fuse_logit(lane, _ll, pose)   # full version (logit fusion)
         else:
-            lane = seg_fuse_np(lane, pose)           # 近似版 (旧エンジン)
+            lane = seg_fuse_np(lane, pose)           # approximation (older engines)
     if os.environ.get("METEOR_NO_THIN", "0") == "0":
         lane = thin_road_edge_np(lane)
     if os.environ.get("METEOR_THIN_LANES", "0") != "0":
@@ -554,7 +554,7 @@ def compose_frame(raw, K, Tc, v0, out, dt, fps_now=None, pose=None):
     pc = crop_bev_np(lane, XF, XR, VIEW_F, VIEW_R, YH)
     BH2 = 1000
     BW2 = int(BH2 * pc.shape[1] / pc.shape[0])
-    # ローカル demo と同じ表示規約: sidewalk(2)/parking(8) は非表示
+    # Same display convention as the local demo: sidewalk(2)/parking(8) hidden
     bev = cv2.resize(DEMO_PALETTE[pc][:, :, ::-1].astype(np.uint8),
                      (BW2, BH2), interpolation=cv2.INTER_NEAREST)
     span = VIEW_F + VIEW_R
@@ -606,15 +606,15 @@ def compose_frame(raw, K, Tc, v0, out, dt, fps_now=None, pose=None):
                             int((VIEW_F - fx) * sy2)))
             cv2.polylines(bev, [np.array(pts, np.int32).reshape(-1, 1, 2)],
                           False, col, 1)
-    # --- 2D 'obs' (落下物・未知障害物, class 0) を予測深度で BEV へ投影 ---
-    # (2026-09-06 ユーザー指示: 旧 demo_rgbd_bev --unk2d の移植。箱の下端寄り
-    #  (cy + 0.25h) の深度 bin を距離に変換し、K / T_cam_ego で自車座標へ。
-    #  複数カメラの重複は 1.5 m クラスタで最大スコアのみ残す)
+    # --- Project 2D 'obs' (dropped objects / unknown obstacles, class 0) into BEV via predicted depth ---
+    # (2026-09-06 user instruction: port of the old demo_rgbd_bev --unk2d. Convert the depth bin
+    #  near the box bottom (cy + 0.25h) to a distance, then K / T_cam_ego into ego coords.
+    #  Duplicates across cameras: keep only the max score within 1.5 m clusters)
     if os.environ.get("METEOR_UNK2D", "1") != "0":
         _th_unk = float(os.environ.get("METEOR_UNK2D_TH",
                                        os.environ.get("METEOR_TH2D", "0.30")))
         _dm = np.exp(np.linspace(np.log(1.0), np.log(79.75), _DBINS))
-        # 期待値深度 (エンジン出力 depth_mean, 2026-09-07) があればそれを使い、無ければ argmax ビン
+        # Use the expected depth (engine output depth_mean, 2026-09-07) if present, else the argmax bin
         _dmean = out.get("depth_mean")
         _dmean = np.asarray(_dmean, np.float32)[0] if _dmean is not None else None
         fh, fw = (dep.shape[-2:] if _dmean is None else _dmean.shape[-2:])
@@ -624,13 +624,13 @@ def compose_frame(raw, K, Tc, v0, out, dt, fps_now=None, pose=None):
             for cls2, sc2, cx2, cy2, w2, h2 in b2d[i]:
                 if int(cls2) != 0 or sc2 < _th_unk:
                     continue
-                # 主: 箱の下端 (接地点) を通る視線と路面の交点 (2026-09-08; 深度マップより確実)
+                # Primary: ray through the box bottom (contact point) meets the road surface (2026-09-08; more reliable than the depth map)
                 pe2 = ground_point(cx2, cy2 + 0.5 * h2, Kc, Tce, _GROUND_Z)
                 if pe2 is not None and 1.5 < float(np.hypot(*pe2)) < 60.0:
                     pe = np.array([pe2[0], pe2[1], _GROUND_Z])
                     d_ = float(np.hypot(*pe2))
                 else:
-                    # 副: 期待値深度 (箱下端寄り 5x5 窓の中央値)
+                    # Fallback: expected depth (median of a 5x5 window near the box bottom)
                     u = int(np.clip(cx2 / 768.0 * fw, 0, fw - 1))
                     v = int(np.clip((cy2 + 0.35 * h2) / 432.0 * fh, 0, fh - 1))
                     u0, u1 = max(0, u - 2), min(fw, u + 3)
@@ -657,14 +657,14 @@ def compose_frame(raw, K, Tc, v0, out, dt, fps_now=None, pose=None):
             if xe_ > VIEW_F or xe_ < -VIEW_R or abs(ye_) > YH:
                 continue
             q = (int((YH - ye_) * sx2), int((VIEW_F - xe_) * sy2))
-            # ユーザー指示 (2026-09-07): 白の小さな丸のみ。名前・距離ラベルは描かない
+            # User instruction (2026-09-07): small white dot only. No name / distance labels
             cv2.circle(bev, q, 4, (255, 255, 255), -1)
             cv2.circle(bev, q, 5, (40, 40, 40), 1)
-    # LiDAR 入力の重畳 (2026-09-08): ピラーラスタ [4,400,250] (0.4m/セル, 前後±80 左右±50) の
-    # 占有セルを薄い青緑の点で描く。カメラのみ (零入力) のときは何も描かない。
+    # LiDAR input overlay (2026-09-08): draw the occupied cells of the pillar raster [4,400,250]
+    # (0.4m/cell, +-80 longitudinal, +-50 lateral) as pale teal dots. Camera-only (zero input) draws nothing.
     _lbin = out.get("lidar_bev_in")
     if _lbin is not None:
-        # ch = (log-count, max z, mean z, occupancy): 占有かつ max z > 0.3 m (路面返り点を除く障害物) だけ描く
+        # ch = (log-count, max z, mean z, occupancy): draw only occupied cells with max z > 0.3 m (obstacles, excluding road-surface returns)
         _lb4 = np.asarray(_lbin, np.float32)[0]
         _occ = (_lb4[3] > 0) & (_lb4[1] > float(os.environ.get("METEOR_LIDAR_ZMIN", "0.3")))
         _res_l = (XF + XR) / _occ.shape[0]
@@ -676,8 +676,8 @@ def compose_frame(raw, K, Tc, v0, out, dt, fps_now=None, pose=None):
         for _y, _x in zip(_ys, _xs):
             cv2.circle(bev, (int((_x + 0.5) * _sx), int((_y + 0.5) * _sy)), 1, (170, 200, 110), -1)
     if "risk" in out:
-        # ローカル (demo_rgbd_bev.py) と同一の重畳: +-40m を TURBO で、
-        # 濃さは risk 値そのもの (alpha 0.55)
+        # Same overlay as local (demo_rgbd_bev.py): +-40m in TURBO,
+        # opacity is the risk value itself (alpha 0.55)
         _rm = 1.0 / (1.0 + np.exp(-np.asarray(out["risk"], np.float32)
                                   .reshape(out["risk"].shape[-2:])))
         _SPAN = VIEW_F + VIEW_R
@@ -697,10 +697,10 @@ def compose_frame(raw, K, Tc, v0, out, dt, fps_now=None, pose=None):
     pts = [(int(YH * sx2), cy0)]
     pts += [(int((YH - y) * sx2), int((VIEW_F - x) * sy2))
             for x, y in wp]
-    # ローカル (demo_rgbd_bev.py) と同一の描画仕様に揃える (2026-08-24)。
-    # 以前は色 (0,255,120)・線幅 3・半径 5 + 暗い縁取りという Orin 独自の
-    # 見た目になっており、ローカルの可視化と並べたときに別物に見えていた。
-    # ローカル: 純緑 (0,255,0)、線幅 2、waypoint は半径 3 の塗り潰しのみ。
+    # Match the drawing spec of local (demo_rgbd_bev.py) exactly (2026-08-24).
+    # Previously an Orin-specific look: colour (0,255,120), thickness 3, radius 5 + dark
+    # outline, which looked like a different thing next to the local visualisation.
+    # Local: pure green (0,255,0), thickness 2, waypoints as radius-3 filled dots only.
     cv2.polylines(bev, [np.array(pts, np.int32).reshape(-1, 1, 2)], False,
                   (0, 255, 0), 2)
     for q in pts[1:]:
@@ -726,16 +726,16 @@ def compose_frame(raw, K, Tc, v0, out, dt, fps_now=None, pose=None):
         bev = cv2.resize(bev, (bw_fit, int(BH2 * bw_fit / BW2)))
     canvas[34:34 + min(bev.shape[0], VH - 40),
            xb0:xb0 + bev.shape[1]] = bev[:VH - 40]
-    # OCC はローカル demo と同じ「左下の独立ボクセルパネル」で見せる
-    # (2026-08-19、BEV への半透明重ねは METEOR_OCC_OVERLAY=1 のときだけ)。
+    # OCC is shown like the local demo: an "independent voxel panel at bottom-left"
+    # (2026-08-19; the translucent overlay on the BEV only with METEOR_OCC_OVERLAY=1).
     if os.environ.get("METEOR_OCC_PANEL", "1") != "0":
         _occ = out.get("occ")
         if _occ is not None:
             try:
                 from deploy.occ_iso import cube_render_fast
-                # ARM CPU では素朴に描くと ~270 ms かかり FPS を半減させる。
-                # (1) argmax 前に ±24 m へクロップ (6.4M -> 2.3M 要素)、
-                # (2) 最終サイズで直接描画、(3) 2 フレームに 1 回だけ更新。
+                # Drawn naively on the ARM CPU this takes ~270 ms and halves the FPS.
+                # (1) crop to +-24 m before argmax (6.4M -> 2.3M elements),
+                # (2) draw directly at final size, (3) update only every other frame.
                 _ev = max(1, int(os.environ.get("METEOR_OCC_EVERY", "3")))
                 _OCC_CACHE["n"] = _OCC_CACHE.get("n", -1) + 1
                 if _OCC_CACHE["n"] % _ev == 0 or _OCC_CACHE.get("iso") is None:
@@ -744,12 +744,12 @@ def compose_frame(raw, K, Tc, v0, out, dt, fps_now=None, pose=None):
                         o = o[0]
                     n24 = 60                       # 24 m / 0.4 m
                     c0 = o.shape[-1] // 2 - n24
-                    # z も描画上限 (3 m -> 10 ビン) まで先に落とす: argmax の
-                    # 要素数 1.92M -> 1.2M
+                    # also drop z to the drawing ceiling (3 m -> 10 bins) first: argmax
+                    # element count 1.92M -> 1.2M
                     oc = o[:, :10, c0:c0 + 2 * n24, c0:c0 + 2 * n24]
                     occ_cls = oc.argmax(0).astype(np.uint8)   # [Z,h,w]
                     _ds = int(os.environ.get("METEOR_OCC_DS", "1"))
-                    if _ds > 1:        # ボクセル間引き (粗いが 1/ds^2 に軽量化)
+                    if _ds > 1:        # voxel subsampling (coarse, but 1/ds^2 cheaper)
                         occ_cls = occ_cls[:, ::_ds, ::_ds]
                     _OCC_CACHE["iso"] = cube_render_fast(occ_cls, W=426, H=360)
                 iso = _OCC_CACHE["iso"]
@@ -760,8 +760,8 @@ def compose_frame(raw, K, Tc, v0, out, dt, fps_now=None, pose=None):
                             (220, 220, 220), 1, cv2.LINE_AA)
             except Exception:
                 pass
-    # 実行環境はハードコードせず自動取得する (2026-08-25)。以前は
-    # "METEOR light - AGX Orin" 固定で、laptop で動かしても Orin と表示された。
+    # Detect the runtime environment instead of hard-coding it (2026-08-25). It used to be
+    # fixed to "METEOR light - AGX Orin", so a laptop run was labelled as Orin too.
     global _ENV_TAG
     try:
         _ENV_TAG
@@ -798,30 +798,30 @@ def main():
     ap.add_argument("--fps", type=int, default=4)
     a = ap.parse_args()
 
-    # 出力スロットを 2 枚にする: 1 枚だと infer が全出力を CPU 側で .copy()
-    # しており、Orin の弱い CPU で実測 9.4 ms 払っていた (108.8 -> 99.4 ms)。
-    # この描画ループは out を使い切ってから次の infer を呼ぶ逐次実行なので、
-    # 2 枚あれば十分 (前フレームの配列を跨いで保持しない)。
+    # Use 2 output slots: with 1, infer .copy()s every output on the CPU side, which
+    # measured 9.4 ms on the weak Orin CPU (108.8 -> 99.4 ms).
+    # This render loop is sequential (out is fully consumed before the next infer),
+    # so 2 are enough (no arrays are held across the previous frame).
     rt = MeteorRT(a.engine, n_out_slots=2)
-    # v103 世代のエンジンは imgs が uint8 (正規化はグラフ内)。ここで
-    # float32/255 を渡すとランタイムの uint8 キャストでほぼ 0 に潰れ、
-    # BEV Seg は「それらしく」出るのに 3D 検出だけ静かに壊れる
-    # (実測 hm 最大 -1.715 -> -3.540 = 信頼度 0.15 -> 0.029)。
+    # v103-generation engines take imgs as uint8 (normalisation is in the graph). Passing
+    # float32/255 here gets squashed to ~0 by the runtime's uint8 cast, so
+    # BEV Seg looks "plausible" while only 3D detection silently breaks
+    # (measured hm max -1.715 -> -3.540 = confidence 0.15 -> 0.029).
     _want_u8 = rt.host["imgs"].dtype == np.uint8
     _n_cam = int(rt.shapes["imgs"][1])
     _CAMS_IN = CAM_IN8 if _n_cam == 8 else CAMS
-    globals()["CAM_DRAW"] = list(_CAMS_IN)     # 描画も同じ本数・同じ並びに
-    # BEV の後方範囲をエンジンの行数から決める。この呼び出しが無いと XR は
-    # 軽量版 (600 行 = 前 80 / 後 40 m) の値で固定されたままになり、
-    # 800 行 = 前後 80 m のベースラインでも「後方 40 m」として描いてしまう。
-    # 後方の半分が消え、縮尺も狂う (2026-08-24 に実害。関数は用意されていたが
-    # どこからも呼ばれていなかった)。
+    globals()["CAM_DRAW"] = list(_CAMS_IN)     # render with the same count and order
+    # Derive the BEV rear extent from the engine's row count. Without this call XR
+    # stays fixed at the light-variant value (600 rows = 80 m front / 40 m rear),
+    # so an 800-row = 80 m front and rear baseline is drawn as "40 m rear" too.
+    # Half the rear vanishes and the scale is wrong (bit us on 2026-08-24; the function
+    # existed but was never called from anywhere).
     set_bev_extent(int(rt.shapes["lane"][-2]))
     _logged_cams = []
-    print(f"[render] エンジンは {_n_cam} カメラ -> 入力順 {_CAMS_IN[0]} ...",
+    print(f"[render] engine has {_n_cam} cameras -> input order {_CAMS_IN[0]} ...",
           flush=True)
-    print(f"[render] imgs 入力は {rt.host['imgs'].dtype} "
-          f"({'uint8 をそのまま渡す' if _want_u8 else 'float32 に正規化して渡す'})",
+    print(f"[render] imgs input is {rt.host['imgs'].dtype} "
+          f"({'passing uint8 as-is' if _want_u8 else 'normalising to float32'})",
           flush=True)
     os.makedirs(os.path.dirname(a.out) or ".", exist_ok=True)
     vw = cv2.VideoWriter(a.out, cv2.VideoWriter_fourcc(*"mp4v"),
@@ -832,9 +832,9 @@ def main():
                                                    "manifest.json")))
     for s in scenes[:a.scenes]:
         m = json.load(open(os.path.join(a.root, s, "manifest.json")))
-        # 欠けているカメラは K/T を単位行列、画像を 0 にする (学習側の
-        # cam-drop と同じ扱い)。7 カメラのリグを 8 カメラのエンジンに
-        # 通すときはこの経路になる。
+        # Missing cameras get identity K/T and a zero image (same treatment as
+        # cam-drop on the training side). Feeding a 7-camera rig to an 8-camera
+        # engine takes this path.
         _eye3, _eye4 = np.eye(3, dtype=np.float32), np.eye(4, dtype=np.float32)
         K = np.stack([np.array(m["cams"][c]["K"], np.float32)
                       if c in m["cams"] else _eye3
@@ -854,16 +854,16 @@ def main():
                 im = cv2.imread(os.path.join(a.root, s,
                                              f["imgs"].get(c, "_")))
                 if im is None:
-                    if c in CAMS:          # 本来あるべきカメラが欠けた
+                    if c in CAMS:          # a camera that should exist is missing
                         ok = False
                         break
-                    im = None              # 8 カメラ目が無いリグ -> 0 で埋める
+                    im = None              # rig without the 8th camera -> fill with 0
                 raw[c] = im
             if not ok:
                 continue
             if not _logged_cams:
                 _ok = [c for c in _CAMS_IN if raw.get(c) is not None]
-                print(f"[render] 実際に読み込んだカメラ {len(_ok)}/{len(_CAMS_IN)}: "
+                print(f"[render] cameras actually loaded {len(_ok)}/{len(_CAMS_IN)}: "
                       f"{_ok}", flush=True)
                 _logged_cams.append(1)
             _shape = next(v.shape for v in raw.values() if v is not None)

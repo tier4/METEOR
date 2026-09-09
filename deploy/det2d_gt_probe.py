@@ -1,6 +1,6 @@
-"""2D BBox の GT 付き fp16 vs INT8 判定 (ローカル, 2026-08-27)。
-使い方: python3 deploy/det2d_gt_probe.py <engine> [n_scenes] [stride]
-GT: bbox2d/%04d.npz boxes[8,96,5]=(cls,cx,cy,w,h), counts[8]。
+"""fp16 vs INT8 verdict for 2D BBoxes with GT (local, 2026-08-27).
+Usage: python3 deploy/det2d_gt_probe.py <engine> [n_scenes] [stride]
+GT: bbox2d/%04d.npz boxes[8,96,5]=(cls,cx,cy,w,h), counts[8].
 """
 import json
 import os

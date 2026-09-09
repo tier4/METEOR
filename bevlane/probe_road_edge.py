@@ -1,8 +1,8 @@
-"""道路領域の左右端の pred-GT オフセットを距離帯別に測る。
+"""Measure the pred-GT offset of the left/right road edges per range band.
 
-ホールドアウトで「予測道路が左に広がり、余分な車線を生成」して見える件の
-定量化。行ごとに road クラスの最左/最右列を取り、pred-GT を左右別に集計
-(+=左)。左端だけ大きく + なら「左側に道路をはみ出して生成」が確定。
+Quantifies the holdout impression that the predicted road spreads left and grows an
+extra lane. Per row, take the leftmost/rightmost road column and accumulate pred-GT
+per side (+=left). A large + on the left edge alone confirms road overflow to the left.
 """
 import argparse
 import os
@@ -34,11 +34,11 @@ cur = m.state_dict()
 m.load_state_dict({k: v for k, v in sd.items()
                    if k in cur and cur[k].shape == v.shape}, strict=False)
 
-BANDS = [("前 0-20m", 0, 20), ("前 20-40m", 20, 40), ("前 40-60m", 40, 60),
-         ("後 0-20m", -20, 0), ("後 20-40m", -40, -20)]
-dl = {b[0]: [] for b in BANDS}       # 左端 pred-GT (+=左へ拡大)
-dr = {b[0]: [] for b in BANDS}       # 右端 pred-GT (+=左 = 右へは縮小)
-wr = {b[0]: [] for b in BANDS}       # 幅比 pred/GT
+BANDS = [("front 0-20m", 0, 20), ("front 20-40m", 20, 40), ("front 40-60m", 40, 60),
+         ("rear 0-20m", -20, 0), ("rear 20-40m", -40, -20)]
+dl = {b[0]: [] for b in BANDS}       # left edge pred-GT (+=expands left)
+dr = {b[0]: [] for b in BANDS}       # right edge pred-GT (+=left = shrinks on the right)
+wr = {b[0]: [] for b in BANDS}       # width ratio pred/GT
 step = max(1, len(ds) // a.frames)
 done = 0
 ROAD = 1
@@ -60,7 +60,7 @@ for i in range(0, len(ds), step):
             pc = np.flatnonzero(pm[r])
             if len(gc) < 5 or len(pc) < 5:
                 continue
-            # 列は +y(左) ほど小さい
+            # column index decreases toward +y (left)
             dl[nm].append((gc[0] - pc[0]) * 0.2)
             dr[nm].append((gc[-1] - pc[-1]) * 0.2)
             wr[nm].append(len(pc) / len(gc))
@@ -68,8 +68,8 @@ for i in range(0, len(ds), step):
     if done >= a.frames:
         break
 
-print(f"\n=== {a.tag or a.ckpt} 道路端オフセット ({done} 枚, +=左) ===")
-print("帯         n     左端 pred-GT      右端 pred-GT     幅比 pred/GT")
+print(f"\n=== {a.tag or a.ckpt} road edge offset ({done} frames, +=left) ===")
+print("band       n     left pred-GT      right pred-GT    width pred/GT")
 for nm, *_ in BANDS:
     L, R, W = map(np.array, (dl[nm], dr[nm], wr[nm]))
     if len(L) >= 10:

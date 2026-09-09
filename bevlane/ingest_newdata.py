@@ -120,14 +120,14 @@ def main():
     found, rejected = {}, {}
     for r in ROOTS:
         if not os.path.isdir(r):
-            print(f"  {r}: 存在しません")
+            print(f"  {r}: does not exist")
             continue
         s = scenes_under(r)
         bad = {k: why_bad(v) for k, v in s.items()}
         bad = {k: b for k, b in bad.items() if b}
         ok = {k: v for k, v in s.items() if k not in bad}
-        print(f"  {os.path.basename(r):24s} {len(ok):4d} 有効 / "
-              f"{len(bad):3d} 除外 / {len(set(map(recording, ok))):3d} 録画")
+        print(f"  {os.path.basename(r):24s} {len(ok):4d} valid / "
+              f"{len(bad):3d} excluded / {len(set(map(recording, ok))):3d} recordings")
         rejected.update({k: (os.path.basename(r), b) for k, b in bad.items()})
         for k, v in ok.items():
             if k in found:
@@ -136,7 +136,7 @@ def main():
             found[k] = v
     if rejected:
         from collections import Counter
-        print("\n  除外の内訳:")
+        print("\n  exclusion breakdown:")
         for reason, n in Counter(b for _, b in rejected.values()).most_common():
             print(f"    {reason:34s} {n:4d}")
 
@@ -155,20 +155,20 @@ def main():
     test_recs = {r for r in recs if h(r) < a.test_frac and r not in protected}
     if protected & {r for r in recs if h(r) < a.test_frac}:
         n = len(protected & {r for r in recs if h(r) < a.test_frac})
-        print(f"  ({n} 録画は学習済みのため holdout から除外)")
+        print(f"  ({n} recordings already trained on, excluded from holdout)")
     tr = sorted(s for s in found if recording(s) not in test_recs)
     te = sorted(s for s in found if recording(s) in test_recs)
-    print(f"\n合計 {len(found)} シーン / {len(recs)} 録画")
-    print(f"  train    {len(tr):4d} シーン / {len(recs) - len(test_recs):3d} 録画"
+    print(f"\ntotal {len(found)} scenes / {len(recs)} recordings")
+    print(f"  train    {len(tr):4d} scenes / {len(recs) - len(test_recs):3d} recordings"
           f"  ({100 * len(tr) / max(len(found), 1):.1f}%)")
-    print(f"  holdout  {len(te):4d} シーン / {len(test_recs):3d} 録画"
+    print(f"  holdout  {len(te):4d} scenes / {len(test_recs):3d} recordings"
           f"  ({100 * len(te) / max(len(found), 1):.1f}%)")
     assert not (set(tr) & set(te))
     assert not ({recording(s) for s in tr} & {recording(s) for s in te}), \
-        "録画が train と holdout の両方に現れています"
+        "a recording appears in both train and holdout"
 
     if not a.commit:
-        print("\n--commit を付けると symlink を張ります（今は何もしていません）")
+        print("\npass --commit to create the symlinks (nothing was done now)")
         return
     os.makedirs(a.dest, exist_ok=True)
     n_new = n_skip = 0
@@ -181,8 +181,8 @@ def main():
         n_new += 1
     open(a.train_out, "w").write("\n".join(tr) + "\n")
     open(a.test_out, "w").write("\n".join(te) + "\n")
-    print(f"\nsymlink: 新規 {n_new} / 既存 {n_skip}  -> {a.dest}")
-    print(f"書き出し: {a.train_out} ({len(tr)})  {a.test_out} ({len(te)})")
+    print(f"\nsymlink: new {n_new} / existing {n_skip}  -> {a.dest}")
+    print(f"written: {a.train_out} ({len(tr)})  {a.test_out} ({len(te)})")
 
 
 if __name__ == "__main__":

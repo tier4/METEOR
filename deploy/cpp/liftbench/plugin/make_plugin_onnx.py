@@ -62,15 +62,15 @@ def main():
     g = gs.import_onnx(onnx.load(a.onnx))
     tmap = g.tensors()
     ctx = tmap[CTX]
-    # PointPainting (2026-08-17): 塗りが有効な ckpt では ctx 直後に
-    # 「ctx + paint_proj(seg2d 確率)」の Add が入り、下流はその出力を使う。
-    # 生の ctx を掴むと塗り経路が死にコードとして除去されてしまうので、
-    # ctx を入力に持つ Add があればその出力をプラグインへ渡す。
+    # PointPainting (2026-08-17): in ckpts with paint enabled, an Add
+    # "ctx + paint_proj(seg2d probs)" follows ctx and downstream uses its output.
+    # Grabbing the raw ctx would get the paint path removed as dead code, so
+    # if an Add takes ctx as input, pass its output to the plugin instead.
     _adds = [n for n in g.nodes
              if n.op == "Add" and any(t is ctx for t in n.inputs)]
     if _adds:
         ctx = _adds[0].outputs[0]
-        print("[surgery] painted ctx を使用 (PointPainting 経路を保持)")
+        print("[surgery] using painted ctx (PointPainting path preserved)")
     resize = [n for n in g.nodes if n.name == RESIZE]
     assert len(resize) == 1, "Resize_3 not found"
     resize = resize[0]

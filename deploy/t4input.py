@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
-"""生の t4dataset シーンを、変換ファイル無しでデモに読ませるアダプタ。
+"""Adapter that feeds raw t4dataset scenes to the demo without converted files.
 
-manifest.json の代わりに annotation/*.json をその場で解釈し、デモ側が
-期待するのと同じ形 (cams: K/T_ego_cam、frames: imgs、v0/pose) を返す。
-キット同梱のため bevlane パッケージには依存しない (json/numpy のみ)。
+Interprets annotation/*.json on the fly instead of manifest.json and returns
+the same shape the demo expects (cams: K/T_ego_cam, frames: imgs, v0/pose).
+Ships with the kit, so it does not depend on the bevlane package (json/numpy only).
 
-- K は 768x432 へのリサイズ分をここでスケールする (画像のリサイズは
-  読み込み側 load_image が行う)
-- t4 の罠: ego_pose.json は時刻順とは限らない -> timestamp で扱う
+- K is scaled here for the resize to 768x432 (the image resize itself is
+  done by load_image on the reader side)
+- t4 gotcha: ego_pose.json is not necessarily time-ordered -> key by timestamp
 """
 import json
 import os
@@ -18,9 +18,9 @@ IMG_W, IMG_H = 768, 432
 
 
 def is_t4_scene(d):
-    # annotation ディレクトリの存在だけでは足りない (シーン内の tmp/ 等が
-    # annotation もどきを持つことがあり、誤ってシーン扱いされた実害あり)。
-    # 実際に読む sample.json の実在まで確認する。
+    # The annotation directory alone is not enough (a tmp/ etc. inside a scene
+    # can hold a pseudo-annotation and got treated as a scene; bit us in practice).
+    # Check that the sample.json we actually read exists.
     return os.path.isfile(os.path.join(d, "annotation", "sample.json")) and \
         not os.path.isfile(os.path.join(d, "manifest.json"))
 
@@ -73,7 +73,7 @@ def load_t4_scene(sdir, cams):
                 T[:3, :3] = _quat_to_rot(cal["rotation"])
                 T[:3, 3] = cal["translation"]
                 cam_cache[ch] = {"K": K.tolist(), "T_ego_cam": T.tolist()}
-            imgs[ch] = sd["filename"]          # 元解像度のパスをそのまま
+            imgs[ch] = sd["filename"]          # full-resolution path as-is
         if not imgs:
             continue
         ep = egop[fr[cams[0]]["ego_pose_token"]]

@@ -46,15 +46,15 @@ class BevLaneDataset(Dataset):
         self.with_lidarbev = with_lidarbev
         self.gt_key = gt_key
         self.use_gt_valid = bool(use_gt_valid)
-        # v131 設計 (2026-08-27): 合成ドメイン (cosmos) は認識 GT のみ学習し
-        # ego (E2E) 損失から除外する。prefix 一致シーンの valid を 0 に落とす
-        # だけで、ego_loss 側は既存の valid ゲートがそのまま効く。
+        # v131 design (2026-08-27): synthetic domain (cosmos) trains perception GT only
+        # and is excluded from the ego (E2E) loss. Just zero the valid flag for prefix-
+        # matched scenes; the existing valid gate in ego_loss does the rest.
         self.ego_mask_prefix = ego_mask_prefix
-        # GT 層間回転の補正 (2026-08-19)。ポーズ由来 GT (BEV ラスタ・自車軌道
-        # wp) はキャリブ由来 GT (3D 箱・深度) に対し約 0.72° 右回転している
-        # (箱⇔レーン中心オフセットの距離回帰で自己校正、out/yawfix_plan.md)。
-        # 正の角度で自車原点 (row400,col250) まわりに反時計回りへ戻す。
-        # occ/risk/agent 系は次段 (A/B ゲート通過後) で対応する。
+        # Inter-layer GT rotation fix (2026-08-19). Pose-derived GT (BEV rasters, ego
+        # trajectory wp) is rotated ~0.72 deg clockwise relative to calib-derived GT
+        # (3D boxes, depth) (self-calibrated via box-to-lane-center offset vs distance, out/yawfix_plan.md).
+        # A positive angle rotates back CCW about the ego origin (row400,col250).
+        # occ/risk/agent are handled in the next stage (after the A/B gate passes).
         self.yaw_fix_deg = float(yaw_fix_deg)
         self._yaw_M = (cv2.getRotationMatrix2D((250.0, 400.0),
                                                self.yaw_fix_deg, 1.0)
@@ -249,9 +249,9 @@ class BevLaneDataset(Dataset):
                     img = np.clip(img, 0, 1)
             img = (img - MEAN) / STD
             if self.img_scale != 1:
-                # 目標は基準解像度 (manifest img_hw) x scale。真解像度ルート
-                # (R プログラム: 1536x864 を格納) では既に目標寸なので等倍、
-                # 旧来の 768 格納ルートでは従来どおり x2 アップサンプル。
+                # Target is base resolution (manifest img_hw) x scale. Full-res roots
+                # (R program: stores 1536x864) are already at target size, so 1x;
+                # legacy 768 roots are upsampled x2 as before.
                 th = self.hw[s][0] * self.img_scale
                 tw = self.hw[s][1] * self.img_scale
                 if img.shape[0] != th or img.shape[1] != tw:
@@ -263,13 +263,13 @@ class BevLaneDataset(Dataset):
         if gt is None:
             return None                # caller advances
         if self._yaw_M is not None and gt.shape == (800, 500):
-            # 境界は 255 (gt_cons では ignore、raw gt では下の 255→0 で背景)。
+            # Border is 255 (ignore in gt_cons; raw gt maps 255->0 = background below).
             gt = cv2.warpAffine(gt, self._yaw_M, (500, 800),
                                 flags=cv2.INTER_NEAREST,
                                 borderMode=cv2.BORDER_CONSTANT,
                                 borderValue=255)
             if gk != "gt_cons":
-                gt[gt == 255] = 0      # 回転境界を ignore(0) に落とす
+                gt[gt == 255] = 0      # rotation border -> ignore(0)
         if gk == "gt_cons":
             gt = gt.copy()
             # Preserve consensus 255 as true don't-care. Mapping it to class 0
@@ -286,11 +286,11 @@ class BevLaneDataset(Dataset):
                     borderMode=cv2.BORDER_CONSTANT, borderValue=0)
             gt = gt.copy()
             gt[valid == 0] = 255
-        # US 由来のペイント教師 (marking=7) は road として扱う (2026-08-18,
-        # ユーザー決定)。JP の GT 方針はゼブラ/導流帯を road に写像しており、
-        # US コーパスだけが 7 を教える不整合で、新ドメインの導流帯に
-        # marking (黄) が発火していた。JP GT は 7 を含まないため、この再写像は
-        # US 教師にのみ作用する。2D セグ (21 クラス) の taxonomy は対象外。
+        # US-derived paint labels (marking=7) are treated as road (2026-08-18,
+        # user decision). The JP GT policy maps zebra/channelizing areas to road;
+        # only the US corpus teaches 7, and that inconsistency made marking (yellow)
+        # fire on channelizing areas in the new domain. JP GT has no 7, so this remap
+        # only affects US labels. The 2D seg (21-class) taxonomy is untouched.
         if (gt == 7).any():
             gt = gt.copy()
             gt[gt == 7] = 1
@@ -401,8 +401,8 @@ class BevLaneDataset(Dataset):
                 b2 = p
                 c2 = np.minimum(c2, k)
             if self.img_scale != 1:
-                # レイアウトは (cls, cx, cy, w, h) — 座標は 1:5。[:4] だと
-                # クラス列を 2 倍して 18ch 目を指す (2026-08-14 実害)。
+                # Layout is (cls, cx, cy, w, h) -- coords are 1:5. [:4] would double
+                # the class column and point at channel 18 (real bug, 2026-08-14).
                 b2 = b2.copy()
                 b2[:, :, 1:5] *= self.img_scale
             if gone:
@@ -419,10 +419,10 @@ class BevLaneDataset(Dataset):
                 p = os.path.join(self.root, s, "ego_motion.npz")
                 try:
                     z = np.load(p)
-                    # 全キーを保持する (2026-09-04)。以前は 6 キーだけ保持して
-                    # いたため、後段の時系列分岐が同じキャッシュに "pose" を
-                    # 見つけられず、with_ego のとき履歴 3 スロットが常に無効
-                    # (全零) になっていた = E2E 全ラウンドで時系列融合は零入力。
+                    # Keep all keys (2026-09-04). Previously only 6 keys were kept, so
+                    # the temporal branch downstream could not find "pose" in the same
+                    # cache and, with with_ego, the 3 history slots were always invalid
+                    # (all zeros) = temporal fusion got zero input in every E2E round.
                     self._ego_cache[s] = {k: z[k] for k in z.files}
                 except Exception:
                     self._ego_cache[s] = None
@@ -431,8 +431,8 @@ class BevLaneDataset(Dataset):
             if z is not None and fi < len(z["v0"]):
                 wp_ = z["wp"][fi].reshape(6, 2)
                 if self.yaw_fix_deg:
-                    # ラスタと同じ補正回転 (ego 平面での +deg、apply_yaw_fix
-                    # と同一規約。直進 wp ドリフト -0.16 -> +0.06 m を実測)。
+                    # Same corrective rotation as the rasters (+deg in the ego plane, same
+                    # convention as apply_yaw_fix; straight-wp drift measured -0.16 -> +0.06 m).
                     th_ = np.radians(self.yaw_fix_deg)
                     c_, s_ = np.cos(th_), np.sin(th_)
                     wp_ = np.stack([c_ * wp_[:, 0] - s_ * wp_[:, 1],
@@ -442,7 +442,7 @@ class BevLaneDataset(Dataset):
                 e[14], e[15] = z["steer"][fi], z["brake"][fi]
                 e[16] = z["valid"][fi]
                 if self.ego_mask_prefix and s.startswith(self.ego_mask_prefix):
-                    e[16] = 0.0        # 認識のみ学習 (E2E 損失から除外)
+                    e[16] = 0.0        # perception only (excluded from E2E loss)
             out.append(torch.from_numpy(e))
         if self.with_occ:
             try:
@@ -597,11 +597,11 @@ class BevLaneDataset(Dataset):
                     self._ego_cache[s] = None
             z = self._ego_cache[s]
             if os.environ.get("METEOR_ZERO_HIST", "0") == "1":
-                # 評価の比較可能性のため履歴を零に固定 (2026-09-04)。修正前の
-                # 全ラウンドは履歴零で学習・検証されたので、旧数値と並べる評価
-                # (沖縄 holdout / 判定用ダミー学習) はこれを立てる。
+                # Pin history to zero for comparable evaluation (2026-09-04). All rounds
+                # before the fix trained/validated with zero history, so evaluations compared
+                # against old numbers (Okinawa holdout / dummy gating runs) set this.
                 z = None
-            if z is not None and "pose" not in z:      # 旧キャッシュ救済
+            if z is not None and "pose" not in z:      # legacy cache fallback
                 try:
                     _z = np.load(os.path.join(self.root, s, "ego_motion.npz"))
                     z = self._ego_cache[s] = {k: _z[k] for k in _z.files}
@@ -620,9 +620,9 @@ class BevLaneDataset(Dataset):
                     tmp = []
                     _gone = set(self.absent.get(s, ()))
                     for ci, c in enumerate(CAMS[:self.n_cams]):
-                        # 7 カメラ車両の欠番カメラは主経路と同じくゼロ画像
-                        # (2026-09-04: 以前は "_" を imread して失敗 → 履歴
-                        # スロット丸ごと無効 + OpenCV WARN の洪水)。
+                        # Missing camera on 7-camera vehicles -> zero image, as in the main path
+                        # (2026-09-04: previously imread("_") failed -> whole history
+                        # slot invalid + a flood of OpenCV WARNs).
                         if ci in _gone or c not in fp["imgs"]:
                             tmp.append(np.zeros((3, 432, 768), np.float32))
                             continue

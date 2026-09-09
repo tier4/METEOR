@@ -47,9 +47,9 @@ from bevlane.model import (DepthGatedIPMNet, DepthSegIPMNet,  # noqa: E402
 DET10_ABBR = ["obs", "car", "trk", "bus", "bcy", "mcy", "ped", "pnt", "tl", "ts"]
 
 
-# 描画の実体は deploy/viz_np.py に一本化 (2026-08-24)。かつてローカルと
-# Orin で同じ関数を二重に持っており、Orin 側だけカメラ順や BEV の
-# 前後範囲が食い違っても気づけなかった。出典を 1 つにして再発を断つ。
+# Rendering lives in deploy/viz_np.py only (2026-08-24). Local and Orin
+# used to carry duplicate copies of the same functions, so a mismatch in
+# camera order or BEV fore/aft range on the Orin side went unnoticed. One source.
 from deploy.viz_np import (draw_boxes2d, draw_boxes_on_rgb,  # noqa: E402
                           draw_path_ribbon)
 
@@ -274,11 +274,11 @@ def main():
                          "auto = navigation-style, derived from the RECORDED "
                          "route 1-5 s ahead (command fires BEFORE the turn)")
     ap.add_argument("--int8-sim", action="store_true",
-                    help="PyTorch 内で INT8 相当 (重み per-channel + 活性 "
-                         "静的較正) を再現して推論する。TensorRT の INT8 で"
-                         "ego が凍結する件の切り分け用 (2026-08-22)")
+                    help="Emulate INT8 inside PyTorch (per-channel weights + static "
+                         "activation calibration). For isolating the TensorRT INT8 "
+                         "ego-freeze issue (2026-08-22)")
     ap.add_argument("--int8-pct", type=float, default=99.9,
-                    help="int8-sim の活性 scale パーセンタイル")
+                    help="activation-scale percentile for int8-sim")
     ap.add_argument("--no-thin", action="store_true")
     ap.add_argument("--seg-fuse", action="store_true",
                     help="ego-warped log-odds fusion of BEV seg over time "
@@ -391,7 +391,7 @@ def main():
         from bevlane.model import enable_lane_branch
         enable_lane_branch(m)
     if any(k.startswith("paint_proj.") for k in _sd):
-        # PointPainting ckpt: 射影を有効化してから読み込む
+        # PointPainting ckpt: enable the projection before loading
         _ck_args = torch.load(args.ckpt, map_location="cpu").get("args") or {}
         _pc = _ck_args.get("paint_seg") or "2,3,4,5,6,7"
         m.enable_paint_seg([int(x) for x in str(_pc).split(",")])
@@ -399,7 +399,7 @@ def main():
     if any(k.startswith("delta_stat.") for k in _sd):
         from bevlane.model import enable_delta_stat
         enable_delta_stat(m)
-        print("[delta-stat] 時間差分 stat ヘッドを有効化", flush=True)
+        print("[delta-stat] temporal-delta stat head enabled", flush=True)
     if "depth_head.0.0.weight" in _sd and hasattr(m, "depth_head"):
         _wck = tuple(_sd[f"depth_head.{i}.0.weight"].shape[0]
                      for i in range(4)
@@ -408,25 +408,25 @@ def main():
         if len(_wck) == 4 and _wck != _wcur:
             from bevlane.model import enable_depth_slim
             enable_depth_slim(m, widths=_wck)
-            print(f"[depth-slim] 幅 {_wck} を検出", flush=True)
+            print(f"[depth-slim] detected width {_wck}", flush=True)
     if any(k.startswith("sem_ego.") for k in _sd):
         from bevlane.model import enable_semantic_ego
         enable_semantic_ego(m)
-        print("[semantic-ego] 意味読み ego 残差を有効化", flush=True)
+        print("[semantic-ego] semantic ego residual enabled", flush=True)
     if any(k.startswith("lane_sdf.") for k in _sd):
-        # v120c 系: レーン符号付き距離の補助ヘッド (推論では未使用の学習補助)
+        # v120c line: lane signed-distance aux head (training aid, unused at inference)
         from bevlane.model import enable_lane_sdf
         enable_lane_sdf(m)
-        print("[lane-sdf] 補助ヘッドを有効化", flush=True)
+        print("[lane-sdf] aux head enabled", flush=True)
     if any(k.startswith("stat_head2.proj.") for k in _sd):
-        # v119/v120 系: 停止判定ヘッドが学習時から有界形 (INT8 対策)
+        # v119/v120 line: stationary head is bounded from training (INT8 fix)
         from bevlane.model import enable_quant_stat_head
         enable_quant_stat_head(m, 8.0)
-        print("[stat] 有界 stat ヘッド (学習済み) を有効化", flush=True)
+        print("[stat] bounded stat head (trained) enabled", flush=True)
     m.load_state_dict(_sd)
     if args.int8_sim:
-        # TensorRT の INT8 と同じ方式 (重み per-channel + 活性静的較正) を
-        # PyTorch 上で再現する。probe_int8_sim.py と同一の実装。
+        # Reproduce the TensorRT INT8 scheme (per-channel weights + static
+        # activation calibration) in PyTorch. Same implementation as probe_int8_sim.py.
         _QMAX = 127
         _SC = {}
         _COL = {"on": True}
@@ -463,8 +463,8 @@ def main():
             if isinstance(_mod, (torch.nn.Conv2d, torch.nn.Linear)):
                 _mod.register_forward_hook(_fq)
         m._int8_collect = _COL
-        print(f"[int8-sim] 重み per-channel INT8 + 活性 pct={args.int8_pct} "
-              f"(最初の数フレームで較正)", flush=True)
+        print(f"[int8-sim] per-channel INT8 weights + activation pct={args.int8_pct} "
+              f"(calibrated on the first few frames)", flush=True)
     refiner = None
     if args.refiner_ckpt:
         from bevlane.model import (BEVSegRefiner, MultiTaskRefiner,  # noqa
@@ -726,13 +726,13 @@ def main():
                 lid_kw["intent"] = torch.from_numpy(oh)[None].cuda()
             if getattr(m, "_int8_collect", None) is not None \
                     and m._int8_collect["on"]:
-                # 較正フェーズ: 最初の 8 フレームで活性 scale を集め、
-                # その後は固定 scale で量子化する (TensorRT と同じ流れ)
+                # Calibration phase: collect activation scales over the first 8 frames,
+                # then quantize with fixed scales (same flow as TensorRT)
                 m._int8_collect.setdefault("n", 0)
                 m._int8_collect["n"] += 1
                 if m._int8_collect["n"] > 8:
                     m._int8_collect["on"] = False
-                    print("[int8-sim] 較正完了 -> 量子化推論を開始", flush=True)
+                    print("[int8-sim] calibration done -> starting quantized inference", flush=True)
             with torch.no_grad(), torch.autocast("cuda", torch.float16):
                 if args.model in ("v22", "v23", "v25", "v26", "v27", "v28", "v29", "v30", "v31", "v32", "v33", "v34", "v35", "v36", "v37", "v38", "v39", "v40", "v41", "v42", "v43", "v44", "v45", "v46", "v47", "v48", "v49", "v51", "v52", "v53", "v54", "v55", "v56", "v63b"):
                     if trt_run is not None:
@@ -820,9 +820,9 @@ def main():
                 # laneline IoU and -0.0002 mIoU.
                 seg = seg.clone()
                 for _c in (4, 5, 6):          # laneline, stopline, road_edge
-                    # 個別較正 (2026-08-18, Orin と統一): probe_seg_bias の
-                    # 実測最適 lane 0.75 / stop 1.0 / edge 0.5。--thin-bias が
-                    # 既定 (0.5) のときだけ適用し、明示指定時は従来動作。
+                    # Per-class calibration (2026-08-18, unified with Orin): measured
+                    # optimum from probe_seg_bias: lane 0.75 / stop 1.0 / edge 0.5. Applied
+                    # only when --thin-bias is the default (0.5); explicit value keeps old behavior.
                     _bmap = {4: 0.75, 5: 1.0, 6: 0.5}
                     seg[:, _c] -= (_bmap.get(_c, args.thin_bias)
                                    if abs(args.thin_bias - 0.5) < 1e-9
@@ -876,18 +876,18 @@ def main():
                 det_boxes = [d for d in m.decode_boxes(
                     out[3].float(), out[4].float(), thresh=0.25, topk=128)[0]
                     if d[1] > (0.35 if d[0] == 0 else 0.15)] + unk_boxes
-                # --- 表示側の安定化 (2026-08-13) --------------------------
-                # 1) 表示クリップ (2026-08-18 修正): 前50/後28 の固定窓は
-                #    軽量版 (det 監督 前50/後28) の対策で、本線の全域グリッド
-                #    では教師が全域にあるのに後方 28m 超・前方 50m 超の枠を
-                #    消してしまっていた。格子の実範囲 (±マージン 2m) に追従。
+                # --- display-side stabilization (2026-08-13) ----------------
+                # 1) Display clip (fixed 2026-08-18): the fixed front-50/rear-28 window
+                #    was a workaround for the light model (det supervision front 50 / rear 28);
+                #    on the mainline full grid the teacher covers everything, yet boxes beyond
+                #    28 m rear / 50 m front were dropped. Follow the real grid extent (+-2 m margin).
                 import bevlane.model as _M
                 _xr = _M.BEV_H * 0.2 - 80.0
                 det_boxes = [d for d in det_boxes
                              if -(_xr - 2.0) <= d[2] <= 78.0]
-                # 2) 時系列 yaw 平滑化: 前フレームの箱と中心 2.5m でマッチし、
-                #    180°フリップを抑止した上で EMA (a=0.6)。真横/真後ろの
-                #    特徴が薄い箱のフレーム毎回転 (クルクル) を直接抑える。
+                # 2) Temporal yaw smoothing: match boxes to the previous frame within 2.5 m,
+                #    suppress 180-degree flips, then EMA (a=0.6). Directly damps the per-frame
+                #    spinning of boxes with weak features (broadside / directly behind).
                 _tr = getattr(main, "_yaw_tracks", None)
                 if _tr is None or getattr(main, "_yaw_scene", None) != scene:
                     _tr = []
@@ -903,7 +903,7 @@ def main():
                     if best is not None and len(d) > 6:
                         py_ = best[1]
                         dy_ = (d[6] - py_ + np.pi) % (2 * np.pi) - np.pi
-                        if abs(dy_) > np.pi / 2:      # フリップ抑止
+                        if abs(dy_) > np.pi / 2:      # flip suppression
                             d[6] = d[6] + (np.pi if dy_ < 0 else -np.pi)
                             dy_ = (d[6] - py_ + np.pi) % (2 * np.pi) - np.pi
                         d[6] = py_ + 0.4 * dy_        # EMA a=0.6
@@ -920,10 +920,10 @@ def main():
                     _rm = out[12][0, 0].float().sigmoid().cpu().numpy()
                     _k, _, _rk = risk_pick(
                         [_e[j * 12:(j + 1) * 12] for j in range(3)], _pr, _rm)
-                # 描画の統一 (2026-08-18): Orin レンダラと同じ選択規則を
-                # risk_pick の後段に適用する。(1) 前フレームのモードに +0.35
-                # (ちらつき抑制)、(2) 旋回モードは直進を 1.0 上回らない限り
-                # 直進を維持 (コマンド無しデモでの飛び出し抑制)。
+                # Unified rendering (2026-08-18): apply the same selection rule as the
+                # Orin renderer after risk_pick. (1) +0.35 for the previous frame's mode
+                # (flicker suppression), (2) keep straight unless a turn mode beats it by
+                # 1.0 (suppresses lunging in the no-command demo).
                 _lg = np.log(np.maximum(_pr, 1e-9))
                 _prev = getattr(main, "_prev_mode", None)
                 if getattr(main, "_mode_scene", None) != scene:

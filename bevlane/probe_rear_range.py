@@ -1,4 +1,4 @@
-"""前後を分けた距離帯別の検出再現率 (後方を 20m で切らずに測る)。"""
+"""Detection recall per range band, front and rear separately (rear not cut at 20 m)."""
 import argparse, os, sys
 import numpy as np, torch
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -23,7 +23,7 @@ cur = m.state_dict()
 m.load_state_dict({k: v for k, v in sd.items() if k in cur and cur[k].shape == v.shape}, strict=False)
 TH = 0.25
 BANDS = [(0,20),(20,40),(40,60),(60,80)]
-gt_n = {("前",b):0 for b in BANDS} | {("後",b):0 for b in BANDS}
+gt_n = {("front",b):0 for b in BANDS} | {("rear",b):0 for b in BANDS}
 hit = dict(gt_n)
 step = max(1, len(ds)//a.frames); done = 0
 for i in range(0, len(ds), step):
@@ -41,7 +41,7 @@ for i in range(0, len(ds), step):
         cls, xe, ye, ln, wd, yw = [float(v) for v in bx[k][:6]]
         if ln <= 0 or cls >= 1.5 or abs(ye) > 50: continue
         r = (xe*xe + ye*ye) ** 0.5
-        side = "前" if xe > 0 else "後"
+        side = "front" if xe > 0 else "rear"
         band = next((bb for bb in BANDS if bb[0] <= r < bb[1]), None)
         if band is None: continue
         gt_n[(side,band)] += 1
@@ -54,8 +54,8 @@ for i in range(0, len(ds), step):
             used.add(best[1]); hit[(side,band)] += 1
     done += 1
     if done >= a.frames: break
-print(f"\n=== {a.tag or a.ckpt} ({done} フレーム, しきい値 {TH}) ===")
-print("帯        " + "  ".join(f"{b[0]:2d}-{b[1]:2d}m" for b in BANDS))
-for side in ("前","後"):
-    print(f"  {side}方 再現率 " + "  ".join(f"{hit[(side,b)]/max(gt_n[(side,b)],1):6.3f}" for b in BANDS))
-    print(f"       GT箱数 " + "  ".join(f"{gt_n[(side,b)]:6d}" for b in BANDS))
+print(f"\n=== {a.tag or a.ckpt} ({done} frames, thr {TH}) ===")
+print("band      " + "  ".join(f"{b[0]:2d}-{b[1]:2d}m" for b in BANDS))
+for side in ("front","rear"):
+    print(f"  {side} recall " + "  ".join(f"{hit[(side,b)]/max(gt_n[(side,b)],1):6.3f}" for b in BANDS))
+    print(f"       GT boxes " + "  ".join(f"{gt_n[(side,b)]:6d}" for b in BANDS))

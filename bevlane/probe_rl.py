@@ -140,26 +140,26 @@ def main():
         if n >= a.samples:
             break
 
-    print(f"\n{os.path.basename(a.ckpt)}  n={n} フレーム  "
-          f"K={EGO_K} 候補  selector的中率 {np.mean(picks):.2f}")
-    print(f"\n{'方策':>10s} {'ADE [m]':>9s} {'FDE [m]':>9s} {'報酬':>9s}")
+    print(f"\n{os.path.basename(a.ckpt)}  n={n} frames  "
+          f"K={EGO_K} candidates  selector hit rate {np.mean(picks):.2f}")
+    print(f"\n{'policy':>10s} {'ADE [m]':>9s} {'FDE [m]':>9s} {'reward':>9s}")
     for p in POL:
         print(f"{p:>10s} {np.mean(ade[p]):9.3f} {np.mean(fde[p]):9.3f} "
               f"{np.mean(rew[p]):9.3f}")
     keys = [k for k in parts["selector"] if isinstance(
         parts["selector"][k][0], float)]
     if keys:
-        print(f"\n報酬の内訳（高いほど良い）")
-        print(f"{'方策':>10s} " + " ".join(f"{k:>9s}" for k in keys))
+        print(f"\nreward breakdown (higher is better)")
+        print(f"{'policy':>10s} " + " ".join(f"{k:>9s}" for k in keys))
         for p in POL:
             print(f"{p:>10s} " + " ".join(
                 f"{np.mean(parts[p][k]):9.3f}" for k in keys))
     s, f, o = np.mean(ade["selector"]), np.mean(ade["fixed"]), \
         np.mean(ade["oracle"])
-    print(f"\n選択器の効果: fixed {f:.3f} -> selector {s:.3f} m "
-          f"({f - s:+.3f} m)、oracle は {o:.3f} m")
+    print(f"\nselector effect: fixed {f:.3f} -> selector {s:.3f} m "
+          f"({f - s:+.3f} m), oracle {o:.3f} m")
     if f > o:
-        print(f"  oracle との差の {100 * (f - s) / (f - o):.0f} % を回収")
+        print(f"  recovers {100 * (f - s) / (f - o):.0f} % of the gap to oracle")
 
 
 if __name__ == "__main__":
