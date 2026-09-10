@@ -38,6 +38,15 @@ CAMS = R.CAMS
 
 
 _LIDAR = os.environ.get("METEOR_LIDAR", "0") == "1"
+# METEOR_VLA_JSONL=<file>: overlay a VLA run (scene / hazards / rationale / command / waypoints per
+# (scene, frame)) on the demo canvas (2026-09-10). Records keyed by (scene name, frame index).
+_VLA = {}
+if os.environ.get("METEOR_VLA_JSONL"):
+    import json as _json
+    for _l in open(os.environ["METEOR_VLA_JSONL"]):
+        _r = _json.loads(_l)
+        _VLA[(_r["scene"], int(_r["frame"]))] = _r
+    print(f"[rt] VLA overlay: {len(_VLA)} records from {os.environ['METEOR_VLA_JSONL']}", flush=True)
 
 
 def loader(scenes, root, stride, q_raw, stop, loop, in_slots=None, in_free=None):
@@ -93,6 +102,8 @@ def loader(scenes, root, stride, q_raw, stop, loop, in_slots=None, in_free=None)
                     raw[c] = im
                 if not ok:
                     continue
+                if _VLA:      # METEOR_VLA_JSONL: attach the VLA record (this frame, else the previous one)
+                    raw["_vla"] = _VLA.get((s, int(f["frame"]))) or _VLA.get((s, int(f["frame"]) - 1))
                 # stack here, off the producer's critical path (~8 ms)
                 if in_slots is not None:
                     # Zero-copy (2026-09-05): write CHW directly into a pinned slot.
@@ -338,6 +349,15 @@ def main():
                                     _r.destroy()
                                 except Exception:
                                     a._scr = (2560, 1600)
+                            # GNOME ignores WND_PROP_FULLSCREEN from an unfocused
+                            # process (demo started over ssh): size and place the
+                            # window explicitly so it fills the display anyway.
+                            try:
+                                cv2.resizeWindow("METEOR Orin realtime",
+                                                 a._scr[0], a._scr[1])
+                                cv2.moveWindow("METEOR Orin realtime", 0, 0)
+                            except Exception:
+                                pass
                     if a._scr is not None and                             (canvas.shape[1], canvas.shape[0]) != a._scr:
                         canvas = cv2.resize(canvas, a._scr,
                                             interpolation=cv2.INTER_LINEAR)

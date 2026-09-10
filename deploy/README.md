@@ -205,6 +205,17 @@ passes three device-side checks before it can become the default:
    that the EMA guard missed.
 Then `bench_rt.py` (median of N frames, CUDA Graph on) for the ledger.
 
+### 6.x Lane thinning under INT8 — open investigation
+
+On the Orin the INT8 engine of the 2:4-sparse model draws visibly thinner lane lines than its
+fp16 engine (laneline pixels −23…−56 % on the demo scenes), while the dense model stays within a
+few percent. Real TensorRT builds on a workstation (8.6) and on a data-centre GPU (10.16) from the
+same plain ONNX reproduce only a −5 % effect for the sparse model, and a PyTorch fake-INT8 proxy
+none at all, so the cause is being narrowed down with the tools listed in §8
+(`int8_lane_local.py`, `int8_lane_x86.py`, `probe_int8_lane.py`): calibration set, calibrator
+type, `--fp16-keep` bisection of the BEV decoder, and training-side levers (dense lane path,
+larger lane-logit margins).
+
 ## 7. 2:4 structured sparsity — what is done and what we learned
 
 Orin's Ampere tensor cores run 2:4 sparse kernels at up to 2× the dense
@@ -276,6 +287,9 @@ engine incl. `depth_mean`) — the largest single lever after the history bake-o
 | `cpp/liftbench/plugin/make_plugin_onnx.py` | inserts the CUDA lift plugin (`libmeteor_lift.so`) into the exported graph |
 | `runtime.py` | Python TensorRT runtime: history ring, CUDA Graph, pinned zero-copy inputs, LiDAR, decoders |
 | `orin_build_int8.py` | torch-free on-device INT8 calibration (real frames, companion engine for recurrent inputs, real LiDAR) |
+| `int8_lane_local.py` | workstation (TensorRT 8.6) fp16 / INT8 / INT8+sparse builder with `--fp16-keep` bisection, and a per-class BEV pixel probe on the demo scenes (INT8 lane-thinning investigation) |
+| `int8_lane_x86.py` | the same for TensorRT 10 on a data-centre GPU (cuda-python) |
+| `../bevlane/probe_int8_lane.py` | PyTorch fake-INT8 proxy (per-channel weights, per-tensor activations; absmax / percentile / KL calibration) for hosts without TensorRT |
 | `orin_realtime.py`, `orin_render.py`, `viz_np.py` | pipelined real-time demo + renderer (reference look) |
 | `infer_t4dataset.py` | raw t4dataset scene → engine → per-frame npz + video |
 | `build_and_bench.py`, `bench_engine.py`, `profile_engine.py`, `profile_layers.py` | workstation build / latency / per-layer profile |
