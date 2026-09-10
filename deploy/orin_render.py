@@ -441,7 +441,7 @@ def _wrap(txt, n):
 _VLA_UNGROUNDED = ("clear weather", "clear sky", "clear skies", "clear day", "clear, sunny", "clear and sunny", "under clear",
                    "overcast", "cloud", "rain", "snow", "fog", "daylight", "daytime", "lighting", "bright", "dim ",
                    "night", "dusk", "evening", "sunny", "sunlight", "weather", "sky", "skies", "visibility", "wet ", "dry ",
-                   "glare", "dark", "illuminat")
+                   "glare", "dark", "illuminat", "japan", "country")   # country is not observable either
 
 
 def _has_ungrounded(t):
@@ -491,7 +491,7 @@ def _draw_vla_strip(canvas, rec):
     cv2.rectangle(canvas, (800, y0 + 3), (800 + 16 + int(9.6 * len(lab)), y0 + 23), col, -1)
     cv2.putText(canvas, lab, (808, y0 + 18), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (20, 20, 20), 1, cv2.LINE_AA)
     hz = [h for h in js.get("hazards", []) if not _has_ungrounded(h)][:5]
-    cols = (("Scene (weather / lighting omitted: not observable from BEV)", _filter_scene(js.get("scene", "")), 14, 62),
+    cols = (("Scene (weather / lighting / country withheld: not in BEV)", _filter_scene(js.get("scene", "")), 14, 62),
             ("Hazards", "; ".join(hz) or "none flagged", 470, 55),
             ("Rationale", _filter_rationale(js.get("rationale", "")), 880, 82))
     for title, txt, x, nchar in cols:
