@@ -47,6 +47,18 @@ if os.environ.get("METEOR_VLA_JSONL"):
         _r = _json.loads(_l)
         _VLA[(_r["scene"], int(_r["frame"]))] = _r
     print(f"[rt] VLA overlay: {len(_VLA)} records from {os.environ['METEOR_VLA_JSONL']}", flush=True)
+# METEOR_VLA_LIVE=<ckpt_last.pt>: run the METEOR-VLA in-process on the engine's bev_tok output (the 13th
+# head) every METEOR_VLA_EVERY frames (2026-09-10). One METEOR forward feeds both the E2E plan and the VLA.
+_VLA_LIVE = None
+if os.environ.get("METEOR_VLA_LIVE") or os.environ.get("METEOR_VLA_SERVER"):
+    from deploy.vla_live import derive_cmd as _vla_derive_cmd
+    if os.environ.get("METEOR_VLA_SERVER"):        # VLA worker in its own process / environment
+        from deploy.vla_live import VLAClient
+        _VLA_LIVE = VLAClient(os.environ["METEOR_VLA_SERVER"])
+    else:
+        from deploy.vla_live import VLALive
+        _VLA_LIVE = VLALive(os.environ["METEOR_VLA_LIVE"])
+    _VLA_EVERY = int(os.environ.get("METEOR_VLA_EVERY", "10"))
 
 
 def loader(scenes, root, stride, q_raw, stop, loop, in_slots=None, in_free=None):
@@ -81,8 +93,10 @@ def loader(scenes, root, stride, q_raw, stop, loop, in_slots=None, in_free=None)
                     z = np.load(os.path.join(root, s, "ego_motion.npz"))
                     v0s = z["v0"]
                     poses = z["pose"] if "pose" in z else None
+                    wps_nav = z["wp"] if "wp" in z else None      # route -> navigation command for the VLA
                 except Exception:
-                    v0s = poses = None
+                    v0s = poses = wps_nav = None
+            _last_cmd = "keep_lane"
             for f in m["frames"][::stride]:
                 if stop.is_set():
                     return
@@ -104,6 +118,12 @@ def loader(scenes, root, stride, q_raw, stop, loop, in_slots=None, in_free=None)
                     continue
                 if _VLA:      # METEOR_VLA_JSONL: attach the VLA record (this frame, else the previous one)
                     raw["_vla"] = _VLA.get((s, int(f["frame"]))) or _VLA.get((s, int(f["frame"]) - 1))
+                if _VLA_LIVE is not None:
+                    _fi = int(f["frame"])
+                    if wps_nav is not None and _fi < len(wps_nav) and np.abs(wps_nav[_fi]).sum() > 0:
+                        _last_cmd = _vla_derive_cmd(np.asarray(wps_nav[_fi], np.float32),
+                                                    float(v0s[_fi]) if v0s is not None and _fi < len(v0s) else 8.0)
+                    raw["_cmd"] = _last_cmd
                 # stack here, off the producer's critical path (~8 ms)
                 if in_slots is not None:
                     # Zero-copy (2026-09-05): write CHW directly into a pinned slot.
@@ -266,6 +286,8 @@ def main():
     # producer puts un-numbered items; wrap with sequence numbers here
     q_seq = queue.Queue(maxsize=4)
 
+    _vla_state = {"rec": None}
+
     def sequencer():
         i = 0
         while True:
@@ -273,6 +295,16 @@ def main():
             if item2 is None:
                 q_seq.put(None)
                 return
+            if _VLA_LIVE is not None:
+                raw2, out2, v02 = item2[0], item2[4], item2[3]
+                if "bev_tok" in out2 and i % _VLA_EVERY == 0:
+                    _t = time.time()
+                    _vla_state["rec"] = _VLA_LIVE.infer(np.asarray(out2["bev_tok"])[0], float(v02),
+                                                        raw2.get("_cmd", "keep_lane"))
+                    if i % (_VLA_EVERY * 10) == 0:
+                        print(f"[vla] frame {i}: {time.time() - _t:.1f}s  cmd={raw2.get('_cmd')}  "
+                              f"decision={(_vla_state['rec'].get('json') or {}).get('command')}", flush=True)
+                raw2["_vla"] = _vla_state["rec"]
             q_seq.put((i,) + item2)
             i += 1
 

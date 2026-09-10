@@ -104,7 +104,7 @@ OUTPUTS = ["lane", "depth", "seg2d", "hm", "reg",
            "hm2d_s0", "hm2d_s1", "hm2d_s2",
            "reg2d_s0", "reg2d_s1", "reg2d_s2",
            "ego", "occ", "traj", "stationary", "tl", "risk", "flow",
-           "lg_pts", "lg_meta", "lg_adj", "unk", "lane_logit", "depth_mean", "raw_bev"]
+           "lg_pts", "lg_meta", "lg_adj", "unk", "lane_logit", "depth_mean", "raw_bev", "bev_tok"]
 HIST_OFFS = (2, 6, 14)          # slots at t-0.4 / -1.2 / -2.8 s (5 Hz frames)
 MEAN = np.array([0.485, 0.456, 0.406], np.float32)
 STD = np.array([0.229, 0.224, 0.225], np.float32)

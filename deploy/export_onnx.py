@@ -122,7 +122,7 @@ class MeteorExport(torch.nn.Module):
 
     def __init__(self, net, drop_lg=False, drop=(), uint8_in=False,
                  argmax_out=False, lane_logits=False, no_hist=False,
-                 depth_mean=False):
+                 depth_mean=False, bev_tokens=False):
         super().__init__()
         self.net = net
         self.drop_lg = drop_lg
@@ -160,6 +160,9 @@ class MeteorExport(torch.nn.Module):
         self.argmax_out = argmax_out
         self.lane_logits = lane_logits
         self.depth_mean = depth_mean
+        # --bev-tokens (2026-09-10): the fused BEV pooled to 25x16 (96 x 400 fp16) as an extra
+        # tail output -- the interface the METEOR-VLA reads (same pooling as the VLA training dump)
+        self.bev_tokens = bev_tokens
         # Dropping an output makes the subgraph that only feeds it dead code,
         # which the exporter prunes -- the same mechanism --no-lanegraph uses,
         # and the reason that one is worth 10 ms. This generalises it so the
@@ -286,6 +289,8 @@ class MeteorExport(torch.nn.Module):
             tail = tail + (_lane_logit,)
         if _depth_mean is not None:
             tail = tail + (_depth_mean,)          # tail (after lane_logit)
+        if self.bev_tokens:
+            tail = tail + (F.adaptive_avg_pool2d(net._fused_bev, (25, 16)).half(),)   # bev_tok [B,96,25,16]
         return tuple(out) + tail
 
 
@@ -537,6 +542,8 @@ def _out_names(args):
         names.append("lane_logit")
     if getattr(args, "depth_mean", False):
         names.append("depth_mean")
+    if getattr(args, "bev_tokens", False):
+        names.append("bev_tok")
     return names
 
 
@@ -597,6 +604,8 @@ def main():
                          "(indexing just becomes input splitting)")
     ap.add_argument("--with-lidar", action="store_true",
                     help="include the optional input lidar_bev [1,4,400,250] fp32 (no-hist only, 2026-09-08)")
+    ap.add_argument("--bev-tokens", action="store_true",
+                    help="append bev_tok [B,96,25,16] fp16 (fused BEV pooled to 25x16) -- the METEOR-VLA input (2026-09-10)")
     ap.add_argument("--depth-mean", action="store_true",
                     help="append the expected depth depth_mean [B,N,h,w] fp16 to the tail outputs (for unk2d, 2026-09-07)")
     ap.add_argument("--no-hist", action="store_true",
@@ -623,7 +632,8 @@ def main():
                              argmax_out=args.argmax_out,
                              lane_logits=args.lane_logits,
                              depth_mean=args.depth_mean,
-                             no_hist=args.no_hist)).eval()
+                             no_hist=args.no_hist,
+                             bev_tokens=args.bev_tokens)).eval()
     # The network is camera-count agnostic (verified: a 7-camera forward runs
     # and emits depth for 7), so dropping CAM_BACK_NARROW is purely an
     # input-side change worth 1/8 of the backbone and the depth tower.
