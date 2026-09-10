@@ -216,6 +216,16 @@ none at all, so the cause is being narrowed down with the tools listed in §8
 type, `--fp16-keep` bisection of the BEV decoder, and training-side levers (dense lane path,
 larger lane-logit margins).
 
+**Lift-plugin tables are rig-specific.** `make_plugin_onnx.py` bakes the projection (pair tables
+from `dump_lift.py`, derived from one scene's `K` / `T_cam_ego`) into the graph, and the engine then
+ignores the `K` / `T_cam_ego` inputs. An engine built with the plugin is therefore valid only for
+the camera rig the tables came from; scenes recorded by another vehicle (different intrinsics or
+mounting) are lifted with the wrong geometry and lane lines come out displaced and thin. For a
+multi-rig demo either build one engine per rig (tables per calibration) or use the plain ONNX
+(no plugin, +4…5 ms on the Orin), which reads `K` / `T_cam_ego` every frame. The 2026-09-10
+investigation traced most of the "thin lanes on the Orin" report to this: two of the demo scenes
+come from a second vehicle (intrinsics differ by up to 250 px, camera positions by 0.5 m).
+
 ## 7. 2:4 structured sparsity — what is done and what we learned
 
 Orin's Ampere tensor cores run 2:4 sparse kernels at up to 2× the dense

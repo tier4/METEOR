@@ -82,7 +82,10 @@ def sanitize_cache(path, floor=1e-4):
 def build(a):
     import tensorrt as trt, pycuda.driver as cuda
     cuda.init(); ctx = cuda.Device(0).retain_primary_context(); ctx.push()
-    lg = trt.Logger(trt.Logger.WARNING); b = trt.Builder(lg)
+    lg = trt.Logger(trt.Logger.WARNING)
+    if a.plugin:      # ONNX after make_plugin_onnx.py surgery: register the MeteorLift plugin library first
+        import ctypes; ctypes.CDLL(a.plugin, mode=ctypes.RTLD_GLOBAL); trt.init_libnvinfer_plugins(lg, "")
+    b = trt.Builder(lg)
     net = b.create_network(1 << int(trt.NetworkDefinitionCreationFlag.EXPLICIT_BATCH)); p = trt.OnnxParser(net, lg)
     assert p.parse(open(a.onnx, "rb").read()), [p.get_error(i) for i in range(p.num_errors)]
     cfg = b.create_builder_config(); cfg.set_memory_pool_limit(trt.MemoryPoolType.WORKSPACE, 8 << 30)
@@ -176,7 +179,7 @@ if __name__ == "__main__":
     b = sub.add_parser("build"); b.add_argument("--onnx", required=True); b.add_argument("--out", required=True)
     b.add_argument("--int8", action="store_true"); b.add_argument("--sparse", action="store_true"); b.add_argument("--fp16-keep", default="")
     b.add_argument("--calib", type=int, default=64); b.add_argument("--cache", default=""); b.add_argument("--calibrator", default="entropy2")
-    b.add_argument("--opt-level", type=int, default=3)
+    b.add_argument("--opt-level", type=int, default=3); b.add_argument("--plugin", default="", help="path to libmeteor_lift.so for a plugin-surgery ONNX")
     p = sub.add_parser("probe"); p.add_argument("--ref", required=True); p.add_argument("--eng", required=True); p.add_argument("--tag", default="")
     p.add_argument("--stride", type=int, default=6); p.add_argument("--scenes", default="")
     a = ap.parse_args(); build(a) if a.cmd == "build" else probe(a)
