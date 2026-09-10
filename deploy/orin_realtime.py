@@ -52,13 +52,16 @@ if os.environ.get("METEOR_VLA_JSONL"):
 _VLA_LIVE = None
 if os.environ.get("METEOR_VLA_LIVE") or os.environ.get("METEOR_VLA_SERVER"):
     from deploy.vla_live import derive_cmd as _vla_derive_cmd
-    if os.environ.get("METEOR_VLA_SERVER"):        # VLA worker in its own process / environment
-        from deploy.vla_live import VLAClient
-        _VLA_LIVE = VLAClient(os.environ["METEOR_VLA_SERVER"])
+    if os.environ.get("METEOR_VLA_SERVER"):        # VLA worker(s) in their own process / environment
+        from deploy.vla_live import VLAClient, VLAPool
+        _addrs = [x for x in os.environ["METEOR_VLA_SERVER"].split(",") if x]
+        _VLA_LIVE = VLAClient(_addrs[0]) if len(_addrs) == 1 else VLAPool(_addrs)
     else:
         from deploy.vla_live import VLALive
         _VLA_LIVE = VLALive(os.environ["METEOR_VLA_LIVE"])
     _VLA_EVERY = int(os.environ.get("METEOR_VLA_EVERY", "10"))
+import json
+_VLA_DUMP = open(os.environ["METEOR_VLA_DUMP"], "a") if os.environ.get("METEOR_VLA_DUMP") else None
 
 
 def loader(scenes, root, stride, q_raw, stop, loop, in_slots=None, in_free=None):
@@ -119,6 +122,7 @@ def loader(scenes, root, stride, q_raw, stop, loop, in_slots=None, in_free=None)
                 if _VLA:      # METEOR_VLA_JSONL: attach the VLA record (this frame, else the previous one)
                     raw["_vla"] = _VLA.get((s, int(f["frame"]))) or _VLA.get((s, int(f["frame"]) - 1))
                 if _VLA_LIVE is not None:
+                    raw["_scene"], raw["_frame"] = s, int(f["frame"])
                     _fi = int(f["frame"])
                     if wps_nav is not None and _fi < len(wps_nav) and np.abs(wps_nav[_fi]).sum() > 0:
                         _last_cmd = _vla_derive_cmd(np.asarray(wps_nav[_fi], np.float32),
@@ -298,13 +302,18 @@ def main():
             if _VLA_LIVE is not None:
                 raw2, out2, v02 = item2[0], item2[4], item2[3]
                 if "bev_tok" in out2 and i % _VLA_EVERY == 0:
-                    _t = time.time()
-                    _vla_state["rec"] = _VLA_LIVE.infer(np.asarray(out2["bev_tok"])[0], float(v02),
-                                                        raw2.get("_cmd", "keep_lane"))
-                    if i % (_VLA_EVERY * 10) == 0:
-                        print(f"[vla] frame {i}: {time.time() - _t:.1f}s  cmd={raw2.get('_cmd')}  "
-                              f"decision={(_vla_state['rec'].get('json') or {}).get('command')}", flush=True)
-                raw2["_vla"] = _vla_state["rec"]
+                    if hasattr(_VLA_LIVE, "submit"):      # worker pool: run ahead, the renderer waits per frame
+                        raw2["_vla_future"] = _VLA_LIVE.submit(np.asarray(out2["bev_tok"])[0].copy(), float(v02),
+                                                               raw2.get("_cmd", "keep_lane"))
+                    else:
+                        _t = time.time()
+                        _vla_state["rec"] = _VLA_LIVE.infer(np.asarray(out2["bev_tok"])[0], float(v02),
+                                                            raw2.get("_cmd", "keep_lane"))
+                        if i % (_VLA_EVERY * 10) == 0:
+                            print(f"[vla] frame {i}: {time.time() - _t:.1f}s  cmd={raw2.get('_cmd')}  "
+                                  f"decision={(_vla_state['rec'].get('json') or {}).get('command')}", flush=True)
+                if "_vla_future" not in raw2:
+                    raw2["_vla"] = _vla_state["rec"]
             q_seq.put((i,) + item2)
             i += 1
 
@@ -319,6 +328,13 @@ def main():
                 done_q.put(None)
                 return
             seq, raw, K, Tc, v0, out, dt, pose, slot = item2
+            if "_vla_future" in raw:                     # pool result for this frame (ordered by construction)
+                raw["_vla"] = raw.pop("_vla_future").result()
+                _vla_state["rec"] = raw["_vla"]
+                if _VLA_DUMP is not None and raw["_vla"] is not None:   # METEOR_VLA_DUMP: keep the live records (re-render without re-inference)
+                    _VLA_DUMP.write(json.dumps({"scene": raw.get("_scene"), "frame": raw.get("_frame"), **raw["_vla"]}) + "\n"); _VLA_DUMP.flush()
+                if seq % 100 == 0:
+                    print(f"[vla] frame {seq}: decision={(raw['_vla'].get('json') or {}).get('command')}", flush=True)
             t0 = time.time()
             canvas = R.compose_frame(raw, K, Tc, v0, out, dt,
                                      fps_now=(seq / max(time.time()

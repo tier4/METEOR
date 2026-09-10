@@ -129,3 +129,26 @@ class VLAClient:
         self.f.write((json.dumps({"tok": base64.b64encode(tok.tobytes()).decode(), "v0": float(v0), "cmd": cmd}) + "\n").encode())
         self.f.flush()
         return json.loads(self.f.readline())
+
+
+class VLAPool:
+    """Several vla_server workers used in parallel (offline rendering at full frame rate). submit() returns
+    a Future; results come back in whatever order the workers finish, the caller keeps them per frame."""
+
+    def __init__(self, addrs):
+        from concurrent.futures import ThreadPoolExecutor
+        import threading
+        self.clients = [VLAClient(a) for a in addrs]; self.locks = [threading.Lock() for _ in addrs]
+        self.pool = ThreadPoolExecutor(max_workers=len(addrs)); self.n = 0; self.mu = threading.Lock()
+
+    def _run(self, k, tok, v0, cmd):
+        with self.locks[k]:
+            return self.clients[k].infer(tok, v0, cmd)
+
+    def submit(self, tok, v0, cmd):
+        with self.mu:
+            k = self.n % len(self.clients); self.n += 1
+        return self.pool.submit(self._run, k, tok, v0, cmd)
+
+    def infer(self, tok, v0, cmd):
+        return self.submit(tok, v0, cmd).result()

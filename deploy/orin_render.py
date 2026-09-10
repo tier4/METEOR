@@ -441,7 +441,8 @@ def _wrap(txt, n):
 _VLA_UNGROUNDED = ("clear weather", "clear sky", "clear skies", "clear day", "clear, sunny", "clear and sunny", "under clear",
                    "overcast", "cloud", "rain", "snow", "fog", "daylight", "daytime", "lighting", "bright", "dim ",
                    "night", "dusk", "evening", "sunny", "sunlight", "weather", "sky", "skies", "visibility", "wet ", "dry ",
-                   "glare", "dark", "illuminat", "japan", "country")   # country is not observable either
+                   "glare", "dark", "illuminat", "japan", "country",   # country is not observable either
+                   "twilight", "dawn", "sunset", "sunrise", "morning", "afternoon", "noon", "midday", "shade", "shadow")
 
 
 def _has_ungrounded(t):

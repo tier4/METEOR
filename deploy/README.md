@@ -213,8 +213,14 @@ few percent. Real TensorRT builds on a workstation (8.6) and on a data-centre GP
 same plain ONNX reproduce only a −5 % effect for the sparse model, and a PyTorch fake-INT8 proxy
 none at all, so the cause is being narrowed down with the tools listed in §8
 (`int8_lane_local.py`, `int8_lane_x86.py`, `probe_int8_lane.py`): calibration set, calibrator
-type, `--fp16-keep` bisection of the BEV decoder, and training-side levers (dense lane path,
-larger lane-logit margins).
+type, `--fp16-keep` bisection, and training-side levers.
+
+Bisection result (TensorRT 8.6, INT8 + `SPARSE_WEIGHTS`, nine demo scenes): the INT8+sparse engine collapses
+(no lane pixels at all) unless the first trunk stage (`stem`, `layer1`) is kept in fp16; keeping only `layer2`,
+`layer3/4`, the FPN or the BEV decoder does not help, keeping the whole trunk restores full agreement. The
+failure is therefore in the small-channel high-resolution sparse INT8 kernels of `layer1`. Deployment fix:
+`--fp16-keep layer1` (or `stem,layer1,layer2`) in the INT8 build; training fix: exclude those stages from 2:4
+pruning (`--sparse-exclude stem,layer1,layer2,...`), where sparsity gains little anyway.
 
 **Lift-plugin tables are rig-specific.** `make_plugin_onnx.py` bakes the projection (pair tables
 from `dump_lift.py`, derived from one scene's `K` / `T_cam_ego`) into the graph, and the engine then
