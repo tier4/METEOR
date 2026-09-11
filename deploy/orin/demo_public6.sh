@@ -22,7 +22,7 @@ while [ $# -gt 0 ]; do
     --root)   ROOT="$2"; shift 2 ;;
     --stop)   # kill the wrapper loops first (not this invocation), then the runtime
               for p in $(pgrep -f "demo_public6.s[h]"); do [ "$p" != "$$" ] && kill "$p" 2>/dev/null; done
-              pkill -f "orin_realtime.py --engine .* --root publi[c]6"; echo "stopped"; exit 0 ;;
+              pkill -f "orin_realtime.py --engine .* --displa[y] --loop"; echo "stopped"; exit 0 ;;
     --autostart)
       mkdir -p ~/.config/systemd/user
       cat > ~/.config/systemd/user/meteor-demo.service <<EOF

@@ -65,11 +65,17 @@ def main():
     ap.add_argument("--model", default="v55")
     ap.add_argument("--n-cams", type=int, default=7)
     ap.add_argument("--scenes", type=int, default=60)
+    ap.add_argument("--list", default="val.lst",
+                    help="scene list file (default val.lst; out/heldout549.lst = val+test, 549 scenes, 2026-09-10)")
+    ap.add_argument("--intent", action="store_true",
+                    help="feed the route intent (straight/left/right one-hot derived from the GT future exactly as "
+                         "training does: any 1.5-3 s waypoint beyond +-2 m) to the planner. Without it the model runs "
+                         "with no navigation, as the demo does (2026-09-10)")
     ap.add_argument("--chain", type=int, default=8,
                     help="chained steps (8 x 0.4 s = 3.2 s)")
     a = ap.parse_args()
 
-    scenes = [l.strip() for l in open("val.lst") if l.strip()][:a.scenes]
+    scenes = [l.strip() for l in open(a.list) if l.strip()][:a.scenes]
     ds = BevLaneDataset(os.environ.get("METEOR_BEV_ROOT", "out/bevlane"),
                         scenes, gt_key="gt_cons",
                         with_ego=True,
@@ -99,9 +105,14 @@ def main():
         if b is None:
             cache[idx] = None
             return None
+        kw = {}
+        if a.intent:                         # route intent from the GT future (training definition, v43+)
+            wpy = b[4][:12].view(6, 2)[2:, 1]
+            k_int = 1 if float(wpy.max()) > 2.0 else (2 if float(wpy.min()) < -2.0 else 0)
+            kw["intent"] = torch.nn.functional.one_hot(torch.tensor([k_int]), 3).float().cuda()
         with torch.no_grad(), torch.autocast("cuda", torch.float16):
             out = m(b[0][None].cuda(), b[1][None].cuda(), b[2][None].cuda(),
-                    b[4][12][None].cuda())      # v0 conditioning, as in eval
+                    b[4][12][None].cuda(), **kw)      # v0 conditioning, as in eval
         # Cache outputs on CPU (2026-09-04). Kept on GPU, VRAM grows with the frame
         # count: 66 GB at 120 scenes and OOM at 240 (when the GUARD stage has 0 frames
         # nothing is popped and every frame stays resident).

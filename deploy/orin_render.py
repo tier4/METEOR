@@ -400,6 +400,107 @@ def _sp_gpu_name():
                             timeout=5).decode().splitlines()[0].strip()
     return _gpu.replace("NVIDIA ", "").replace("GeForce ", "").replace("Jetson ", "")
 
+VLA_COL = (255, 90, 255)     # BGR magenta: the VLA trajectory (E2E stays green)
+
+
+def _draw_vla_path_cam(img, rec, Kc, Tce, cw, ch, W0=768, H0=432):
+    """Project the VLA waypoints (x fwd, y left, ground) into the front tile as a magenta polyline."""
+    wps = rec.get("wp_reg")
+    if not wps:
+        return
+    pts = np.concatenate([[[0.0, 0.0]], np.asarray(wps, np.float32)], 0)
+    P = np.stack([pts[:, 0], pts[:, 1], np.zeros(len(pts))], 1)
+    C = (Tce[:3, :3] @ P.T + Tce[:3, 3:]).T
+    uv = (Kc @ C.T).T
+    prev = None
+    for (u, v, z) in uv:
+        if z <= 0.5:
+            prev = None
+            continue
+        q = (int(u / z * cw / W0), int(v / z * ch / H0))
+        if prev is not None:
+            cv2.line(img, prev, q, VLA_COL, 2, cv2.LINE_AA)
+        cv2.circle(img, q, 3, VLA_COL, -1, cv2.LINE_AA)
+        prev = q
+
+
+def _wrap(txt, n):
+    out, cur = [], ""
+    for w in str(txt).split():
+        if len(cur) + len(w) + 1 > n:
+            out.append(cur); cur = w
+        else:
+            cur = (cur + " " + w).strip()
+    if cur:
+        out.append(cur)
+    return out
+
+
+# Weather / lighting words are not observable from the BEV tokens the VLA reads (2026-09-10, user
+# instruction "hide what has no grounding"): drop clauses / items / sentences that contain them.
+_VLA_UNGROUNDED = ("clear weather", "clear sky", "clear skies", "clear day", "clear, sunny", "clear and sunny", "under clear",
+                   "overcast", "cloud", "rain", "snow", "fog", "daylight", "daytime", "lighting", "bright", "dim ",
+                   "night", "dusk", "evening", "sunny", "sunlight", "weather", "sky", "skies", "visibility", "wet ", "dry ",
+                   "glare", "dark", "illuminat", "japan", "country",   # country is not observable either
+                   "twilight", "dawn", "sunset", "sunrise", "morning", "afternoon", "noon", "midday", "shade", "shadow")
+
+
+def _has_ungrounded(t):
+    t = " " + str(t).lower() + " "
+    return any(k in t for k in _VLA_UNGROUNDED)
+
+
+def _filter_scene(t):
+    import re
+    parts = re.split(r",| under | during | with | in | at | on a | on an ", " " + str(t))
+    keep = [p.strip() for p in parts if p.strip() and not _has_ungrounded(p)
+            and not re.fullmatch(r"(a |an )?(clear|sunny|dry|wet)", p.strip().lower())]
+    out = ", ".join(keep).strip(" ,.")
+    return (out[0].upper() + out[1:] + ".") if out else "(road-type / traffic description withheld)"
+
+
+def _filter_rationale(t):
+    import re
+    sents = [x.strip() for x in re.split(r"(?<=[.;])\s+", str(t)) if x.strip()]
+    keep = [x for x in sents if not _has_ungrounded(x)]
+    return " ".join(keep) if keep else "(withheld: rationale relied on weather / lighting)"
+
+
+def _draw_vla_strip(canvas, rec):
+    """Reasoning strip in the free band under the depth rows (left of the BEV panel)."""
+    js = rec.get("json") or {}
+    y0 = 34 + 4 * (CH + 26) + 4                 # 952: first free row under the depth block
+    x_end = 8 + 4 * (CW + 6) - 6                # 1526: left edge of the BEV panel
+    cv2.rectangle(canvas, (8, y0), (x_end, VH - 6), (30, 26, 34), -1)
+    cv2.putText(canvas, "METEOR-VLA (Qwen3-VL-8B + LoRA on METEOR BEV tokens)", (14, y0 + 17),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.48, VLA_COL, 1, cv2.LINE_AA)
+    cv2.putText(canvas, "path: green = METEOR   pink = METEOR-VLA", (1100, y0 + 17),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.45, (200, 200, 200), 1, cv2.LINE_AA)
+    _ci = str(rec.get("cmd_in", "?"))
+    if _ci in ("turn_left", "turn_right") and float(rec.get("v0", 0.0)) >= 7.0:
+        _ci = _ci.replace("turn", "curve")
+    cv2.putText(canvas, f"nav command in: {_ci}", (520, y0 + 17),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.45, (170, 170, 170), 1, cv2.LINE_AA)
+    cmd = str(js.get("command", "?"))
+    # The command vocabulary the VLA was trained with means "lateral displacement > 2 m within 3 s":
+    # at speed that is a road curve, not an intersection turn. Show it as such (2026-09-10 user report).
+    if cmd in ("turn_left", "turn_right") and float(rec.get("v0", 0.0)) >= 7.0:
+        cmd = cmd.replace("turn", "curve")
+    col = {"stop": (80, 80, 255), "turn_left": (80, 200, 255), "turn_right": (80, 200, 255),
+           "curve_left": (200, 220, 120), "curve_right": (200, 220, 120)}.get(cmd, (120, 220, 120))
+    lab = f"decision: {cmd}"
+    cv2.rectangle(canvas, (800, y0 + 3), (800 + 16 + int(9.6 * len(lab)), y0 + 23), col, -1)
+    cv2.putText(canvas, lab, (808, y0 + 18), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (20, 20, 20), 1, cv2.LINE_AA)
+    hz = [h for h in js.get("hazards", []) if not _has_ungrounded(h)][:5]
+    cols = (("Scene (weather / lighting / country withheld: not in BEV)", _filter_scene(js.get("scene", "")), 14, 62),
+            ("Hazards", "; ".join(hz) or "none flagged", 470, 55),
+            ("Rationale", _filter_rationale(js.get("rationale", "")), 880, 82))
+    for title, txt, x, nchar in cols:
+        cv2.putText(canvas, title, (x, y0 + 38), cv2.FONT_HERSHEY_SIMPLEX, 0.42, (120, 200, 255), 1, cv2.LINE_AA)
+        for li, ln in enumerate(_wrap(txt, nchar)[:3]):
+            cv2.putText(canvas, ln, (x, y0 + 54 + 15 * li), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (230, 230, 230), 1, cv2.LINE_AA)
+
+
 def compose_frame(raw, K, Tc, v0, out, dt, fps_now=None, pose=None):
     """One 1920x1080 canvas from one frame's raw images + engine outputs.
 
@@ -511,6 +612,10 @@ def compose_frame(raw, K, Tc, v0, out, dt, fps_now=None, pose=None):
         draw_boxes2d(img, b2d[i], CW, CH)
         if chn == "CAM_FRONT_WIDE":
             draw_path_ribbon(img, sel, K[0][i], Tc[0][i], CW, CH)
+            if raw.get("_vla"):
+                _draw_vla_path_cam(img, raw["_vla"], K[0][i], Tc[0][i], CW, CH)
+                cv2.putText(img, "path: METEOR", (6, CH - 24), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (60, 255, 120), 2, cv2.LINE_AA)
+                cv2.putText(img, "path: METEOR-VLA", (6, CH - 6), cv2.FONT_HERSHEY_SIMPLEX, 0.5, VLA_COL, 2, cv2.LINE_AA)
         cv2.putText(canvas, chn, (x0, y0 - 6),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.45,
                     (200, 200, 200), 1, cv2.LINE_AA)
@@ -705,6 +810,13 @@ def compose_frame(raw, K, Tc, v0, out, dt, fps_now=None, pose=None):
                   (0, 255, 0), 2)
     for q in pts[1:]:
         cv2.circle(bev, q, 3, (0, 255, 0), -1)
+    if raw.get("_vla") and raw["_vla"].get("wp_reg"):      # VLA waypoints in magenta, same mapping
+        cv2.putText(bev, "METEOR", (BW2 - 150, 18), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1, cv2.LINE_AA)
+        cv2.putText(bev, "METEOR-VLA", (BW2 - 150, 38), cv2.FONT_HERSHEY_SIMPLEX, 0.5, VLA_COL, 1, cv2.LINE_AA)
+        vp = [(int(YH * sx2), cy0)] + [(int((YH - y) * sx2), int((VIEW_F - x) * sy2)) for x, y in raw["_vla"]["wp_reg"]]
+        cv2.polylines(bev, [np.array(vp, np.int32).reshape(-1, 1, 2)], False, VLA_COL, 2)
+        for q in vp[1:]:
+            cv2.circle(bev, q, 3, VLA_COL, -1)
     st_deg = float(np.degrees(sel[12]))
     acc = float(sel[13])
     brk = 1 / (1 + np.exp(-float(sel[14])))
@@ -777,6 +889,8 @@ def compose_frame(raw, K, Tc, v0, out, dt, fps_now=None, pose=None):
             _ENV_TAG = f"{_gpu} - TensorRT {_trt.__version__}"
         except Exception:
             _ENV_TAG = _gpu
+    if raw.get("_vla"):
+        _draw_vla_strip(canvas, raw["_vla"])
     _t = (f"METEOR - {_ENV_TAG} - on-device "
           f"inference+render - {dt:.0f} ms infer"
           + (" - LiDAR ON" if out.get("lidar_bev_in") is not None else ""))
