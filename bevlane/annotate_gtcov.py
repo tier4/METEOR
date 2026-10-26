@@ -17,7 +17,7 @@ for _v in ("OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS", "MKL_NUM_THREADS"):
 import cv2
 
 cv2.setNumThreads(1)
-OUT = "out/bevlane"
+OUT = os.environ.get("METEOR_BEVLANE_OUT", "out/bevlane")   # output root switchable by env, like the other stages
 
 
 def process_scene(scene):

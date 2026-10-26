@@ -66,13 +66,21 @@ def main():
     ap.add_argument("--n-cams", type=int, default=7)
     ap.add_argument("--scenes", type=int, default=60)
     ap.add_argument("--list", default="val.lst",
-                    help="scene list file (default val.lst; out/heldout549.lst = val+test, 549 scenes, 2026-09-10)")
+                    help="scene list file (default val.lst; out/heldout549.lst = val+test, 549 scenes)")
     ap.add_argument("--intent", action="store_true",
                     help="feed the route intent (straight/left/right one-hot derived from the GT future exactly as "
                          "training does: any 1.5-3 s waypoint beyond +-2 m) to the planner. Without it the model runs "
-                         "with no navigation, as the demo does (2026-09-10)")
+                         "with no navigation, as the demo does")
     ap.add_argument("--chain", type=int, default=8,
                     help="chained steps (8 x 0.4 s = 3.2 s)")
+    ap.add_argument("--h2-graft", default="",
+                    help="v203: load the H2 head GRAFTED onto the model (enable_hist_traj) instead of a standalone head; value = h2 ckpt")
+    ap.add_argument("--h2", default="",
+                    help="HistoryTrajHead checkpoint (out/h2_*/best.pt): apply the history-conditioned bounded "
+                         "trajectory residual to the selected waypoints, exactly as deployment would")
+    ap.add_argument("--h2-cache", default="",
+                    help="causal replay cache dir (bevlane/build_track_cache.py output) supplying the per-frame "
+                         "object history for --h2. Frames missing from the cache run with history disabled (= baseline)")
     a = ap.parse_args()
 
     scenes = [l.strip() for l in open(a.list) if l.strip()][:a.scenes]
@@ -83,6 +91,56 @@ def main():
                         trim_start=3, trim_end=10)
     from bevlane.probe_net import load_full
     m = load_full(a.ckpt, mv=a.model)   # 2026-09-05: lossless build (silent failure #10)
+    if os.environ.get("METEOR_F3_HEAD"):
+        from bevlane.f3_refine import enable_f3_refine
+        enable_f3_refine(m, os.environ["METEOR_F3_HEAD"])
+
+    # ---- H2: history-conditioned trajectory residual (guide Stage C), fed from the causal replay cache ----
+    h2_head = None
+    h2_cache = {}
+    h2_stat = {"hit": 0, "miss": 0}
+    if a.h2_graft and not a.h2:
+        a.h2 = a.h2_graft                     # same cache/eval path, head lives on the model
+    if a.h2:
+        from bevlane.history_encoder import HistoryTrajHead
+        from bevlane.history_schema import INPUT_NAMES as _HKEYS
+        if a.h2_graft:
+            from bevlane.model import enable_hist_traj
+            h2_head = enable_hist_traj(m, a.h2_graft)
+        else:
+            _ck = torch.load(a.h2, map_location="cpu", weights_only=False)
+            h2_head = HistoryTrajHead(bound_m=float(_ck.get("args", {}).get("bound", 2.0)))
+            h2_head.load_state_dict(_ck["head"]); h2_head.cuda().eval()
+            print(f"[h2] head {a.h2} (ep {_ck.get('ep')}, val {_ck.get('val')})", flush=True)
+
+        def _h2_rows(scene):
+            if scene not in h2_cache:
+                import numpy as _np
+                fp = os.path.join(a.h2_cache, scene + ".npz")
+                if os.path.isfile(fp):
+                    z = _np.load(fp)
+                    h2_cache[scene] = ({int(f): i for i, f in enumerate(z["frame"])},
+                                       {k: z[k] for k in _HKEYS})
+                else:
+                    h2_cache[scene] = None
+            return h2_cache[scene]
+
+        def h2_apply(scene, frame, wp, v0, intent_vec):
+            rows = _h2_rows(scene)
+            if rows is None or int(frame) not in rows[0]:
+                h2_stat["miss"] += 1
+                return wp                                  # no history -> gated to baseline
+            i = rows[0][int(frame)]
+            hb = {k: torch.from_numpy(rows[1][k][i][None]).cuda() for k in _HKEYS}
+            it = torch.zeros(1, 3).cuda()
+            if intent_vec is not None:
+                it = intent_vec.view(1, 3).float().cuda()
+            with torch.no_grad():
+                new12, _ = h2_head(torch.from_numpy(wp.reshape(1, 12).astype(np.float32)).cuda(), it,
+                                   torch.tensor([float(v0)]).cuda(), hb["track_hist"], hb["track_mask"],
+                                   hb["ego_hist"], hb["ego_mask"], hb["history_enable"])
+            h2_stat["hit"] += 1
+            return new12.float().cpu().numpy().reshape(6, 2)
 
     # index frames per scene so chains walk stride-2 through real frames
     by_scene = {}
@@ -110,6 +168,7 @@ def main():
             wpy = b[4][:12].view(6, 2)[2:, 1]
             k_int = 1 if float(wpy.max()) > 2.0 else (2 if float(wpy.min()) < -2.0 else 0)
             kw["intent"] = torch.nn.functional.one_hot(torch.tensor([k_int]), 3).float().cuda()
+        infer.last_intent = kw.get("intent")
         with torch.no_grad(), torch.autocast("cuda", torch.float16):
             out = m(b[0][None].cuda(), b[1][None].cuda(), b[2][None].cuda(),
                     b[4][12][None].cuda(), **kw)      # v0 conditioning, as in eval
@@ -138,6 +197,9 @@ def main():
                     break
                 ego = out[7].float()[0].cpu().numpy()
                 wp, _ = sel_wp(ego)
+                if h2_head is not None:
+                    wp = h2_apply(s, ds.items[idxs[st + ci]][1]["frame"], wp,
+                                  float(e[12]), infer.last_intent)
                 pred_pos += wp_at(wp, STEP_S)          # ego-frame step
                 gtwp = e[:12].view(6, 2).numpy()
                 gt_pos += wp_at(gtwp, STEP_S)
@@ -147,6 +209,10 @@ def main():
                     drift_n[ci] += 1
             if not ok:
                 continue
+        # Drop this scene's cached frames once its chains are done; caching every frame of every scene
+        # exhausts host memory. The guard stage below simply re-infers its 400 frames.
+        for i in idxs:
+            cache.pop(i, None)
 
     # ---- recovery + guardrail on a strided subset ----
     flat = [i for v in by_scene.values() for i in v][::4][:400]
@@ -160,6 +226,9 @@ def main():
             continue
         ego = out[7].float()[0].cpu().numpy()
         wp, _ = sel_wp(ego)
+        if h2_head is not None:
+            wp = h2_apply(ds.items[idx][0], ds.items[idx][1]["frame"], wp,
+                          float(e[12]), infer.last_intent)
         for off in (0.5, 1.0):
             # perception-side offset, exactly the training lat-aug transform:
             # inject dy into the extrinsics (Tc' = Tc @ R, R[1,3]=dy) so the
@@ -215,6 +284,8 @@ def main():
         n_guard += 1
         cache.pop(idx, None)
 
+    if h2_head is not None:
+        print(f"[h2] applied on {h2_stat['hit']} frames, missing history on {h2_stat['miss']}", flush=True)
     print(f"=== CHAIN: cumulative divergence of chained rollout (following own plan vs GT) ===")
     for ci in range(a.chain):
         if drift_n[ci]:

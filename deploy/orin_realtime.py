@@ -39,7 +39,7 @@ CAMS = R.CAMS
 
 _LIDAR = os.environ.get("METEOR_LIDAR", "0") == "1"
 # METEOR_VLA_JSONL=<file>: overlay a VLA run (scene / hazards / rationale / command / waypoints per
-# (scene, frame)) on the demo canvas (2026-09-10). Records keyed by (scene name, frame index).
+# (scene, frame)) on the demo canvas. Records keyed by (scene name, frame index).
 _VLA = {}
 if os.environ.get("METEOR_VLA_JSONL"):
     import json as _json
@@ -48,7 +48,7 @@ if os.environ.get("METEOR_VLA_JSONL"):
         _VLA[(_r["scene"], int(_r["frame"]))] = _r
     print(f"[rt] VLA overlay: {len(_VLA)} records from {os.environ['METEOR_VLA_JSONL']}", flush=True)
 # METEOR_VLA_LIVE=<ckpt_last.pt>: run the METEOR-VLA in-process on the engine's bev_tok output (the 13th
-# head) every METEOR_VLA_EVERY frames (2026-09-10). One METEOR forward feeds both the E2E plan and the VLA.
+# head) every METEOR_VLA_EVERY frames. One METEOR forward feeds both the E2E plan and the VLA.
 _VLA_LIVE = None
 if os.environ.get("METEOR_VLA_LIVE") or os.environ.get("METEOR_VLA_SERVER"):
     from deploy.vla_live import derive_cmd as _vla_derive_cmd
@@ -84,10 +84,17 @@ def loader(scenes, root, stride, q_raw, stop, loop, in_slots=None, in_free=None)
                 m = json.load(open(os.path.join(_sd, "manifest.json")))
                 _t4v0 = _t4pose = None
                 _reduced = False
-            K = np.stack([np.array(m["cams"][c]["K"], np.float32)
+            # a rig without some camera (e.g. 7-camera rigs: no CAM_BACK_NARROW) runs like training
+            # cam-drop: zero image, geometry borrowed from the analogous camera (dataset._CAM_FALLBACK)
+            _fb = {"CAM_BACK_NARROW": "CAM_BACK_WIDE", "CAM_FRONT_NARROW": "CAM_FRONT_WIDE",
+                   "CAM_BACK_WIDE": "CAM_BACK_LEFT", "CAM_FRONT_WIDE": "CAM_FRONT_NARROW"}
+            _absent = {c for c in CAMS if c not in m["cams"]}
+            _geo = {c: (c if c in m["cams"] else _fb.get(c) if _fb.get(c) in m["cams"]
+                        else next(x for x in CAMS if x in m["cams"])) for c in CAMS}
+            K = np.stack([np.array(m["cams"][_geo[c]]["K"], np.float32)
                           for c in CAMS])[None]
             Tc = np.stack([np.linalg.inv(np.array(
-                m["cams"][c]["T_ego_cam"], np.float32))
+                m["cams"][_geo[c]]["T_ego_cam"], np.float32))
                 for c in CAMS])[None]
             if _t4v0 is not None:
                 v0s, poses = _t4v0, _t4pose
@@ -106,6 +113,9 @@ def loader(scenes, root, stride, q_raw, stop, loop, in_slots=None, in_free=None)
                 raw = {}
                 ok = True
                 for c in CAMS:
+                    if c in _absent:
+                        raw[c] = np.zeros((432, 768, 3), np.uint8)
+                        continue
                     _fl = cv2.IMREAD_REDUCED_COLOR_4 if _reduced \
                         else cv2.IMREAD_COLOR
                     im = cv2.imread(os.path.join(root, s,
@@ -165,6 +175,18 @@ def loader(scenes, root, stride, q_raw, stop, loop, in_slots=None, in_free=None)
 
 def producer(rt, q_raw, q, free_slots, stop, in_free=None):
     u8 = rt.host["imgs"].dtype == np.uint8
+    # v203 (METEOR_TRACK_HIST=1): run the reference tracker and feed the
+    # engine's history inputs. Off, or on a pre-v203 engine, nothing changes;
+    # on a v203 engine without the tracker the zeroed history_enable keeps the
+    # output bit-identical to v199.
+    mem = None
+    if (os.environ.get("METEOR_TRACK_HIST", "0") == "1"
+            and "track_hist" in rt.shapes):
+        from deploy.track_memory import TrackMemory
+        mem = TrackMemory()
+        print("[rt] v203 track-history feed enabled", flush=True)
+    _FRAME_DT = 0.2                      # replay scenes are 5 Hz (history_schema.FRAME_DT)
+    fi = 0
     while not stop.is_set():
         item = q_raw.get()
         if item is None:
@@ -174,8 +196,17 @@ def producer(rt, q_raw, q, free_slots, stop, in_free=None):
             imgs = imgs.astype(np.float32) / 255.0
         slot = free_slots.get()          # blocks until a consumer released
         t0 = time.time()
+        hist = None
+        t_cap = fi * _FRAME_DT
+        if mem is not None and pose is not None:
+            hist = mem.pack(t_cap, tuple(pose), v0)   # BEFORE this frame's update (causal)
         out = rt.infer(imgs, K[0][None], Tc[0][None], v0=v0, pose=pose,
-                       out_slot=slot, lidar_bev=lb)
+                       out_slot=slot, lidar_bev=lb, hist=hist)
+        if mem is not None and pose is not None:
+            mem.update(decode_boxes(np.asarray(out["hm"]),
+                                    np.asarray(out["reg"])),
+                       t_cap, tuple(pose), v0)
+        fi += 1
         if lb is not None:
             out = dict(out); out["lidar_bev_in"] = lb    # so rendering can overlay the point cloud
         if si is not None:               # H2D already completed inside infer()
@@ -312,6 +343,8 @@ def main():
                         if i % (_VLA_EVERY * 10) == 0:
                             print(f"[vla] frame {i}: {time.time() - _t:.1f}s  cmd={raw2.get('_cmd')}  "
                                   f"decision={(_vla_state['rec'].get('json') or {}).get('command')}", flush=True)
+                        if _VLA_DUMP is not None and _vla_state["rec"] is not None:   # single worker: dump here (the pool path dumps in the renderer)
+                            _VLA_DUMP.write(json.dumps({"scene": raw2.get("_scene"), "frame": raw2.get("_frame"), **_vla_state["rec"]}) + "\n"); _VLA_DUMP.flush()
                 if "_vla_future" not in raw2:
                     raw2["_vla"] = _vla_state["rec"]
             q_seq.put((i,) + item2)

@@ -21,6 +21,130 @@ _CAM_FALLBACK = {"CAM_BACK_NARROW": "CAM_BACK_WIDE",
                  "CAM_FRONT_WIDE": "CAM_FRONT_NARROW"}
 
 
+def causal_acc(z, fi, n=2):
+    """Current acceleration for use as an INPUT, computed from past samples only.
+    ego_motion.npz "acc" uses a central difference + symmetric smoothing (extract_ego.py; looks up to 0.6 s
+    ahead), so it is used only as a supervision target. Here: n-frame backward difference of the causal v0
+    (mean backward difference over the past 0.5 s): (v0[fi] - v0[fi-n]) / (n*dt).
+    The frame interval dt is estimated per scene as the median of pose displacement / v0 over moving frames
+    and cached in z["_dt"] (0.2 s if it cannot be estimated).
+    Returns 0 when invalid (first n frames, missing v0). z is a dict (the dataset's _ego_cache) or equivalent."""
+    v = z["v0"]
+    if fi - n < 0 or fi >= len(v):
+        return 0.0
+    dt = z.get("_dt")
+    if dt is None:
+        dt = 0.2
+        p = z.get("pose")
+        if p is not None and len(p) == len(v):
+            p = np.asarray(p, np.float64); vv = np.asarray(v[1:], np.float64)
+            d = np.hypot(np.diff(p[:, 0]), np.diff(p[:, 1])); ok = (vv > 3.0) & np.isfinite(d)
+            if ok.sum() >= 5:
+                dt = float(np.clip(np.median(d[ok] / vv[ok]), 0.05, 1.0))
+        z["_dt"] = dt
+    a = (float(v[fi]) - float(v[fi - n])) / (n * dt)
+    return float(np.clip(a, -8.0, 8.0)) if np.isfinite(a) else 0.0
+
+
+
+AE2E = os.environ.get("METEOR_AE2E", "0") == "1"
+AE2E_RES, AE2E_H, AE2E_W = 0.8, 200, 125          # map / route raster (rows x +80..-80 m, cols y +50..-50 m; same orientation as the GT png)
+
+
+def ae2e_inputs(root, s, f, cache):
+    """Extra inputs of the same kind as AutoE2E (auto_e2e), so HD-map scenes can be trained / evaluated
+    under the same conditions.
+      hist [32] : past 4 s of ego motion, 8 rows at 0.5 s x (speed/10, long. accel/3, yaw rate/0.5, curvature/0.1).
+                  Row 0 = [t-0.5, t]. Uses poses up to now only (causal). AutoE2E uses 40 rows at 10 Hz; our poses
+                  are ~5 Hz, so the step is coarsened to 0.5 s.
+      ras [10,200,125] (0.8 m) : ch0-7 = HD map (classes 1..8 of the Lanelet2-derived GT png; 0 for scenes without
+                  a map, e.g. Co-MLOps) / ch8 = route corridor (the whole-scene driven trajectory = an oracle that
+                  includes the future, 3.5 m wide, cut 10 m behind the ego) / ch9 = destination (last pose, radius 2 m).
+                  AutoE2E's route is likewise an oracle rebuilt from the recorded future trajectory (Lanelet2
+                  matching, 3.5 m corridor, destination = end of scene)."""
+    c = cache.get(s)
+    if c is None:
+        z = np.load(os.path.join(root, s, "ego_motion.npz")); pose = np.asarray(z["pose"], np.float64); v = np.asarray(z["v0"], np.float64)
+        d = np.hypot(np.diff(pose[:, 0]), np.diff(pose[:, 1])); ok = (v[1:] > 3.0) & np.isfinite(d)
+        dt = float(np.clip(np.median(d[ok] / v[1:][ok]), 0.05, 1.0)) if ok.sum() >= 5 else 0.2
+        try:
+            man = json.load(open(os.path.join(root, s, "manifest.json"))); has_map = _hdmap_scene(s) and not man.get("no_map", False)
+        except Exception:
+            has_map = False
+        c = cache[s] = {"pose": pose, "dt": dt, "map": has_map}
+    pose, dt = c["pose"], c["dt"]; fi = int(f["frame"])
+    hist = np.zeros((8, 4), np.float32)
+    def at(t):                                         # pose at t s (<= 0), linearly interpolated; None if out of range
+        x = fi + t / dt
+        if x < 0 or fi >= len(pose):
+            return None
+        i0 = int(np.floor(x)); i1 = min(i0 + 1, len(pose) - 1); r = x - i0
+        p = pose[i0] * (1 - r) + pose[i1] * r
+        p[2] = pose[i0, 2] + r * np.arctan2(np.sin(pose[i1, 2] - pose[i0, 2]), np.cos(pose[i1, 2] - pose[i0, 2]))
+        return p
+    P = [at(-0.5 * k) for k in range(10)]
+    vel = [None] * 9
+    for k in range(9):
+        if P[k] is not None and P[k + 1] is not None:
+            vel[k] = (np.hypot(*(P[k][:2] - P[k + 1][:2])) / 0.5, np.arctan2(np.sin(P[k][2] - P[k + 1][2]), np.cos(P[k][2] - P[k + 1][2])) / 0.5)
+    for k in range(8):
+        if vel[k] is None:
+            continue
+        sp, yr = vel[k]; ac = (sp - vel[k + 1][0]) / 0.5 if vel[k + 1] is not None else 0.0
+        hist[k] = (sp / 10.0, np.clip(ac, -8, 8) / 3.0, np.clip(yr, -2, 2) / 0.5, np.clip(yr / max(sp, 0.1), -0.5, 0.5) / 0.1)
+    ras = np.zeros((10, AE2E_H, AE2E_W), np.float32)
+    if c["map"] and f.get("gt"):
+        g = cv2.imread(os.path.join(root, s, f["gt"]), 0)
+        if g is not None and g.shape == (800, 500):
+            for k in range(8):
+                ras[k] = (g == k + 1).reshape(AE2E_H, 4, AE2E_W, 4).max(axis=(1, 3))
+    if fi < len(pose) and os.environ.get("METEOR_AE2E_ROUTE", "trace") == "lanelet":
+        # lane-level corridor as in AutoE2E (bevlane/ae2e_route.py); scenes without a valid route leave ch8/ch9 empty
+        if "route" not in c:
+            from bevlane.ae2e_route import scene_route
+            c["route"] = scene_route(os.path.join(root, s)) if c["map"] else {"valid": False}   # no route for scenes without a map (e.g. Co-MLOps)
+        rt = c["route"]
+        if rt["valid"]:
+            x0, y0, h0 = pose[fi]; cc, ss = np.cos(h0), np.sin(h0)
+            def ego_px(xy):
+                dx, dy = xy[:, 0] - x0, xy[:, 1] - y0
+                return np.stack([(50.0 - (-ss * dx + cc * dy)) / AE2E_RES, (80.0 - (cc * dx + ss * dy)) / AE2E_RES], 1)
+            m8 = np.zeros((AE2E_H, AE2E_W), np.uint8); pts = ego_px(rt["pts"])
+            for a, b in zip(rt["off"][:-1], rt["off"][1:]):
+                if b - a >= 2:
+                    cv2.polylines(m8, [np.round(pts[a:b] * 4).astype(np.int32)], False, 1, max(1, int(round(3.5 / AE2E_RES))), lineType=cv2.LINE_8, shift=2)
+            m8[int(np.ceil((80.0 + 10.0) / AE2E_RES - 0.5)):] = 0          # nothing beyond 10 m behind the ego
+            ras[8] = m8
+            m9 = np.zeros((AE2E_H, AE2E_W), np.uint8); d = ego_px(np.asarray(rt["dest"], np.float64)[None])[0]
+            cv2.circle(m9, (int(round(d[0])), int(round(d[1]))), max(1, int(round(2.0 / AE2E_RES))), 1, -1)
+            ras[9] = m9
+    elif fi < len(pose):
+        x0, y0, h0 = pose[fi]; cc, ss = np.cos(h0), np.sin(h0)
+        dx, dy = pose[:, 0] - x0, pose[:, 1] - y0
+        ex, ey = cc * dx + ss * dy, -ss * dx + cc * dy
+        keep = np.arange(len(pose)) >= fi
+        back = np.where(np.arange(len(pose)) < fi)[0]
+        keep[back[ex[back] >= -10.0]] = True           # keep up to 10 m behind
+        col = (50.0 - ey) / AE2E_RES; row = (80.0 - ex) / AE2E_RES
+        pts = np.stack([col[keep], row[keep]], 1)
+        m8 = np.zeros((AE2E_H, AE2E_W), np.uint8)
+        if len(pts) >= 2:
+            cv2.polylines(m8, [np.round(pts * 4).astype(np.int32)], False, 1, max(1, int(round(3.5 / AE2E_RES))), lineType=cv2.LINE_8, shift=2)
+        ras[8] = m8
+        m9 = np.zeros((AE2E_H, AE2E_W), np.uint8)
+        cv2.circle(m9, (int(round(col[-1])), int(round(row[-1]))), max(1, int(round(2.0 / AE2E_RES))), 1, -1)
+        ras[9] = m9
+    return torch.from_numpy(hist.reshape(-1)), torch.from_numpy(ras)
+
+# Scenes whose GT comes from an HD map (no yaw correction; map/route rasters available) are
+# recognised by a name prefix, set with METEOR_HDMAP_PREFIX (empty = no such scenes).
+HDMAP_PREFIX = os.environ.get("METEOR_HDMAP_PREFIX", "")
+
+
+def _hdmap_scene(s):
+    return bool(HDMAP_PREFIX) and s.startswith(HDMAP_PREFIX)
+
+
 class BevLaneDataset(Dataset):
     def __init__(self, root, scenes, max_per_scene=None, gt_key="gt",
                  dontcare_sidewalk=False, with_depth=False, augment=False,
@@ -28,23 +152,35 @@ class BevLaneDataset(Dataset):
                  with_boxdet=False, trim_start=0, trim_end=0,
                  min_cov_core=0.0, min_cov_fwd=0.0, seg2d_key="seg2d",
                  with_bbox2d=False, with_ego=False, with_occ=False,
+                 gt_optional=False,
                  with_agenttraj=False, with_temporal=False, with_tl=False,
                  with_risk=False, with_lanegraph=False, temporal_hist=0,
                  with_unknown=False, with_lidarbev=False,
                  with_unknown_v2=False, unk2_key="unknown_v2",
                  with_sdmap=False, with_tlin=False, cam_drop=0.0,
                  n_cams=len(CAMS), img_scale=1, yaw_fix_deg=0.0,
-                 use_gt_valid=False, ego_mask_prefix=None):
+                 front_mask="",
+                 use_gt_valid=False, ego_mask_prefix=None, hr_root=None, depth_key="depth4"):
         # img_scale=2: R7 resolution axis, phase "upsample-first" -- the
         # stored 432x768 jpgs are bicubic-upsampled on load and K is scaled
         # to match, so the x2/stride-8 model trains BEFORE the true-res
         # re-ingest exists. 2D GT (depth/seg2d at 108x192) needs no change:
         # the s8 fuse lands on the same feature grid. bbox2d pixel coords
         # are scaled here.
-        self.img_scale = int(img_scale)
+        self.img_scale = float(img_scale) if float(img_scale) != int(img_scale) else int(img_scale)
+        # Native-resolution input (hr720: 1280x720 re-extraction): read hr_root/<scene>/img/<file> when present,
+        # otherwise fall back to the 768 image under root (mixing per scene / per camera is fine). Both are resized
+        # to hw x img_scale (hr: INTER_AREA down, 768: INTER_CUBIC up), so K / 2D boxes scale by img_scale only.
+        # Example: img_scale 1.5 -> 648x1152.
+        self.hr_root = hr_root or None
+        self.depth_key = depth_key or "depth4"   # finer depth target (e.g. depth_hr = 180x320) if present, else depth4 (108x192)
+        if self.hr_root:
+            nh = sum(os.path.isfile(os.path.join(self.hr_root, sc, "HR_OK.json")) for sc in scenes)
+            print(f"[data] hr_root {self.hr_root}: {nh}/{len(scenes)} scenes have true-res images (others fall back to {root})", flush=True)
         self.root = root
         self.with_lidarbev = with_lidarbev
         self.gt_key = gt_key
+        self.gt_optional = gt_optional
         self.use_gt_valid = bool(use_gt_valid)
         # v131 design (2026-08-27): synthetic domain (cosmos) trains perception GT only
         # and is excluded from the ego (E2E) loss. Just zero the valid flag for prefix-
@@ -56,6 +192,15 @@ class BevLaneDataset(Dataset):
         # A positive angle rotates back CCW about the ego origin (row400,col250).
         # occ/risk/agent are handled in the next stage (after the A/B gate passes).
         self.yaw_fix_deg = float(yaw_fix_deg)
+        # METEOR-Nano: supervise only a front sector, e.g. "0,80,-25,25" (x0,x1,y0,y1 metres).
+        # BEV rasters outside the sector become ignore/background, box lists are filtered.
+        self.front_mask = None
+        if front_mask:
+            x0, x1, y0, y1 = [float(v) for v in front_mask.split(",")]
+            r0, r1 = int((80 - x1) / 0.2), int((80 - x0) / 0.2)   # rows: x1(top)..x0
+            c0, c1 = int((50 - y1) / 0.2), int((50 - y0) / 0.2)   # cols: y1(left)..y0
+            self.front_mask = (x0, x1, y0, y1, max(r0, 0), min(r1, 800), max(c0, 0), min(c1, 500))
+        self._fovcache = {}
         self._yaw_M = (cv2.getRotationMatrix2D((250.0, 400.0),
                                                self.yaw_fix_deg, 1.0)
                        if self.yaw_fix_deg else None)
@@ -198,6 +343,34 @@ class BevLaneDataset(Dataset):
             if with_temporal:
                 self._byfi[s] = {fr["frame"]: fr for fr in m["frames"]}
 
+    def _fov_front(self, s):
+        """Per-scene visibility of the front sector from CAM_FRONT_WIDE (Nano).
+        Returns (ground_vis, mid_vis): booleans over the front-mask sub-grid, computed by projecting
+        each cell centre at z=0 (road surface -> lane GT) and z=1 m (vehicle mid-height -> box GT)
+        into the camera; a cell outside the image or behind the camera is invisible."""
+        if s in self._fovcache:
+            return self._fovcache[s]
+        x0, x1, y0, y1, r0, r1, c0, c1 = self.front_mask
+        K, Tc = self.calib[s]
+        # K is already scaled by img_scale (self.calib), so the image size must be scaled the same way.
+        #   Using the unscaled hw (432x768) at 720p (img_scale 1.6667) marked the bottom 40 % of the image
+        #   invisible and ignored the road GT within 17.5 m ahead.
+        H, W = [int(round(v * float(self.img_scale))) for v in self.hw[s]]
+        K0, T0 = K[0], Tc[0]
+        rows = np.arange(r0, r1); cols = np.arange(c0, c1)
+        gx, gy = np.meshgrid(80.0 - (rows + 0.5) * 0.2, 50.0 - (cols + 0.5) * 0.2, indexing="ij")
+
+        def _vis(z):
+            pts = np.stack([gx, gy, np.full_like(gx, z), np.ones_like(gx)], -1).reshape(-1, 4)
+            pc = pts @ T0.T
+            Z = pc[:, 2]
+            u = K0[0, 0] * pc[:, 0] / np.maximum(Z, 1e-6) + K0[0, 2]
+            v = K0[1, 1] * pc[:, 1] / np.maximum(Z, 1e-6) + K0[1, 2]
+            return ((Z > 0.3) & (u >= 0) & (u < W) & (v >= 0) & (v < H)).reshape(gx.shape)
+
+        self._fovcache[s] = (_vis(0.0), _vis(1.0))
+        return self._fovcache[s]
+
     def __len__(self):
         return len(self.items)
 
@@ -218,7 +391,9 @@ class BevLaneDataset(Dataset):
         s, f = self.items[i]
         K, Tc = self.calib[s]
         imgs = []
-        drop = np.random.randint(6) if (self.augment and np.random.rand() < 0.15) else -1
+        # single-camera rigs: never black out the only input
+        drop = (np.random.randint(6) if (self.augment and self.n_cams > 1
+                                         and np.random.rand() < 0.15) else -1)
         # Cameras that carry NO image for this sample: the ones the recording
         # lacks, plus (with prob cam_drop) CAM_BACK_NARROW on 8-camera samples
         # so the 7-camera configuration stays calibrated in the same weights.
@@ -228,12 +403,20 @@ class BevLaneDataset(Dataset):
         if self.cam_drop and 7 not in gone and np.random.rand() < self.cam_drop:
             gone.add(7)
         for ci, c in enumerate(CAMS):
+            if ci >= self.n_cams:
+                break          # tail cams are dropped below; their jpgs may not exist
             if ci in gone:
                 imgs.append(np.zeros(
-                    (3, self.hw[s][0] * self.img_scale,
-                     self.hw[s][1] * self.img_scale), np.float32))
+                    (3, int(round(self.hw[s][0] * self.img_scale)),
+                     int(round(self.hw[s][1] * self.img_scale))), np.float32))
                 continue
-            img = cv2.imread(os.path.join(self.root, s, f["imgs"][c]))
+            img = None
+            if self.hr_root:
+                hp = os.path.join(self.hr_root, s, f["imgs"][c])
+                if os.path.isfile(hp):
+                    img = cv2.imread(hp)
+            if img is None:
+                img = cv2.imread(os.path.join(self.root, s, f["imgs"][c]))
             if img is None:      # unreadable sample: fall back to a neighbor
                 return None            # caller advances
             img = img[:, :, ::-1].astype(np.float32) / 255.0
@@ -248,21 +431,26 @@ class BevLaneDataset(Dataset):
                     img += np.random.normal(0, 0.012, img.shape).astype(np.float32)
                     img = np.clip(img, 0, 1)
             img = (img - MEAN) / STD
-            if self.img_scale != 1:
+            if self.img_scale != 1 or self.hr_root:
                 # Target is base resolution (manifest img_hw) x scale. Full-res roots
                 # (R program: stores 1536x864) are already at target size, so 1x;
-                # legacy 768 roots are upsampled x2 as before.
-                th = self.hw[s][0] * self.img_scale
-                tw = self.hw[s][1] * self.img_scale
+                # legacy 768 roots are upsampled x2 as before. hr720 images shrink (AREA).
+                th = int(round(self.hw[s][0] * self.img_scale))
+                tw = int(round(self.hw[s][1] * self.img_scale))
                 if img.shape[0] != th or img.shape[1] != tw:
-                    img = cv2.resize(img, (tw, th),
-                                     interpolation=cv2.INTER_CUBIC)
+                    img = cv2.resize(img, (tw, th), interpolation=cv2.INTER_AREA
+                                     if img.shape[1] > tw else cv2.INTER_CUBIC)
             imgs.append(img.transpose(2, 0, 1))
         gk = self.gt_key if self.gt_key in f else "gt"
-        gt = cv2.imread(os.path.join(self.root, s, f[gk]), 0)
+        gt = cv2.imread(os.path.join(self.root, s, f[gk]), 0) if gk in f else None
         if gt is None:
-            return None                # caller advances
-        if self._yaw_M is not None and gt.shape == (800, 500):
+            if not self.gt_optional:
+                return None            # caller advances
+            # released demo scenes (meteor-demo-scenes) carry images only: an all-ignore raster
+            # keeps the sample readable for inference-only callers (demo_rgbd_bev --scene-dump)
+            gt = np.full((800, 500), 255, np.uint8)
+        _yfix = self._yaw_M if (self._yaw_M is not None and not _hdmap_scene(s)) else None   # HD-map GT scenes get no yaw correction
+        if _yfix is not None and gt.shape == (800, 500):
             # Border is 255 (ignore in gt_cons; raw gt maps 255->0 = background below).
             gt = cv2.warpAffine(gt, self._yaw_M, (500, 800),
                                 flags=cv2.INTER_NEAREST,
@@ -279,7 +467,7 @@ class BevLaneDataset(Dataset):
             valid = cv2.imread(os.path.join(self.root, s, f["gt_valid"]), 0)
             if valid is None or valid.shape != gt.shape:
                 return None
-            if self._yaw_M is not None and valid.shape == (800, 500):
+            if _yfix is not None and valid.shape == (800, 500):
                 valid = cv2.warpAffine(
                     valid, self._yaw_M, (500, 800),
                     flags=cv2.INTER_NEAREST,
@@ -298,6 +486,12 @@ class BevLaneDataset(Dataset):
         if self.dontcare_sidewalk:
             gt = gt.copy()
             gt[gt == 2] = 0    # sidewalk -> don't care (ignored like bg)
+        if self.front_mask is not None and gt.shape == (800, 500):   # Nano: supervise the front sector only
+            _, _, _, _, r0, r1, c0, c1 = self.front_mask
+            g_vis, _ = self._fov_front(s)
+            m_ = np.full_like(gt, 255)
+            sub_ = gt[r0:r1, c0:c1].copy(); sub_[~g_vis] = 255      # laterally invisible ground -> ignore
+            m_[r0:r1, c0:c1] = sub_; gt = m_
         # copy K/Tc: they are cached/shared per scene -> from_numpy on shared
         # storage breaks the DataLoader shared-memory collate ("not resizable")
         # n_cams < len(CAMS) DROPS the tail of the camera list rather than
@@ -313,7 +507,7 @@ class BevLaneDataset(Dataset):
                torch.from_numpy(np.ascontiguousarray(gt.astype(np.int64)))]
         if self.with_depth:
             try:
-                d = np.load(os.path.join(self.root, s, f["depth4"]))["depth"]
+                d = np.load(os.path.join(self.root, s, f.get(self.depth_key) or f["depth4"]))["depth"]
                 d = d.astype(np.float32)
             except Exception:
                 d = np.zeros((6, 72, 128), np.float32)
@@ -342,7 +536,7 @@ class BevLaneDataset(Dataset):
             out.append(torch.from_numpy(np.ascontiguousarray(d[:nc])))
         if self.with_seg2d:
             try:
-                sg = np.load(os.path.join(self.root, s, f[self.seg2d_key]))["seg"]
+                sg = np.load(os.path.join(self.root, s, f.get(self.seg2d_key) or f["seg2d21"]))["seg"]   # finer target (seg2d21_hr) if present, else seg2d21
             except Exception:
                 sg = np.full((len(CAMS), 108, 192), 255, np.uint8)
             if gone:
@@ -355,6 +549,12 @@ class BevLaneDataset(Dataset):
             bx = cv2.imread(os.path.join(self.root, s, f.get("bev_box", "_")), 0)
             if bx is None:
                 bx = np.zeros((800, 500), np.uint8)
+            if self.front_mask is not None:
+                _, _, _, _, r0, r1, c0, c1 = self.front_mask
+                _, v_vis = self._fov_front(s)
+                mb_ = np.zeros_like(bx)
+                sb_ = bx[r0:r1, c0:c1].copy(); sb_[~v_vis] = 0
+                mb_[r0:r1, c0:c1] = sb_; bx = mb_
             out.append(torch.from_numpy(bx.astype(np.int64)))
         if self.with_boxdet:
             try:
@@ -377,6 +577,20 @@ class BevLaneDataset(Dataset):
                 z = np.load(os.path.join(self.root, s, f["agent_traj"]))
                 ab, an = z["boxes"], int(z["count"])
                 at, av = z["traj"], z["tvalid"]
+                if self.front_mask is not None and an > 0:
+                    x0_, x1_, y0_, y1_, r0_, r1_, c0_, c1_ = self.front_mask
+                    _, v_vis_ = self._fov_front(s)
+                    rr_ = ((80.0 - ab[:an, 1]) / 0.2).astype(int).clip(0, 799)
+                    cc_ = ((50.0 - ab[:an, 2]) / 0.2).astype(int).clip(0, 499)
+                    in_rect_ = ((ab[:an, 1] >= x0_) & (ab[:an, 1] <= x1_)
+                                & (ab[:an, 2] >= y0_) & (ab[:an, 2] <= y1_))
+                    in_fov_ = np.zeros(an, bool)
+                    ok_ = in_rect_ & (rr_ >= r0_) & (rr_ < r1_) & (cc_ >= c0_) & (cc_ < c1_)
+                    in_fov_[ok_] = v_vis_[rr_[ok_] - r0_, cc_[ok_] - c0_]
+                    keep_ = np.where(in_rect_ & in_fov_)[0]
+                    ab2 = np.zeros_like(ab); at2 = np.zeros_like(at); av2 = np.zeros_like(av)
+                    ab2[:len(keep_)] = ab[keep_]; at2[:len(keep_)] = at[keep_]; av2[:len(keep_)] = av[keep_]
+                    ab, at, av, an = ab2, at2, av2, len(keep_)
             except Exception:                 # not extracted yet
                 ab = np.zeros((64, 6), np.float32); an = 0
                 at = np.zeros((64, 6, 2), np.float32)
@@ -413,8 +627,8 @@ class BevLaneDataset(Dataset):
             out.append(torch.from_numpy(b2[:nc]))
             out.append(torch.from_numpy(np.asarray(c2[:nc]).astype(np.int64)))
         if self.with_ego:
-            # [17] = wp(12), v0, acc, steer, brake, valid (0 when missing)
-            e = np.zeros(17, np.float32)
+            # [18] = wp(12), v0, acc, steer, brake, valid (0 when missing), acc_causal (input; past only)
+            e = np.zeros(18, np.float32)
             if s not in self._ego_cache:
                 p = os.path.join(self.root, s, "ego_motion.npz")
                 try:
@@ -424,13 +638,18 @@ class BevLaneDataset(Dataset):
                     # cache and, with with_ego, the 3 history slots were always invalid
                     # (all zeros) = temporal fusion got zero input in every E2E round.
                     self._ego_cache[s] = {k: z[k] for k in z.files}
+                    # v216 (2026-10-05): METEOR_EGO_WP_FILE=ego_motion_s.npz swaps in the pose-smoothed
+                    # trajectory target (bevlane/smooth_ego_gt.py); v0 / acc / valid stay the original ones.
+                    _alt = os.environ.get("METEOR_EGO_WP_FILE")
+                    if _alt and os.path.exists(os.path.join(self.root, s, _alt)):
+                        self._ego_cache[s]["wp"] = np.load(os.path.join(self.root, s, _alt))["wp"]
                 except Exception:
                     self._ego_cache[s] = None
             z = self._ego_cache[s]
             fi = f["frame"]
             if z is not None and fi < len(z["v0"]):
                 wp_ = z["wp"][fi].reshape(6, 2)
-                if self.yaw_fix_deg:
+                if self.yaw_fix_deg and not _hdmap_scene(s):
                     # Same corrective rotation as the rasters (+deg in the ego plane, same
                     # convention as apply_yaw_fix; straight-wp drift measured -0.16 -> +0.06 m).
                     th_ = np.radians(self.yaw_fix_deg)
@@ -441,6 +660,7 @@ class BevLaneDataset(Dataset):
                 e[12], e[13] = z["v0"][fi], z["acc"][fi]
                 e[14], e[15] = z["steer"][fi], z["brake"][fi]
                 e[16] = z["valid"][fi]
+                e[17] = causal_acc(z, fi)          # causal accel for inputs (e[13] acc looks ahead; target only)
                 if self.ego_mask_prefix and s.startswith(self.ego_mask_prefix):
                     e[16] = 0.0        # perception only (excluded from E2E loss)
             out.append(torch.from_numpy(e))
@@ -593,6 +813,11 @@ class BevLaneDataset(Dataset):
                 try:
                     z = np.load(os.path.join(self.root, s, "ego_motion.npz"))
                     self._ego_cache[s] = {k: z[k] for k in z.files}
+                    # v216 (2026-10-05): METEOR_EGO_WP_FILE=ego_motion_s.npz swaps in the pose-smoothed
+                    # trajectory target (bevlane/smooth_ego_gt.py); v0 / acc / valid stay the original ones.
+                    _alt = os.environ.get("METEOR_EGO_WP_FILE")
+                    if _alt and os.path.exists(os.path.join(self.root, s, _alt)):
+                        self._ego_cache[s]["wp"] = np.load(os.path.join(self.root, s, _alt))["wp"]
                 except Exception:
                     self._ego_cache[s] = None
             z = self._ego_cache[s]
@@ -655,6 +880,11 @@ class BevLaneDataset(Dataset):
                 try:
                     z = np.load(os.path.join(self.root, s, "ego_motion.npz"))
                     self._ego_cache[s] = {k: z[k] for k in z.files}
+                    # v216 (2026-10-05): METEOR_EGO_WP_FILE=ego_motion_s.npz swaps in the pose-smoothed
+                    # trajectory target (bevlane/smooth_ego_gt.py); v0 / acc / valid stay the original ones.
+                    _alt = os.environ.get("METEOR_EGO_WP_FILE")
+                    if _alt and os.path.exists(os.path.join(self.root, s, _alt)):
+                        self._ego_cache[s]["wp"] = np.load(os.path.join(self.root, s, _alt))["wp"]
                 except Exception:
                     self._ego_cache[s] = None
             z = self._ego_cache[s]
@@ -681,6 +911,8 @@ class BevLaneDataset(Dataset):
             out.append(torch.from_numpy(np.ascontiguousarray(pimgs)))
             out.append(torch.from_numpy(rel))
             out.append(torch.from_numpy(pv))
+        if os.environ.get("METEOR_AE2E", "0") == "1":   # AutoE2E-style extra inputs (last 2 items: hist [32], ras [10,200,125])
+            out.extend(ae2e_inputs(self.root, s, f, self.__dict__.setdefault("_ae_cache", {})))
         # clone -> each tensor owns fresh, resizable storage (from_numpy storage
         # is not resizable, which breaks the shared-memory DataLoader collate)
         return tuple(t.clone() for t in out)

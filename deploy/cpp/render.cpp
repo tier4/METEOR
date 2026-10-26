@@ -437,8 +437,10 @@ cv::Mat compose_frame(const std::vector<cv::Mat>& raw,
   int kMode = 0;
   for (int i = 1; i < EGO_K; ++i)
     if (lg[i] > lg[kMode]) kMode = i;
-  // straight-preference rule (orin_render 2026-08-18)
-  if (kMode != 0 && (lg[kMode] - lg[0]) < 1.0f) kMode = 0;
+  // straight-preference rule retired 2026-09-29 (mode 0 is no longer the
+  // straight mode); METEOR_STRAIGHT_PREF=1 restores it
+  static const bool STRAIGHT_PREF = envd("METEOR_STRAIGHT_PREF", 0.0) > 0.5;
+  if (STRAIGHT_PREF && kMode != 0 && (lg[kMode] - lg[0]) < 1.0f) kMode = 0;
   g_prevMode.store(kMode);
   float mx = *std::max_element(lg, lg + EGO_K);
   double pr[EGO_K], prSum = 0;

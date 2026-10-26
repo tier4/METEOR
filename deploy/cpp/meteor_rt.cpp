@@ -273,6 +273,7 @@ OutMap MeteorRT::infer(const void* imgsHost, const float* K, const float* Tc,
     float fl = lidarBev ? 1.0f : 0.0f;
     h2d("lidar_flag", &fl, sizeof(float));
   }
+  if (shapes_.count("intent")) h2d("intent", intent_, 3 * sizeof(float));
   launch();
   // store this frame's raw_bev in the device ring (D2D, no host copy)
   if (!ring_.empty()) {

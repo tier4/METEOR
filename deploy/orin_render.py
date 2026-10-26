@@ -436,8 +436,8 @@ def _wrap(txt, n):
     return out
 
 
-# Weather / lighting words are not observable from the BEV tokens the VLA reads (2026-09-10, user
-# instruction "hide what has no grounding"): drop clauses / items / sentences that contain them.
+# Weather / lighting words are not observable from the BEV tokens the VLA reads, so clauses / items /
+# sentences that contain them are dropped (show only what is grounded).
 _VLA_UNGROUNDED = ("clear weather", "clear sky", "clear skies", "clear day", "clear, sunny", "clear and sunny", "under clear",
                    "overcast", "cloud", "rain", "snow", "fog", "daylight", "daytime", "lighting", "bright", "dim ",
                    "night", "dusk", "evening", "sunny", "sunlight", "weather", "sky", "skies", "visibility", "wet ", "dry ",
@@ -483,7 +483,7 @@ def _draw_vla_strip(canvas, rec):
                 cv2.FONT_HERSHEY_SIMPLEX, 0.45, (170, 170, 170), 1, cv2.LINE_AA)
     cmd = str(js.get("command", "?"))
     # The command vocabulary the VLA was trained with means "lateral displacement > 2 m within 3 s":
-    # at speed that is a road curve, not an intersection turn. Show it as such (2026-09-10 user report).
+    # at speed that is a road curve, not an intersection turn. Show it as such.
     if cmd in ("turn_left", "turn_right") and float(rec.get("v0", 0.0)) >= 7.0:
         cmd = cmd.replace("turn", "curve")
     col = {"stop": (80, 80, 255), "turn_left": (80, 200, 255), "turn_right": (80, 200, 255),
@@ -542,10 +542,13 @@ def compose_frame(raw, K, Tc, v0, out, dt, fps_now=None, pose=None):
         _sm.append(tuple(d))
     det = _sm
     compose_frame._yaw_tracks = [(d[2], d[3], d[6]) for d in det]
-    b2d = decode_boxes2d_ms_np(
-        [out[f"hm2d_s{i}"][0] for i in range(3)],
-        [out[f"reg2d_s{i}"][0] for i in range(3)],
-        thresh=float(os.environ.get("METEOR_TH2D", "0.50")))
+    if "hm2d_s0" in out:
+        b2d = decode_boxes2d_ms_np(
+            [out[f"hm2d_s{i}"][0] for i in range(3)],
+            [out[f"reg2d_s{i}"][0] for i in range(3)],
+            thresh=float(os.environ.get("METEOR_TH2D", "0.50")))
+    else:                       # METEORite engines: no 2D box heads in the graph
+        b2d = [[] for _ in range(out["ego"].shape[0] and 8)]
     ego = out["ego"][0]
     lg = ego[12 * EGO_K:12 * EGO_K + EGO_K].copy()
     # Mode hysteresis: closed loop rewards temporal consistency over
@@ -562,7 +565,10 @@ def compose_frame(raw, K, Tc, v0, out, dt, fps_now=None, pose=None):
     # straight unless a turning mode's logit beats it by >= 1.0. INT8 measurably picked the
     # right mode 2x as often due to quantisation (29 vs 15); with this rule the mean path y
     # went -1.012 -> -0.902 m and ADE vs GT improved 5.60 -> 5.33. Harmless under fp16.
-    if k != 0 and (lg[k] - lg[0]) < 1.0:
+    # Retired 2026-09-29 (METEOR_STRAIGHT_PREF=1 restores it): mode 0 is no longer
+    # the straight mode, so the rule pinned every frame to mode 0.
+    if os.environ.get("METEOR_STRAIGHT_PREF", "0") == "1" and \
+            k != 0 and (lg[k] - lg[0]) < 1.0:
         k = 0
     compose_frame._prev_mode = k
     pr = np.exp(lg - lg.max())

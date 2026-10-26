@@ -7,6 +7,9 @@
 *Eight cameras (Co-MLOps DRS). One 54M-parameter network. Twelve driving tasks —
 running on a Jetson AGX Orin at ~15 FPS (67 ms INT8), with LiDAR as an optional extra input on the same engine.*
 
+**Scalability × portability: one training stack, one model family — from an 8-camera
+GPU stack down to a single camera on a low-power edge accelerator.**
+
 **Zero human labels. Zero human-written code. Multiple machines run by AI agents.**
 
 [![Built on CoMET](https://img.shields.io/badge/built_on-CoMET_(Co--MLOps)-orange)](https://co-mlops.tier4.jp/)
@@ -14,6 +17,8 @@ running on a Jetson AGX Orin at ~15 FPS (67 ms INT8), with LiDAR as an optional 
 [![Tasks](https://img.shields.io/badge/tasks-12-blueviolet)]()
 [![Params](https://img.shields.io/badge/params-54M_(refiner_incl.)-blue)]()
 [![Orin](https://img.shields.io/badge/AGX_Orin_INT8-67.4_ms_(2:4_sparse)_%7C_75.4_ms_(dense)-76B900)]()
+[![Family](https://img.shields.io/badge/family-METEOR_%7C_METEOR2_%7C_METEOR2_Nano-d0021b)](#one-family--scalability--portability)
+[![Targets](https://img.shields.io/badge/targets-GPU_%7C_automotive_NPU_%7C_edge_accelerator-d0021b)](#one-family--scalability--portability)
 [![Runtime](https://img.shields.io/badge/runtime-Python_%7C_C%2B%2B_(TensorRT_10)-informational)]()
 [![Labels](https://img.shields.io/badge/human_labels-0-success)]()
 [![Code](https://img.shields.io/badge/human_written_code-0-success)]()
@@ -65,6 +70,47 @@ task costs < 5 % of total compute. A 5.0M-parameter **refiner** (seg / box / E2E
 heads) is part of the shipped network. The whole graph is `conv / grid_sample / gather /
 MLP` only and exports to TensorRT as a single static ONNX; the BEV lift runs as a fused
 CUDA plugin (IPluginV3) on the Orin.
+
+## One family — scalability × portability
+
+METEOR is not a single network but a **family that shares one training stack**: the same
+auto-labeled data, the same multi-task heads (lanes, 3D objects, depth, ego path) and the same
+training recipe. What changes from one silicon target to the next is **only the camera-to-BEV
+lift** — the one block whose operators decide whether a compiler accepts the graph.
+
+- **Scalability** — from 8 surround cameras on an automotive GPU to 1 front camera on a
+  low-power edge accelerator, with the same heads and the same E2E planner contract
+  (images + ego speed in, trajectory hypotheses out).
+- **Portability** — each generation rewrites the lift into the operator set its target
+  compiler accepts, so a new silicon target means a **new lift form, not a new model**.
+
+| | **METEOR** | **METEOR2** | **METEOR2 Nano** |
+|---|---|---|---|
+| Role | reference design | NPU-portable surround model | 1-camera, all-on-accelerator |
+| Cameras | 8 × 432×768, surround | 4–8 × 648×1152, surround | 1 front × 720×1280 |
+| Backbone | ResNet-34 + FPN | ResNet-18 + FPN-lite | ResNet-18 |
+| Camera → BEV lift | depth-gated geometric lift from intrinsics / extrinsics (fused CUDA plugin) | **learned low-rank block mapping**, distilled from the geometric lift — no Gather / ScatterND / GridSample | **Cartesian lift** (GPU) or **polar lift**: strided convolutions collapse each image column into range bins, no resampling at all |
+| BEV grid | Cartesian ±80 × ±50 m, 96 ch | Cartesian ±80 × ±50 m, 64 ch | Cartesian, or polar (azimuth × range) with boxes decoded to the ground plane |
+| Graph | custom plugin, dynamic shapes | standard ONNX operators only, static shapes | polar: Conv / Pool / Concat only (~220 nodes) |
+
+### Family tree — by target silicon
+
+```
+METEOR ─────────────── geometric lift + CUDA plugin ── Jetson AGX Orin            67–75 ms INT8
+  └─▶ METEOR2 ─┬────── low-rank learned lift ─┬─────── automotive NPU             compiles end-to-end, standard ops only
+               │                              └─────── Jetson AGX Orin            ~92 ms INT8
+               ├ ─ ─ ─ gather lift (planned) ───────── Jetson AGX Orin            to be measured
+               └─▶ METEOR2 Nano ─┬ Cartesian lift ──── Jetson Orin Nano           108 ms mixed INT8 / fp16 (84 ms 2:4 + INT8)
+                                 └ polar lift ──────── low-power edge accelerator 67.7 ms (14.8 FPS), single compiled graph, nothing on the host
+```
+
+All latencies are measured on the device with the real graph. The edge-accelerator number is
+for the whole network in one compiled graph — image in, BEV outputs and trajectory out, with no
+pre-/post-processing hops to the host CPU.
+
+**Status.** The METEOR2 / METEOR2 Nano code is in this repository (see the layout below);
+**pretrained METEOR2 and METEOR2 Nano weights are coming soon.** The released METEOR weights
+(v157) are unchanged and remain fully supported by this code.
 
 ### Optional inputs — one set of weights, every sensor configuration
 
@@ -224,6 +270,7 @@ released model and the demo scenes are published under the Autoware Foundation o
 |---|---|---|
 | **[AutowareFoundation/meteor](https://huggingface.co/AutowareFoundation/meteor)** (model) | `meteor_v157c3Z.onnx` — plain ONNX, camera-only, no custom ops; `meteor_v157.pt` — PyTorch checkpoint (final epoch) for fine-tuning / re-export; `meteor_v157.param.yaml` — camera order, resolution, BEV grid, output tensors; `lift_plugin_tables_r64/` — tables for the optional CUDA lift plugin; tag `v1.0` | Apache-2.0 |
 | **[AutowareFoundation/meteor-demo-scenes](https://huggingface.co/datasets/AutowareFoundation/meteor-demo-scenes)** (dataset) | six anonymised 8-camera scenes, one per road type — `highway_day`, `mountain_day`, `arterial_day`, `valday`, `valcurve`, `fast` — each with `manifest.json`, `img/`, `ego_motion.npz`, `lidar_bev/`; no ground truth; tag `v1.0` | CC-BY-4.0 |
+| METEOR2 / METEOR2 Nano (model) | checkpoints and plain ONNX for the NPU-portable and 1-camera generations | **coming soon** |
 
 ### Reproduce the released model end to end
 
@@ -258,7 +305,9 @@ python3 deploy/cpp/liftbench/plugin/make_plugin_onnx.py --onnx models/meteor_v15
 # 5. re-export or fine-tune from the checkpoint (needs torch + this repo)
 python3 deploy/export_onnx.py --ckpt models/meteor_v157.pt --model v52 --n-cams 8 --drop unk,pl,flow \
     --uint8-in --argmax-out --lane-logits --seg-bias "1:0.5,3:1.5,4:1.0,5:0.6,6:0.5" --no-hist --depth-mean \
-    --out out/meteor_v157c3Z_reexport.onnx        # add --with-lidar for the LiDAR-input variant
+    --no-intent --out out/meteor_v157c3Z_reexport.onnx   # add --with-lidar for the LiDAR-input variant
+#    --no-intent reproduces the published interface; without it the graph takes the driving-command
+#    input intent [1,3] (all zeros = no command, which applies the planner's learned no-command bias)
 ```
 
 `hf/onnx_smoke_test.py` is the reference for the input contract (RGB uint8 `[1,8,3,432,768]`, `K`,
@@ -314,6 +363,12 @@ bevlane/                 training, GT generation, evaluation
   eval_adverse.py        adverse / cracked / night-rain-reflection holdouts
   demo_rgbd_bev.py       local 12-task demo renderer
   probe_*.py (45)        one-question diagnostic probes
+  meteorite.py           METEOR2 / METEOR2 Nano network (internal name METEORite): low-rank learned lift,
+                         NPU export path (standard ONNX operators only, static shapes)
+  train_meteorite.py     METEOR2 trainer (geometric-lift distillation, QAT / 2:4 robustness via robust_train.py)
+  polar_lift.py          METEOR2 Nano polar lift (Conv / Pool / Concat only)
+  rowband_lift.py        row-band lift variant for Conv-only accelerators
+  train_f3.py            lightweight trajectory residual head for the NPU graph
 deploy/                  export + TensorRT runtimes
   export_onnx.py         --no-hist / --depth-mean / --with-lidar / --uint8-in / --argmax-out
   runtime.py             Python TensorRT runtime (CUDA Graph, pinned zero-copy inputs, LiDAR)
@@ -323,6 +378,8 @@ deploy/                  export + TensorRT runtimes
                          render.cpp (parity with Python), liftbench/ (CUDA lift plugin)
   orin/                  Orin-side scripts (demo.sh, demo_cpp.sh, bench, health checks, job template)
   build_engine_fp16.py   plugin-free fp16 engine for any NVIDIA GPU (the workstation reproduction path)
+  export_mite_ckpt.py    METEOR2 checkpoint -> ONNX (--npu npu: strict NPU graph; parity-checked against PyTorch)
+  npu_lint.py            operator / shape lint of an ONNX graph against NPU-style constraints
 hf/                      Hugging Face release: model / dataset cards, publish_to_hf.py, onnx_smoke_test.py
 docs/                    architecture / data pipeline / training / demo / quickstart / reproduce
 comlops-*.csv            2D taxonomies (21-class semantic, 10-class instance)
@@ -383,6 +440,7 @@ against final epochs. The detection rules live in [docs/TRAINING.md](docs/TRAINI
 - Promote the 2:4 sparse trunk (the released v157) to the device default; the dense baseline is still the default on our Orin.
 - Ship the LiDAR-capable export as the single engine, with LiDAR as a runtime switch (the host-side presence flag is in place).
 - A history-aware line trained from scratch (the temporal memory is unused today; a history-aware engine costs about +22 ms on the Orin) — one run is in progress.
+- Release the METEOR2 and METEOR2 Nano weights (code is already here).
 - Evaluation on a public benchmark, so accuracy can be reported in comparable terms.
 - An Autoware (ROS 2) node around the released ONNX; today METEOR ships with its own Python and C++ runtimes.
 - VLA support: a vision-language-action layer on top of METEOR's BEV features for long-tail understanding, instruction following and explanations, with METEOR's driving-command input as the interface.

@@ -77,6 +77,10 @@ class MeteorRT {
   OutMap infer(const void* imgsHost, const float* K, const float* Tc,
                float v0, const float* pose3, int outSlot,
                const float* lidarBev = nullptr);
+  // Driving Command one-hot [straight, left, right] for engines exported with the intent input (2026-10-05).
+  // Default zeros = no command. Engines without the input ignore it.
+  void setIntent(const float* oh3) { for (int i = 0; i < 3; ++i) intent_[i] = oh3[i]; }
+  float intent_[3]{0.f, 0.f, 0.f};
   bool hasLidar() const { return shapes_.count("lidar_bev") != 0; }
 
  private:

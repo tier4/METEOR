@@ -34,6 +34,8 @@ cv2.setNumThreads(1)
 SEG_CAMS = set(CAMS)
 STRIDE = 4
 SH, SW = IMG_H // STRIDE, IMG_W // STRIDE     # 108 x 192
+# Finer 2D seg targets: --grid H,W (e.g. 180,320) and --out-dir/--key save under another name (default seg2d21)
+OUT_DIR, OUT_KEY = "seg2d21", "seg2d21"
 
 N_SEG21 = 21
 _CSV = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
@@ -58,6 +60,37 @@ def _load_taxonomy():
 
 
 CAT2SEG, SEG21_PAL = _load_taxonomy()             # SEG21_PAL is RGB
+
+
+def _sample_idx(H, W, h, w, k=1):
+    """Sample points of an (h*k, w*k) grid as column-major linear indices. k=1 gives the cv2 INTER_NEAREST points (floor(y*H/h)); k>1 an even sub-grid inside each cell."""
+    vs = np.minimum(((np.arange(h * k) + 0.5) * (H / (h * k))).astype(np.int64), H - 1) if k > 1 else np.minimum((np.arange(h) * (H / h)).astype(np.int64), H - 1)
+    us = np.minimum(((np.arange(w * k) + 0.5) * (W / (w * k))).astype(np.int64), W - 1) if k > 1 else np.minimum((np.arange(w) * (W / w)).astype(np.int64), W - 1)
+    V, U = np.meshgrid(vs, us, indexing="ij")
+    return (U * H + V).reshape(-1)
+
+
+def seg_small_fast(lst, hw, k_thin=2):
+    """Fast path: instead of decoding the 4K masks, read only the (SH, SW) sample points from the RLE (same
+    nearest-neighbour points as before). The thin-class area fraction (formerly INTER_AREA) is approximated on a
+    k_thin x k_thin sub-grid."""
+    from bevlane.extract_depth_dense import _rle_sample
+    H, W = hw
+    idx1 = _sample_idx(H, W, SH, SW, 1); idxk = _sample_idx(H, W, SH, SW, k_thin)
+    small = np.zeros((SH, SW), np.uint8); labk = np.zeros((SH * k_thin, SW * k_thin), np.uint8)
+    seen_thin = False                      # sub-grid only for thin classes and masks painted after them (the only ones affecting the fraction)
+    for nm, m in sorted(lst, key=lambda a: PAINT_ORDER.get(a[0], -1)):
+        rle = {"size": m["size"], "counts": base64.b64decode(m["counts"])}
+        cid = CAT2SEG[nm]
+        small[_rle_sample(rle, (H, W), idx1).reshape(SH, SW)] = cid
+        if cid in THIN_IDS: seen_thin = True
+        if seen_thin:
+            labk[_rle_sample(rle, (H, W), idxk).reshape(SH * k_thin, SW * k_thin)] = cid
+    keep = small != 255
+    for tid in THIN_IDS:
+        frac = (labk == tid).reshape(SH, k_thin, SW, k_thin).mean(axis=(1, 3))
+        small[(frac > THIN_FRAC) & keep] = tid
+    return small
 # thin/small classes: a nearest-neighbour resize to 108x192 makes sub-pixel
 # lane lines vanish from the GT. Instead, mark a low-res cell as the thin
 # class when its full-res footprint covers > THIN_FRAC of the cell.
@@ -102,12 +135,12 @@ def process_scene(args):
         ordered, frames, _, _ = load_scene_light(sdir)
         strided = ordered[::stride]
         anns = load_anns(sdir)
-        os.makedirs(os.path.join(out_dir, "seg2d21"), exist_ok=True)
+        os.makedirs(os.path.join(out_dir, OUT_DIR), exist_ok=True)
         for fr in man["frames"]:
             fi = fr["frame"]
-            path = os.path.join(out_dir, f"seg2d21/{fi:04d}.npz")
+            path = os.path.join(out_dir, f"{OUT_DIR}/{fi:04d}.npz")
             if os.path.exists(path):
-                fr["seg2d21"] = f"seg2d21/{fi:04d}.npz"
+                fr[OUT_KEY] = f"{OUT_DIR}/{fi:04d}.npz"
                 continue
             frame = frames[strided[fi]["token"]]
             seg = np.full((len(CAMS), SH, SW), 255, np.uint8)
@@ -121,21 +154,9 @@ def process_scene(args):
                 if not lst:
                     continue
                 hw = tuple(lst[0][1]["size"])
-                # base 0 = background: pixels of unlisted categories
-                # (freespace, road_edge, obstacle_edge, ...) are none-of-21cls
-                lab = np.zeros(hw, np.uint8)
-                for nm, m in sorted(lst, key=lambda a: PAINT_ORDER.get(a[0], -1)):
-                    rle = {"size": m["size"], "counts": base64.b64decode(m["counts"])}
-                    lab[cocomask.decode(rle).astype(bool)] = CAT2SEG[nm]
-                small = cv2.resize(lab, (SW, SH), interpolation=cv2.INTER_NEAREST)
-                keep = small != 255                    # never overwrite ignore
-                for tid in THIN_IDS:
-                    frac = cv2.resize((lab == tid).astype(np.float32), (SW, SH),
-                                      interpolation=cv2.INTER_AREA)
-                    small[(frac > THIN_FRAC) & keep] = tid
-                seg[ci] = small
+                seg[ci] = seg_small_fast(lst, hw)
             np.savez_compressed(path, seg=seg)
-            fr["seg2d21"] = f"seg2d21/{fi:04d}.npz"
+            fr[OUT_KEY] = f"{OUT_DIR}/{fi:04d}.npz"
         json.dump(man, open(os.path.join(out_dir, "manifest.json"), "w"))
         return f"[ok] {scene}"
     except Exception as e:
@@ -147,7 +168,14 @@ def main():
     ap.add_argument("--stride", type=int, default=2)
     ap.add_argument("--workers", type=int, default=24)
     ap.add_argument("--scenes", default=None)
+    ap.add_argument("--grid", default="", help="grid H,W (e.g. 180,320); default 108,192")
+    ap.add_argument("--out-dir", default="")
+    ap.add_argument("--key", default="")
     args = ap.parse_args()
+    global SH, SW, OUT_DIR, OUT_KEY
+    if args.grid: SH, SW = [int(v) for v in args.grid.split(",")]
+    if args.out_dir: OUT_DIR = args.out_dir
+    if args.key: OUT_KEY = args.key
     if args.scenes:
         scenes = (open(args.scenes).read().split() if os.path.isfile(args.scenes)
                   else args.scenes.split(","))

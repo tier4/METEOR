@@ -47,7 +47,7 @@ done
 
 [ -d "$ROOT" ] && [ -s "$ROOT/scenes.txt" ] || { echo "data missing: ~/meteor/$ROOT (rsync the public scenes first)"; exit 1; }
 if [ -z "$ENGINE" ]; then
-  for cand in eng/v157c3Zg_int8.engine eng/v151c3Zg_int8.engine eng/v147c3Zg_int8.engine; do
+  for cand in eng/v211Lc3Zg_int8.engine eng/v199Lc3Zg_int8.engine eng/v162Lc3Zg_int8.engine eng/v157c3Zg_int8.engine eng/v151c3Zg_int8.engine eng/v147c3Zg_int8.engine; do
     [ -s "$cand" ] && { ENGINE="$cand"; break; }
   done
 fi
