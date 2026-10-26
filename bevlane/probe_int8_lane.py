@@ -113,7 +113,7 @@ def run(net, ds, idxs, fq=None):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--ckpt", required=True); ap.add_argument("--tag", default="")
-    ap.add_argument("--root", default=os.environ.get("METEOR_BEV_ROOT", "/data/dataset/bevlane"))
+    ap.add_argument("--root", default=os.environ.get("METEOR_BEV_ROOT", "out/bevlane"))
     ap.add_argument("--list", default=os.path.expanduser("~/work/BevLane/val.lst"))
     ap.add_argument("--n-scenes", type=int, default=6); ap.add_argument("--stride", type=int, default=6)
     ap.add_argument("--calib-frames", type=int, default=24); ap.add_argument("--gt-key", default="gt")

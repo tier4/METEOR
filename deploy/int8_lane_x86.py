@@ -16,7 +16,7 @@ import numpy as np, cv2
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 CAMS = ["CAM_FRONT_WIDE", "CAM_FRONT_LEFT", "CAM_FRONT_RIGHT", "CAM_BACK_WIDE", "CAM_BACK_LEFT",
         "CAM_BACK_RIGHT", "CAM_FRONT_NARROW", "CAM_BACK_NARROW"]
-ROOT = os.environ.get("METEOR_BEV_ROOT", "/data/dataset/bevlane")
+ROOT = os.environ.get("METEOR_BEV_ROOT", "out/bevlane")
 LIST = os.path.expanduser("~/work/BevLane/val.lst")
 NAMES = {1: "road", 3: "crosswalk", 4: "laneline", 5: "stopline", 6: "road_edge"}
 
