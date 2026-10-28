@@ -270,11 +270,11 @@ METEOR2 fine-tuned on the KITScenes train split and evaluated on the **KITScenes
 keyframes** (`bevlane/kitscenes_eval.py`; protocol in [docs/KITSCENES.md](docs/KITSCENES.md)).
 Trajectory errors in metres; the ground truth is the recorded 10 Hz future of each keyframe.
 
-| Model (6 cameras) | Inputs | ADE@1s | ADE@2s | ADE@3s | FDE@3s | 3D AP vehicle | 3D AP pedestrian |
-|---|---|---|---|---|---|---|---|
-| METEOR2 (KITScenes fine-tune) | images + ego speed + ego history + HD map + route | TBD | TBD | TBD | TBD | TBD | TBD |
-| METEOR2, no HD map | images + ego speed + ego history + route | TBD | TBD | TBD | TBD | TBD | TBD |
-| METEOR2, camera-only | images + ego speed | TBD | TBD | TBD | TBD | TBD | TBD |
+| Model (6 cameras) | Inputs | ADE@1s | ADE@2s | ADE@3s | FDE@3s |
+|---|---|---|---|---|---|
+| METEOR2 (KITScenes fine-tune) | images + ego speed + ego history + HD map + route | TBD | TBD | TBD | TBD |
+| METEOR2, no HD map | images + ego speed + ego history + route | TBD | TBD | TBD | TBD |
+| METEOR2, camera-only | images + ego speed | TBD | TBD | TBD | TBD |
 
 - **Pretraining** on in-house (Co-MLOps) data; **fine-tuning on KITScenes train only** (val is never trained on).
 - The reported epoch is **fixed in advance (the final epoch)**, not picked on val.
@@ -282,9 +282,7 @@ Trajectory errors in metres; the ground truth is the recorded 10 Hz future of ea
 - The route is a lane-level corridor of Lanelet2 lanelets rebuilt from the recorded drive (a navigation
   oracle); the destination is the end of the sequence. Scenes listed in
   `tools/kitscenes/route_unmatched_scenes.txt` get no route (see [docs/KITSCENES.md](docs/KITSCENES.md)).
-- **3D detection AP** is BEV centre-distance AP (match within 3 m for vehicles, 1.5 m for pedestrians).
-  KITScenes has no 3D box annotations, so it is measured against **LiDAR auto-labels** of the val split and is
-  a reference number, not a score against human annotations.
+- Box metrics on KITScenes will be added together with the evaluation tool.
 - KITScenes is CC BY-NC: these fine-tuned weights are research-only and are not released.
 
 ## Edge deployment: Jetson AGX Orin
