@@ -11,7 +11,7 @@ the scene's trajectory drives through:
   3. quality gate: matched >= 0.8, distance p95 <= 5 m, heading error p95 <= 45 deg, unresolved = 0; otherwise the
      route is invalid (empty raster)
 The corridor is each lanelet's centreline (mean of the left / right bounds) drawn 3.5 m wide, nothing more than 10 m
-behind the ego; the destination is the last pose of the scene (radius 2 m); see dataset.ae2e_inputs.
+behind the ego; the destination is the last pose of the scene (radius 2 m); see dataset.rmap_inputs.
 The lanelet2 library is not needed: map.osm is parsed directly (same projection as tools/kitscenes/kitscenes_to_bevlane.py)."""
 import os, re, json, math
 from collections import deque

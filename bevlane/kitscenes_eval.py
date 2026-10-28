@@ -10,10 +10,10 @@ Ground truth: from the raw 10 Hz poses (poses10.txt, TUM format), pos[a+1 : a+31
   (x forward, y left) by the yaw of pose a -> 30 points at 0.1 s.
 Prediction: the selected candidate of the METEOR2 ego head (6 points at 0.5 s), linearly interpolated from (0, 0) at
   0.1 s -> 30 points. ADE@1/2/3s = mean L2 error over the first 10 / 20 / 30 points, FDE@3s = error of point 30.
-Inputs follow the checkpoint: a plain checkpoint sees images + ego speed only; a --ae2e checkpoint additionally gets
-  the ego history and the HD-map / route raster that the dataset appends (this script sets METEOR_AE2E=1). The
-  conditioning switches must match training, e.g. METEOR_AE2E_ROUTE=lanelet METEOR_AE2E_HIST=past64 METEOR_ABSENT_CAMS=6
-  (and METEOR_AE2E_NOMAP=1 for the no-HD-map variant); see docs/KITSCENES.md.
+Inputs follow the checkpoint: a plain checkpoint sees images + ego speed only; a --route-map checkpoint additionally gets
+  the ego history and the HD-map / route raster that the dataset appends (this script sets METEOR_RMAP=1). The
+  conditioning switches must match training, e.g. METEOR_RMAP_ROUTE=lanelet METEOR_RMAP_HIST=past64 METEOR_ABSENT_CAMS=6
+  (and METEOR_RMAP_NOMAP=1 for the no-HD-map variant); see docs/KITSCENES.md.
 
 usage: python bevlane/kitscenes_eval.py NAME=CKPT [NAME=CKPT ...] --val-list out/kitscenes/scenes_val.txt
            [--root out/bevlane] [--hr-root <hr720 root>] [--img-scale 1.5] [--set kf202|dense|both] [--dump DIR]
@@ -24,7 +24,7 @@ import sys
 
 os.environ.setdefault("METEOR_EVAL_MODEL", "v52")
 os.environ.setdefault("METEOR_ZERO_HIST", "1")
-os.environ["METEOR_AE2E"] = "1"                 # the dataset appends the conditioning inputs (ignored by plain checkpoints)
+os.environ["METEOR_RMAP"] = "1"                 # the dataset appends the conditioning inputs (ignored by plain checkpoints)
 
 import numpy as np   # noqa: E402
 import torch         # noqa: E402
@@ -91,7 +91,7 @@ def main():
     for spec in a.ckpts:
         name, ck = spec.split("=", 1)
         w = M.load_mite_eval(ck, device=a.device); net = w.net.eval()
-        cond = getattr(net, "ae2e", False)
+        cond = getattr(net, "route_map", False)
         for st in sets:
             E, miss, keys, route = [], 0, [], []
             for s, fa in anchors[st]:
@@ -101,9 +101,9 @@ def main():
                     miss += 1; continue
                 ego = b[6]
                 if cond:
-                    net._ae_hist = b[-2][None].to(a.device).float(); net._ae_ras = b[-1][None].to(a.device).float()
+                    net._rm_hist = b[-2][None].to(a.device).float(); net._rm_ras = b[-1][None].to(a.device).float()
                     for ch in zero_ch:
-                        net._ae_ras[:, ch] = 0
+                        net._rm_ras[:, ch] = 0
                 with torch.no_grad(), torch.autocast("cuda", torch.bfloat16):
                     o = net.forward_geo(b[0][None].to(a.device), b[1][None].to(a.device), b[2][None].to(a.device),
                                         ego[12].view(1).to(a.device).float())

@@ -24,7 +24,7 @@ import torch.nn.functional as F
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from autolabel_bev import PALETTE  # noqa: E402
-from bevlane.dataset import CAMS, BevLaneDataset  # noqa: E402
+from bevlane.dataset import CAMS, BevLaneDataset, rmap_env  # noqa: E402
 from bevlane.extract_bbox2d import DET10_PAL  # noqa: E402
 from bevlane.demo_occ_gt import cube_render  # noqa: E402
 from bevlane.guardrail import check_path, risk_pick  # noqa: E402
@@ -361,8 +361,8 @@ def main():
     ap.add_argument("--no-agent-traj", action="store_true", help="do not draw the other agents' forecast trajectories")
     ap.add_argument("--no-2d-boxes", action="store_true", help="do not draw 2D boxes on the camera images (--unk2d BEV points remain)")
     ap.add_argument("--no-risk", action="store_true", help="do not overlay the risk map")
-    ap.add_argument("--show-ae-map", action="store_true", help="route / map conditioned METEOR2 checkpoints: show the input raster (HD map + route corridor + destination) "
-                                                                 "to the right of the predicted BEV, same extent (widens the video)")
+    ap.add_argument("--show-route-map", "--show-ae-map", action="store_true", help="route / map conditioned METEOR2 checkpoints: show the input raster (HD map + route corridor + destination) "
+                                                                                   "to the right of the predicted BEV, same extent (widens the video)")
     ap.add_argument("--bev-proj", action="store_true", help="project the predicted BEV classes onto the camera images (flat-ground assumption)")
     ap.add_argument("--no-occ", action="store_true", help="do not draw the predicted OCC voxel inset")
     ap.add_argument("--show-ped-path", action="store_true",
@@ -798,7 +798,7 @@ def main():
         (int(infer_hw.split("x")[0]), int(infer_hw.split("x")[1]))
 
     VW, VH = 1920, 1080
-    if args.show_ae_map:                     # extra column for the input map, as wide as the BEV (the BEV column is 412 px)
+    if args.show_route_map:                  # extra column for the input map, as wide as the BEV (the BEV column is 412 px)
         VW = 1920 + 420
     # left = RGB (top) over Depth (below), same 2x4 grid; right = BEV portrait.
     CAM8 = ["CAM_FRONT_LEFT", "CAM_FRONT_WIDE", "CAM_FRONT_RIGHT", "CAM_FRONT_NARROW",
@@ -835,11 +835,11 @@ def main():
         for i in range(len(ds)):
             _b = ds[i]
             imgs, K, T, _ = _b[:4]
-            if args.mite_ckpt and getattr(_mite.net, "ae2e", False):
+            if args.mite_ckpt and getattr(_mite.net, "route_map", False):
                 # route / map conditioned checkpoint: pass the ego history and the map / route raster that the dataset
-                # appends with METEOR_AE2E=1 (as in kitscenes_eval)
-                assert os.environ.get("METEOR_AE2E") == "1", "demo of a route / map conditioned ckpt needs METEOR_AE2E=1 (and METEOR_AE2E_ROUTE=lanelet)"
-                _mite.net._ae_hist = _b[-2][None].cuda().float(); _mite.net._ae_ras = _b[-1][None].cuda().float()
+                # appends with METEOR_RMAP=1 (as in kitscenes_eval)
+                assert rmap_env() == "1", "demo of a route / map conditioned ckpt needs METEOR_RMAP=1 (and METEOR_RMAP_ROUTE=lanelet)"
+                _mite.net._rm_hist = _b[-2][None].cuda().float(); _mite.net._rm_ras = _b[-1][None].cuda().float()
             # with native-resolution input (img_scale != 1), overlays on camera images (boxes, path, unk2d) use the 768x432-based K
             K_draw = K.clone(); K_draw[:, :2] /= float(getattr(ds, 'img_scale', 1) or 1)
             # run the model at its training resolution (avoid OOD instability
@@ -1714,10 +1714,10 @@ def main():
                             cv2.FONT_HERSHEY_SIMPLEX, 0.6, (80, 220, 255), 2,
                             cv2.LINE_AA)
             bx = min(bx0, VW - BW2)                          # flush to right edge
-            if args.show_ae_map:
+            if args.show_route_map:
                 bx = bx0                                     # predicted BEV right of the camera grid, input map further right
             frame[40:40 + BH2, bx:bx + BW2] = bev
-            _ras = getattr(_mite.net, "_ae_ras", None) if (args.show_ae_map and args.mite_ckpt) else None
+            _ras = getattr(_mite.net, "_rm_ras", None) if (args.show_route_map and args.mite_ckpt) else None
             if _ras is not None:
                 # crop the input raster [10,200,125] @0.8 m (rows x +80..-80, cols y +50..-50) to the predicted BEV's +60..-_XB x +-25 m
                 _r = _ras[0].float().cpu().numpy() > 0.5
@@ -1767,7 +1767,7 @@ def main():
                      + (["SDMAP"] if args.sdmap else []))
             mode_tag = ("+".join(_mods) + " ON") if _mods \
                 else ("LIDAR ON" if args.lidar else "camera-only")
-            if args.mite_ckpt and getattr(_mite.net, "ae2e", False):   # route / map conditioned ckpt: map, route and ego history are inputs too
+            if args.mite_ckpt and getattr(_mite.net, "route_map", False):   # route / map conditioned ckpt: map, route and ego history are inputs too
                 mode_tag = "camera + route/map + ego-history"
             if args.seg_fuse:
                 mode_tag += "  |  seg-EMA<=45m"

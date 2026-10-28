@@ -25,7 +25,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from bevlane.dataset import BevLaneDataset                              # noqa: E402
+from bevlane.dataset import BevLaneDataset, rmap_env                    # noqa: E402
 from bevlane.model import DepthSegIPMNetV52 as DON, EGO_K               # noqa: E402
 from bevlane.train import (EMA, EpochSubsetSampler, boundary_weight, dice_loss,   # noqa: E402
                            lovasz_softmax, split_scenes, tversky_loss)
@@ -305,10 +305,10 @@ def losses(net, out, batch, dev, args):
     return sum(ls.values()), log
 
 
-def _set_ae2e(net, batch, dev):
+def _set_route_map(net, batch, dev):
     """Route / map conditioning inputs: attach the last two dataset items (ego history [B,32|256], map/route raster [B,10,200,125]) to the net."""
     m_ = net.module if hasattr(net, "module") else net
-    m_._ae_hist = batch[-2].to(dev, non_blocking=True).float(); m_._ae_ras = batch[-1].to(dev, non_blocking=True).float()
+    m_._rm_hist = batch[-2].to(dev, non_blocking=True).float(); m_._rm_ras = batch[-1].to(dev, non_blocking=True).float()
 
 
 @torch.no_grad()
@@ -321,8 +321,8 @@ def validate(net, loader, dev, max_batches=200):
         if bi >= max_batches:
             break
         e = batch[I_EGO].to(dev)
-        if os.environ.get("METEOR_AE2E", "0") == "1":
-            _set_ae2e(net, batch, dev)
+        if rmap_env("", "0") == "1":
+            _set_route_map(net, batch, dev)
         with torch.autocast("cuda", torch.bfloat16):
             out = net.forward_geo(batch[I_IMG].to(dev), batch[I_K].to(dev),
                                   batch[I_T].to(dev), e[:, 12])   # val = camera only (gate condition)
@@ -353,17 +353,17 @@ def main():
     ap.add_argument("--mined", default="out/mined_scenes.txt")
     ap.add_argument("--mined-oversample", type=int, default=4)
     ap.add_argument("--eps-wta", type=float, default=0.1)
-    ap.add_argument("--ae2e-lr-mult", type=float, default=20.0)
-    # Privileged-information distillation ("HD map at training time only"): the teacher is a frozen --ae2e checkpoint that
-    #   sees the map / route raster and the ego history; the student sees images + v0 only (--ae2e 0). The student's BEV
+    ap.add_argument("--route-map-lr-mult", "--ae2e-lr-mult", type=float, default=20.0)
+    # Privileged-information distillation ("HD map at training time only"): the teacher is a frozen --route-map checkpoint that
+    #   sees the map / route raster and the ego history; the student sees images + v0 only (--route-map 0). The student's BEV
     #   features (fused BEV and the ego trunk l1) and its ego output (candidate waypoints and selection scores) are pulled
-    #   towards the teacher, on samples that have a map only. The dataset appends the teacher inputs with METEOR_AE2E=1
+    #   towards the teacher, on samples that have a map only. The dataset appends the teacher inputs with METEOR_RMAP=1
     #   (they are not given to the student).
-    ap.add_argument("--priv-kd-ckpt", default="", help="teacher checkpoint for privileged-information distillation (trained with --ae2e 1)")
+    ap.add_argument("--priv-kd-ckpt", default="", help="teacher checkpoint for privileged-information distillation (trained with --route-map 1)")
     ap.add_argument("--priv-kd-feat-w", type=float, default=0.0, help="weight of the BEV feature distillation (fused BEV + ego trunk)")
     ap.add_argument("--priv-kd-ego-w", type=float, default=0.0, help="weight of the ego output distillation (candidate waypoints smooth-L1 + selection-score KL)")
     ap.add_argument("--priv-kd-tau", type=float, default=1.0, help="temperature of the selection-score KL")
-    ap.add_argument("--ae2e", type=int, default=0, help="route / map conditioned variant: add ego-motion history + HD-map / route raster inputs (dataset.ae2e_inputs, METEOR_AE2E=1)")
+    ap.add_argument("--route-map", "--ae2e", type=int, default=0, help="route / map conditioned variant: add ego-motion history + HD-map / route raster inputs (dataset.rmap_inputs, METEOR_RMAP=1)")
     ap.add_argument("--ego-acc", type=int, default=0, help="add the current acceleration (GT acc, CAN-equivalent) as an ego_mlp input")
     ap.add_argument("--qat", type=int, default=0, help="fake-quant training: step at which to enable it (0 = off); observe only before that")
     ap.add_argument("--sparse-24", action="store_true", help="2:4 mask training (SP24_DENSE layers stay dense)")
@@ -473,8 +473,8 @@ def main():
     ap.add_argument("--out", required=True)
     ap.add_argument("--smoke", type=int, default=0, help="steps per epoch for a smoke run")
     args = ap.parse_args()
-    if args.ae2e:
-        os.environ["METEOR_AE2E"] = "1"     # dataset appends ego history and map/route raster (inherited by DataLoader workers)
+    if args.route_map:
+        os.environ["METEOR_RMAP"] = "1"     # dataset appends ego history and map/route raster (inherited by DataLoader workers)
     if args.det2d_w > 0:
         global I_B2, I_C2, I_EGO, I_TL, I_RISK, I_LB
         I_B2, I_C2, I_EGO, I_TL, I_RISK, I_LB = 10, 11, 12, 13, 14, 15
@@ -553,8 +553,8 @@ def main():
 
     torch.manual_seed(0)                 # identical fresh init on all ranks (redundant with the broadcast below)
     net = make_net(args, rank).to(dev)
-    if args.ae2e:
-        net.enable_ae2e()                    # create before loading the init ckpt (older ckpts keep the zero init = function-preserving)
+    if args.route_map:
+        net.enable_route_map()               # create before loading the init ckpt (older ckpts keep the zero init = function-preserving)
     if args.rowband_lift:                  # row-band lift: geometric init from the reference rig (overwritten later if init-ckpt has rowband.*)
         from bevlane.rowband_lift import attach as _hl_attach
         _ref = BevLaneDataset(args.root, [args.rowband_ref_scene], augment=False, max_per_scene=1, trim_start=3, trim_end=10, **kw)
@@ -571,7 +571,7 @@ def main():
             print(f"[polar] attached: {net.polar.extra_repr()} ref={args.rowband_ref_scene}", flush=True)
     if args.init_ckpt:
         ck = torch.load(args.init_ckpt, map_location="cpu", weights_only=False)
-        sd = {k.replace("module.", ""): v for k, v in ck["sd"].items()}
+        sd = M.remap_legacy_keys({k.replace("module.", ""): v for k, v in ck["sd"].items()})
         if args.ego_acc and "ego_mlp.0.weight" in sd and sd["ego_mlp.0.weight"].shape[1] == net.ego_mlp[0].in_features + 1:
             net.enable_ego_acc()                 # ckpt already has the acc input -> widen first so shapes match
         cur = net.state_dict()
@@ -612,7 +612,7 @@ def main():
         # resume from the epoch after our own last.pt (EMA weights) instead of restarting from init.
         # optimizer state is not saved, so AdamW is re-initialized (lr continues from its schedule position)
         ck = torch.load(rp, map_location="cpu", weights_only=False)
-        net.load_state_dict({k.replace("module.", ""): v for k, v in ck["sd"].items()})
+        net.load_state_dict(M.remap_legacy_keys({k.replace("module.", ""): v for k, v in ck["sd"].items()}))
         start_ep = int(ck["ep"]) + 1
         if rank == 0:
             print(f"[resume] {rp} (ep {ck['ep']}) -> start ep {start_ep}", flush=True)
@@ -646,26 +646,26 @@ def main():
             print(f"[kd-box] teacher {args.kd_box_ckpt} (w {args.kd_box_w}, r >= {args.kd_box_rmin} m)", flush=True)
     priv = None
     if args.priv_kd_ckpt and (args.priv_kd_feat_w > 0 or args.priv_kd_ego_w > 0):
-        assert os.environ.get("METEOR_AE2E") == "1" and not args.ae2e, "the dataset appends the teacher inputs with METEOR_AE2E=1; the student uses --ae2e 0"
+        assert rmap_env() == "1" and not args.route_map, "the dataset appends the teacher inputs with METEOR_RMAP=1; the student uses --route-map 0"
         import bevlane.model as _MD
         _y2 = getattr(_MD, "_YAW2", 0)                                    # load_mite_eval resets _YAW2 for evaluation -> restore it so the student's box encoding is unchanged
         priv = M.load_mite_eval(args.priv_kd_ckpt, device=str(dev), verbose=rank == 0).net.eval()
         _MD._YAW2 = _y2
-        assert getattr(priv, "ae2e", False), "the teacher must be a --ae2e checkpoint (with map / route inputs)"
+        assert getattr(priv, "route_map", False), "the teacher must be a --route-map checkpoint (with map / route inputs)"
         for p_ in priv.parameters():
             p_.requires_grad_(False)
         if rank == 0:
             print(f"[priv-kd] teacher {args.priv_kd_ckpt} feat_w {args.priv_kd_feat_w} ego_w {args.priv_kd_ego_w} tau {args.priv_kd_tau}", flush=True)
     # no DDP wrapper: forward_geo is our own entry point, so gradients are synced
     # manually after backward (all ranks build the same graph; None grads skip equally)
-    if args.ae2e and args.ae2e_lr_mult != 1.0:
-        # the new zero-initialized AE2E input layers barely move at the base lr -> separate group with lr x ae2e_lr_mult
-        _ae = [p_ for n_, p_ in net.named_parameters() if ".ae_" in n_ or n_.startswith("ae_")]
-        _ids = {id(p_) for p_ in _ae}
+    if args.route_map and args.route_map_lr_mult != 1.0:
+        # the new zero-initialized route / map input layers barely move at the base lr -> separate group with lr x route_map_lr_mult
+        _rm = [p_ for n_, p_ in net.named_parameters() if ".rm_" in n_ or n_.startswith("rm_")]
+        _ids = {id(p_) for p_ in _rm}
         opt = torch.optim.AdamW([{"params": [p_ for p_ in net.parameters() if id(p_) not in _ids], "mult": 1.0},
-                                 {"params": _ae, "mult": args.ae2e_lr_mult}], lr=args.lr, weight_decay=1e-4)
+                                 {"params": _rm, "mult": args.route_map_lr_mult}], lr=args.lr, weight_decay=1e-4)
         if rank == 0:
-            print(f"[ae2e] {len(_ae)} tensors at lr x{args.ae2e_lr_mult}", flush=True)
+            print(f"[route-map] {len(_rm)} tensors at lr x{args.route_map_lr_mult}", flush=True)
     else:
         opt = torch.optim.AdamW(net.parameters(), lr=args.lr, weight_decay=1e-4)
     steps_ep = len(dl)
@@ -694,14 +694,14 @@ def main():
                 keep = (torch.rand(lidar.shape[0], 1, 1, 1, device=dev)
                         >= args.lidar_drop).float()
                 lidar = lidar * keep
-            if args.ae2e:
-                _set_ae2e(net, batch, dev)
+            if args.route_map:
+                _set_route_map(net, batch, dev)
             with torch.autocast("cuda", torch.bfloat16):
                 out = net.forward_geo(batch[I_IMG].to(dev), batch[I_K].to(dev),
                                       batch[I_T].to(dev), e[:, 12], lidar=lidar, acc=e[:, 17] if args.ego_acc else None)   # input acceleration is the causal e[17] (e[13] looks ahead and is for targets only)
             if priv is not None:
                 with torch.no_grad(), torch.autocast("cuda", torch.bfloat16):
-                    _set_ae2e(priv, batch, dev)
+                    _set_route_map(priv, batch, dev)
                     pt = priv.forward_geo(batch[I_IMG].to(dev), batch[I_K].to(dev), batch[I_T].to(dev), e[:, 12])
                 has_map = (batch[-1][:, :8].flatten(1).amax(1) > 0).to(dev)          # distil only samples that have an HD map
                 out["pk_mask"] = has_map.float()

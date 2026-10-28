@@ -20,6 +20,7 @@ No GridSample / ScatterND / Shape / Where / CumSum / trig / LayerNorm / Div in t
 """
 import math
 import os
+import re
 
 import numpy as np
 import torch
@@ -959,28 +960,28 @@ class METEORite(nn.Module):
         self.ego_mlp[0] = new
         self.ego_acc = True
 
-    def enable_ae2e(self):
-        """Optional extra inputs: ego-motion history [32] and a map / route raster [10,200,125] (dataset.ae2e_inputs).
+    def enable_route_map(self):
+        """Optional extra inputs: ego-motion history [32] and a map / route raster [10,200,125] (dataset.rmap_inputs).
         Both are zero-initialised additive branches (function-preserving): the raster enters at the BEV network input
         (same place as the LiDAR raster), the history at the ego_mlp hidden layer (before the ReLU).
-        Set self._ae_hist / self._ae_ras before forward_geo (like acc; if absent the plain path is used)."""
-        if getattr(self, "ae2e", False):
+        Set self._rm_hist / self._rm_ras before forward_geo (like acc; if absent the plain path is used)."""
+        if getattr(self, "route_map", False):
             return
         dev = self.ego_mlp[0].weight.device
         cp = self.lidar_stem.out_channels
-        self.ae_ras_stem = nn.Sequential(nn.Conv2d(10, 32, 3, 1, 1), nn.ReLU(inplace=True), nn.Conv2d(32, cp, 1)).to(dev)
-        from bevlane.dataset import AE2E_HIST_DIM                 # 32, or 256 with METEOR_AE2E_HIST=past64 (6.4 s @10 Hz)
-        self.ae_hist_mlp = nn.Sequential(nn.Linear(AE2E_HIST_DIM, 128), nn.ReLU(inplace=True), nn.Linear(128, self.ego_mlp[0].out_features)).to(dev)
-        for m_ in (self.ae_ras_stem[2], self.ae_hist_mlp[2]):
+        self.rm_ras_stem = nn.Sequential(nn.Conv2d(10, 32, 3, 1, 1), nn.ReLU(inplace=True), nn.Conv2d(32, cp, 1)).to(dev)
+        from bevlane.dataset import RMAP_HIST_DIM                 # 32, or 256 with METEOR_RMAP_HIST=past64 (6.4 s @10 Hz)
+        self.rm_hist_mlp = nn.Sequential(nn.Linear(RMAP_HIST_DIM, 128), nn.ReLU(inplace=True), nn.Linear(128, self.ego_mlp[0].out_features)).to(dev)
+        for m_ in (self.rm_ras_stem[2], self.rm_hist_mlp[2]):
             nn.init.zeros_(m_.weight); nn.init.zeros_(m_.bias)
-        self.ae2e = True
+        self.route_map = True
 
     def _ego_out(self, g, v0, acc, B):
         x = self._ego_in(g, v0, acc, B)
-        h_ = getattr(self, "_ae_hist", None) if getattr(self, "ae2e", False) else None
+        h_ = getattr(self, "_rm_hist", None) if getattr(self, "route_map", False) else None
         if h_ is None:
             return self.ego_mlp(x)
-        h = self.ego_mlp[0](x) + self.ae_hist_mlp(h_.to(x.dtype))
+        h = self.ego_mlp[0](x) + self.rm_hist_mlp(h_.to(x.dtype))
         return self.ego_mlp[2](self.ego_mlp[1](h))
 
     def _ego_in(self, g, v0, acc, B):
@@ -998,9 +999,9 @@ class METEORite(nn.Module):
 
     def _heads(self, bev, lidar=None):
         """Everything after the view transform (shared between export forward and forward_geo)."""
-        r_ = getattr(self, "_ae_ras", None) if getattr(self, "ae2e", False) else None
+        r_ = getattr(self, "_rm_ras", None) if getattr(self, "route_map", False) else None
         if r_ is not None:                                       # map / route raster (zero-initialised additive branch)
-            bev = bev + F.interpolate(self.ae_ras_stem(r_.to(bev.dtype)), size=bev.shape[-2:], mode="bilinear", align_corners=False)
+            bev = bev + F.interpolate(self.rm_ras_stem(r_.to(bev.dtype)), size=bev.shape[-2:], mode="bilinear", align_corners=False)
         if self.bev2:
             if lidar is not None:                                # LiDAR raster stays at 0.4 m -> x2 after the stem
                 bev = bev + self._up2(self.lidar_stem(lidar))
@@ -1512,6 +1513,17 @@ class MiteEval(nn.Module):
 _DEF = dict(BEV_FRONT=0, OCC_HEAD=OCC_HEAD, YAW2=YAW2, N_CAM=N_CAM, FS=FS, NECK_C=NECK_C, HEAD_C=HEAD_C, IMG_H=IMG_H, IMG_W=IMG_W, C_P=C_P, D=D, BC0=BC0, BC1=BC1, BCF=BCF, BEV2_C02=BEV2_C02, BEV2_DW=BEV2_DW)
 
 
+def remap_legacy_keys(sd):
+    """State-dict keys of older route / map conditioned checkpoints: ae_ras_stem / ae_hist_mlp -> rm_ras_stem / rm_hist_mlp
+    (also below a module. / net. prefix)."""
+    return {re.sub(r"(^|\.)ae_(ras_stem|hist_mlp)\.", r"\1rm_\2.", k): v for k, v in sd.items()}
+
+
+def ckpt_route_map(a):
+    """Route / map conditioning flag of the ckpt args (older ckpts store it as ae2e)."""
+    return int(a.get("route_map", a.get("ae2e", 0)) or 0)
+
+
 def load_mite_eval(path, device="cuda", verbose=True):
     import bevlane.model as _mm
     ck = torch.load(path, map_location="cpu", weights_only=False)
@@ -1569,15 +1581,15 @@ def load_mite_eval(path, device="cuda", verbose=True):
     net = METEORite(taps=None, pretrained=False, backbone=a.get("backbone", "resnet18"))
     if int(a.get("ego_acc", 0) or 0):
         net.enable_ego_acc()                                   # ckpt with the acc input
-    if int(a.get("ae2e", 0) or 0):
-        net.enable_ae2e()                                      # ckpt with the extra inputs (ego history + map / route raster)
+    if ckpt_route_map(a):
+        net.enable_route_map()                                 # ckpt with the extra inputs (ego history + map / route raster)
     if int(a.get("rowband_lift", 0) or 0):                     # ckpt with the row-band lift: build the modules, then load weights
         from bevlane.rowband_lift import attach as _hl_attach
         _hl_attach(net, a)
     if int(a.get("polar", 0) or 0):                            # polar BEV ckpt: build modules and load weights; if no grid is stored, build geometry from the reference scene
         from bevlane.polar_lift import attach as _pl_attach, ensure_geometry as _pl_geo
         _pl_attach(net, a)
-    sd = {k.replace("module.", ""): v for k, v in ck["sd"].items()}
+    sd = remap_legacy_keys({k.replace("module.", ""): v for k, v in ck["sd"].items()})
     net.load_state_dict(sd, strict=net.polar is None)         # polar: older ckpts have no grid buffers -> strict=False
     if net.polar is not None:
         _pl_geo(net, scene=a.get("rowband_ref_scene"))

@@ -47,25 +47,31 @@ def causal_acc(z, fi, n=2):
 
 
 
-AE2E = os.environ.get("METEOR_AE2E", "0") == "1"
-AE2E_RES, AE2E_H, AE2E_W = 0.8, 200, 125          # map / route raster (rows x +80..-80 m, cols y +50..-50 m; same orientation as the GT png)
+def rmap_env(suffix="", default=""):
+    """METEOR_RMAP<suffix> (route / map conditioning switches)."""
+    v = os.environ.get("METEOR_RMAP" + suffix)
+    return v if v is not None else os.environ.get("METEOR_AE2E" + suffix, default)   # legacy env names
+
+
+RMAP = rmap_env("", "0") == "1"
+RMAP_RES, RMAP_H, RMAP_W = 0.8, 200, 125          # map / route raster (rows x +80..-80 m, cols y +50..-50 m; same orientation as the GT png)
 # Environment switches of the route / map conditioned variant (all optional):
-#   METEOR_AE2E_HIST=past64     : ego history of 64 past steps (6.4 s) @10 Hz x (speed / long. accel / yaw rate / curvature)
+#   METEOR_RMAP_HIST=past64     : ego history of 64 past steps (6.4 s) @10 Hz x (speed / long. accel / yaw rate / curvature)
 #                                 = 256 values, derived from the raw 10 Hz poses (poses10.txt). Row k holds the sample at
 #                                 a-1-k (strictly past; the acceleration of row 0, which would need pose a+1, is zeroed).
 #                                 Default: the 32-value history of the base recipe.
-#   METEOR_AE2E_ROUTE_DENY=<f>  : scenes listed in <f> get no route (route + destination channels left empty; the map stays),
+#   METEOR_RMAP_ROUTE_DENY=<f>  : scenes listed in <f> get no route (route + destination channels left empty; the map stays),
 #                                 e.g. scenes whose route a stricter matcher rejects.
-#   METEOR_AE2E_NOMAP=1         : empty HD-map channels 0-7 (route + destination stay): the "no HD map" variant.
-#   METEOR_AE2E_NOROUTE=1       : empty route + destination channels (ablation).
+#   METEOR_RMAP_NOMAP=1         : empty HD-map channels 0-7 (route + destination stay): the "no HD map" variant.
+#   METEOR_RMAP_NOROUTE=1       : empty route + destination channels (ablation).
 #   METEOR_KITS_BOX=1           : read 3D box auto-labels of KITScenes scenes (tools/kitscenes/kits_box_gt.py) as box GT.
-AE2E_HIST_PAST = os.environ.get("METEOR_AE2E_HIST", "") == "past64"
+RMAP_HIST_PAST = rmap_env("_HIST") == "past64"
 KITS_BOX = os.environ.get("METEOR_KITS_BOX", "") == "1"
-AE2E_HIST_DIM = 256 if AE2E_HIST_PAST else 32
-_AE2E_DENY = set(l.strip() for l in open(os.environ["METEOR_AE2E_ROUTE_DENY"]) if l.strip()) if os.environ.get("METEOR_AE2E_ROUTE_DENY") else set()
+RMAP_HIST_DIM = 256 if RMAP_HIST_PAST else 32
+_RMAP_DENY = set(l.strip() for l in open(rmap_env("_ROUTE_DENY")) if l.strip()) if rmap_env("_ROUTE_DENY") else set()
 
 
-def _ae2e_hist_past64(root, s, f, c):
+def _rmap_hist_past64(root, s, f, c):
     """Ego history from the raw 10 Hz poses (poses10.txt): speed, longitudinal acceleration, yaw rate and curvature are
     differentiated over the whole scene; the 64 steps strictly before the current 10 Hz index (= 2 x our frame number) are
     stacked newest first. Out of range = 0. Normalisation as in the 32-value history (/10, /3, /0.5, /0.1)."""
@@ -86,16 +92,16 @@ def _ae2e_hist_past64(root, s, f, c):
     return h.reshape(-1)
 
 
-def ae2e_inputs(root, s, f, cache):
+def rmap_inputs(root, s, f, cache):
     """Optional route / map conditioning inputs, so HD-map scenes (e.g. KITScenes) can be trained / evaluated with
     an HD map, a navigation route and the ego-motion history.
       hist [32] : past 4 s of ego motion, 8 rows at 0.5 s x (speed/10, long. accel/3, yaw rate/0.5, curvature/0.1).
-                  Row 0 = [t-0.5, t]. Uses poses up to now only (causal). With METEOR_AE2E_HIST=past64 it is
-                  [256] instead: 64 past steps at 10 Hz from the raw poses (see _ae2e_hist_past64).
+                  Row 0 = [t-0.5, t]. Uses poses up to now only (causal). With METEOR_RMAP_HIST=past64 it is
+                  [256] instead: 64 past steps at 10 Hz from the raw poses (see _rmap_hist_past64).
       ras [10,200,125] (0.8 m) : ch0-7 = HD map (classes 1..8 of the Lanelet2-derived GT png; 0 for scenes without
                   a map, e.g. Co-MLOps) / ch8 = route corridor, 3.5 m wide, cut 10 m behind the ego / ch9 = destination
-                  (last pose of the scene, radius 2 m). Route source: METEOR_AE2E_ROUTE=lanelet -> lane-level corridor of
-                  the Lanelet2 lanelets matched to the scene's driven trajectory (bevlane/ae2e_route.py); default "trace"
+                  (last pose of the scene, radius 2 m). Route source: METEOR_RMAP_ROUTE=lanelet -> lane-level corridor of
+                  the Lanelet2 lanelets matched to the scene's driven trajectory (bevlane/route_corridor.py); default "trace"
                   -> the driven trajectory itself. Both are rebuilt from the recorded trajectory (a navigation oracle)."""
     c = cache.get(s)
     if c is None:
@@ -127,35 +133,35 @@ def ae2e_inputs(root, s, f, cache):
             continue
         sp, yr = vel[k]; ac = (sp - vel[k + 1][0]) / 0.5 if vel[k + 1] is not None else 0.0
         hist[k] = (sp / 10.0, np.clip(ac, -8, 8) / 3.0, np.clip(yr, -2, 2) / 0.5, np.clip(yr / max(sp, 0.1), -0.5, 0.5) / 0.1)
-    ras = np.zeros((10, AE2E_H, AE2E_W), np.float32)
+    ras = np.zeros((10, RMAP_H, RMAP_W), np.float32)
     if c["map"] and f.get("gt"):
         g = cv2.imread(os.path.join(root, s, f["gt"]), 0)
         if g is not None and g.shape == (800, 500):
             for k in range(8):
-                ras[k] = (g == k + 1).reshape(AE2E_H, 4, AE2E_W, 4).max(axis=(1, 3))
-    if os.environ.get("METEOR_AE2E_NOMAP") == "1":                # "no HD map" variant: empty HD-map channels 0-7 (route + destination stay)
+                ras[k] = (g == k + 1).reshape(RMAP_H, 4, RMAP_W, 4).max(axis=(1, 3))
+    if rmap_env("_NOMAP") == "1":                # "no HD map" variant: empty HD-map channels 0-7 (route + destination stay)
         ras[:8] = 0
-    if s in _AE2E_DENY or os.environ.get("METEOR_AE2E_NOROUTE") == "1":
+    if s in _RMAP_DENY or rmap_env("_NOROUTE") == "1":
         pass                                                       # no route: route + destination channels stay empty (the map stays)
-    elif fi < len(pose) and os.environ.get("METEOR_AE2E_ROUTE", "trace") == "lanelet":
-        # lane-level Lanelet2 corridor (bevlane/ae2e_route.py); scenes without a valid route leave ch8/ch9 empty
+    elif fi < len(pose) and rmap_env("_ROUTE", "trace") == "lanelet":
+        # lane-level Lanelet2 corridor (bevlane/route_corridor.py); scenes without a valid route leave ch8/ch9 empty
         if "route" not in c:
-            from bevlane.ae2e_route import scene_route
+            from bevlane.route_corridor import scene_route
             c["route"] = scene_route(os.path.join(root, s)) if c["map"] else {"valid": False}   # no route for scenes without a map (e.g. Co-MLOps)
         rt = c["route"]
         if rt["valid"]:
             x0, y0, h0 = pose[fi]; cc, ss = np.cos(h0), np.sin(h0)
             def ego_px(xy):
                 dx, dy = xy[:, 0] - x0, xy[:, 1] - y0
-                return np.stack([(50.0 - (-ss * dx + cc * dy)) / AE2E_RES, (80.0 - (cc * dx + ss * dy)) / AE2E_RES], 1)
-            m8 = np.zeros((AE2E_H, AE2E_W), np.uint8); pts = ego_px(rt["pts"])
+                return np.stack([(50.0 - (-ss * dx + cc * dy)) / RMAP_RES, (80.0 - (cc * dx + ss * dy)) / RMAP_RES], 1)
+            m8 = np.zeros((RMAP_H, RMAP_W), np.uint8); pts = ego_px(rt["pts"])
             for a, b in zip(rt["off"][:-1], rt["off"][1:]):
                 if b - a >= 2:
-                    cv2.polylines(m8, [np.round(pts[a:b] * 4).astype(np.int32)], False, 1, max(1, int(round(3.5 / AE2E_RES))), lineType=cv2.LINE_8, shift=2)
-            m8[int(np.ceil((80.0 + 10.0) / AE2E_RES - 0.5)):] = 0          # nothing beyond 10 m behind the ego
+                    cv2.polylines(m8, [np.round(pts[a:b] * 4).astype(np.int32)], False, 1, max(1, int(round(3.5 / RMAP_RES))), lineType=cv2.LINE_8, shift=2)
+            m8[int(np.ceil((80.0 + 10.0) / RMAP_RES - 0.5)):] = 0          # nothing beyond 10 m behind the ego
             ras[8] = m8
-            m9 = np.zeros((AE2E_H, AE2E_W), np.uint8); d = ego_px(np.asarray(rt["dest"], np.float64)[None])[0]
-            cv2.circle(m9, (int(round(d[0])), int(round(d[1]))), max(1, int(round(2.0 / AE2E_RES))), 1, -1)
+            m9 = np.zeros((RMAP_H, RMAP_W), np.uint8); d = ego_px(np.asarray(rt["dest"], np.float64)[None])[0]
+            cv2.circle(m9, (int(round(d[0])), int(round(d[1]))), max(1, int(round(2.0 / RMAP_RES))), 1, -1)
             ras[9] = m9
     elif fi < len(pose):
         x0, y0, h0 = pose[fi]; cc, ss = np.cos(h0), np.sin(h0)
@@ -164,17 +170,17 @@ def ae2e_inputs(root, s, f, cache):
         keep = np.arange(len(pose)) >= fi
         back = np.where(np.arange(len(pose)) < fi)[0]
         keep[back[ex[back] >= -10.0]] = True           # keep up to 10 m behind
-        col = (50.0 - ey) / AE2E_RES; row = (80.0 - ex) / AE2E_RES
+        col = (50.0 - ey) / RMAP_RES; row = (80.0 - ex) / RMAP_RES
         pts = np.stack([col[keep], row[keep]], 1)
-        m8 = np.zeros((AE2E_H, AE2E_W), np.uint8)
+        m8 = np.zeros((RMAP_H, RMAP_W), np.uint8)
         if len(pts) >= 2:
-            cv2.polylines(m8, [np.round(pts * 4).astype(np.int32)], False, 1, max(1, int(round(3.5 / AE2E_RES))), lineType=cv2.LINE_8, shift=2)
+            cv2.polylines(m8, [np.round(pts * 4).astype(np.int32)], False, 1, max(1, int(round(3.5 / RMAP_RES))), lineType=cv2.LINE_8, shift=2)
         ras[8] = m8
-        m9 = np.zeros((AE2E_H, AE2E_W), np.uint8)
-        cv2.circle(m9, (int(round(col[-1])), int(round(row[-1]))), max(1, int(round(2.0 / AE2E_RES))), 1, -1)
+        m9 = np.zeros((RMAP_H, RMAP_W), np.uint8)
+        cv2.circle(m9, (int(round(col[-1])), int(round(row[-1]))), max(1, int(round(2.0 / RMAP_RES))), 1, -1)
         ras[9] = m9
-    if AE2E_HIST_PAST:
-        hist = _ae2e_hist_past64(root, s, f, c)
+    if RMAP_HIST_PAST:
+        hist = _rmap_hist_past64(root, s, f, c)
     return torch.from_numpy(hist.reshape(-1)), torch.from_numpy(ras)
 
 # Scenes whose GT comes from an HD map (no yaw correction; map/route rasters available) are
@@ -961,8 +967,8 @@ class BevLaneDataset(Dataset):
             out.append(torch.from_numpy(np.ascontiguousarray(pimgs)))
             out.append(torch.from_numpy(rel))
             out.append(torch.from_numpy(pv))
-        if os.environ.get("METEOR_AE2E", "0") == "1":   # route / map conditioning inputs (last 2 items: hist [32|256], ras [10,200,125])
-            out.extend(ae2e_inputs(self.root, s, f, self.__dict__.setdefault("_ae_cache", {})))
+        if rmap_env("", "0") == "1":   # route / map conditioning inputs (last 2 items: hist [32|256], ras [10,200,125])
+            out.extend(rmap_inputs(self.root, s, f, self.__dict__.setdefault("_rm_cache", {})))
         # clone -> each tensor owns fresh, resizable storage (from_numpy storage
         # is not resizable, which breaks the shared-memory DataLoader collate)
         return tuple(t.clone() for t in out)

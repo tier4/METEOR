@@ -190,7 +190,7 @@ def cam_crop(entry, narrow):
 
 
 def copy_extras(scene_dir, od):
-    """Raw 10 Hz poses and the Lanelet2 map, read by the route corridor (bevlane/ae2e_route.py) and kitscenes_eval.py."""
+    """Raw 10 Hz poses and the Lanelet2 map, read by the route corridor (bevlane/route_corridor.py) and kitscenes_eval.py."""
     shutil.copyfile(f"{scene_dir}/poses.txt", os.path.join(od, "poses10.txt"))
     if os.path.isfile(f"{scene_dir}/maps/map.osm") and os.path.isfile(f"{scene_dir}/maps/origin.json"):
         os.makedirs(os.path.join(od, "maps"), exist_ok=True)

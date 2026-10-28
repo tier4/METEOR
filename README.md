@@ -418,7 +418,7 @@ METEOR_F3_HEAD=out/f3_single/best.pt python3 bevlane/closed_loop_eval.py --ckpt 
 python3 tools/kitscenes/download_kitscenes.py --root /data/kitscenes --index <archive index csv> val train
 KITS_DL=/data/kitscenes HR=/data/kitscenes_hr bash tools/kitscenes/convert_all.sh
 INIT=<METEOR2 ckpt> VARIANT=full HR=/data/kitscenes_hr bash tools/kitscenes/finetune.sh     # full | nomap | camonly
-METEOR_AE2E_ROUTE=lanelet METEOR_AE2E_HIST=past64 METEOR_ABSENT_CAMS=6 \
+METEOR_RMAP_ROUTE=lanelet METEOR_RMAP_HIST=past64 METEOR_ABSENT_CAMS=6 \
 python3 bevlane/kitscenes_eval.py full=out/kits_ft/ckpt_kits_full/last.pt --hr-root /data/kitscenes_hr
 ```
 
@@ -446,7 +446,7 @@ bevlane/                 training, GT generation, evaluation
   rowband_lift.py        row-band lift variant for Conv-only accelerators
   train_f3.py            F3 trajectory refinement head (bounded residual on the selected hypothesis; --npu 1 for the NPU graph)
   f3_refine.py           F3 head at inference (METEOR_F3_HEAD: closed_loop_eval, demo); dump_f3_cache.py builds its training cache
-  ae2e_route.py          lane-level route corridor from a Lanelet2 HD map (optional route / map inputs, KITScenes)
+  route_corridor.py      lane-level route corridor from a Lanelet2 HD map (optional route / map inputs, KITScenes)
   kitscenes_eval.py      KITScenes trajectory metrics: ADE@1/2/3s, FDE@3s on the 202 val keyframes
 deploy/                  export + TensorRT runtimes
   export_onnx.py         --no-hist / --depth-mean / --with-lidar / --uint8-in / --argmax-out

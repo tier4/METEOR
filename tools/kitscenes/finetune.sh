@@ -4,8 +4,8 @@
 #   usage: INIT=<METEOR2 checkpoint> VARIANT=full|nomap|camonly [GPUS=0,1,2,3] [EP=12] [BOXES=1] \
 #          HR=<hr image root> bash tools/kitscenes/finetune.sh
 #
-#   VARIANT=full     images + ego speed + ego history (past 6.4 s) + HD map + lane-level route  (--ae2e 1)
-#   VARIANT=nomap    as full, but the HD-map channels are empty: route + ego history only      (METEOR_AE2E_NOMAP=1)
+#   VARIANT=full     images + ego speed + ego history (past 6.4 s) + HD map + lane-level route  (--route-map 1)
+#   VARIANT=nomap    as full, but the HD-map channels are empty: route + ego history only      (METEOR_RMAP_NOMAP=1)
 #   VARIANT=camonly  images + ego speed only (the plain METEOR2 interface)
 #   BOXES=1          also train 3D boxes on the KITScenes auto-labels (tools/kitscenes/kits_box_gt.py, METEOR_KITS_BOX=1)
 #   ROUTE_DENY=<f>   optional list of scenes treated as having no valid route
@@ -27,12 +27,12 @@ head -60 $K/scenes_val.txt > "$OUTD/val60.txt"
 export CUDA_VISIBLE_DEVICES=$GPUS METEOR_ABSENT_CAMS=6 OMP_NUM_THREADS=4 PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 COND=""
 case "$VARIANT" in
-  full)    export METEOR_AE2E=1 METEOR_AE2E_ROUTE=lanelet METEOR_AE2E_HIST=past64; COND="--ae2e 1 --ae2e-lr-mult 20" ;;
-  nomap)   export METEOR_AE2E=1 METEOR_AE2E_ROUTE=lanelet METEOR_AE2E_HIST=past64 METEOR_AE2E_NOMAP=1; COND="--ae2e 1 --ae2e-lr-mult 20" ;;
+  full)    export METEOR_RMAP=1 METEOR_RMAP_ROUTE=lanelet METEOR_RMAP_HIST=past64; COND="--route-map 1 --route-map-lr-mult 20" ;;
+  nomap)   export METEOR_RMAP=1 METEOR_RMAP_ROUTE=lanelet METEOR_RMAP_HIST=past64 METEOR_RMAP_NOMAP=1; COND="--route-map 1 --route-map-lr-mult 20" ;;
   camonly) ;;
   *) echo "unknown VARIANT=$VARIANT (full | nomap | camonly)"; exit 1 ;;
 esac
-[ -n "${ROUTE_DENY:-}" ] && export METEOR_AE2E_ROUTE_DENY=$ROUTE_DENY
+[ -n "${ROUTE_DENY:-}" ] && export METEOR_RMAP_ROUTE_DENY=$ROUTE_DENY
 [ "${BOXES:-0}" = 1 ] && export METEOR_KITS_BOX=1
 KD=""; [ -n "${KD_BOX_CKPT:-}" ] && KD="--kd-box-ckpt $KD_BOX_CKPT --kd-box-w 2.0 --kd-box-rmin 0"
 
