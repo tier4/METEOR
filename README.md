@@ -130,12 +130,6 @@ graph is standard ONNX operators with static shapes. The same weights family exi
   the full path is in [docs/KITSCENES.md](docs/KITSCENES.md). KITScenes is CC BY-NC, so **KITScenes
   fine-tuned weights are research-only and are not released**; the code is.
 
-<div align="center">
-<!-- TODO: refresh media (new slot: METEOR2 on KITScenes)
-<img src="docs/media/meteor2_kitscenes.gif" width="880" alt="METEOR2 on KITScenes"/>
--->
-</div>
-
 ### METEOR2 Nano — one front camera, the whole network on the accelerator
 
 METEOR2 Nano keeps the METEOR2 heads and training stack and shrinks the input to **one front camera
