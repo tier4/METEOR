@@ -63,6 +63,7 @@ OCC_GSCALE = 1.0   # gradient scale from the OCC head into the shared BEV featur
 OCC_HEAD = 0       # 3D occupancy head (±40 m, 0.4 m, Z 16 x 10 classes) grafted onto a crop of the 0.4 m BEV feature (Conv only)
 OCC_Z, OCC_C = 16, 10
 YAW2 = 0           # ckpt trained with π-periodic box yaw (sin 2θ, cos 2θ) (graph unchanged; the inference adapter halves the angle)
+POLAR_PERSAMPLE = int(os.environ.get("METEOR_POLAR_PERSAMPLE", "1"))   # polar BEV geometry from each sample's own rig (0 = legacy: fixed reference rig)
 BOX_GSCALE = 1.0   # gradient scale from the 3D box head into the shared BEV feature (raise box weight without starving path/road; identity at inference)
 # PointPainting: seg2d probabilities (classes in PAINT_CLS) are added to ctx before the lift via a zero-initialised 1x1 conv.
 # seg2d is detached (trained by its own 2D loss only). The class selection is a weight mask on a 1x1 conv over all 21
@@ -968,7 +969,8 @@ class METEORite(nn.Module):
         dev = self.ego_mlp[0].weight.device
         cp = self.lidar_stem.out_channels
         self.ae_ras_stem = nn.Sequential(nn.Conv2d(10, 32, 3, 1, 1), nn.ReLU(inplace=True), nn.Conv2d(32, cp, 1)).to(dev)
-        self.ae_hist_mlp = nn.Sequential(nn.Linear(32, 128), nn.ReLU(inplace=True), nn.Linear(128, self.ego_mlp[0].out_features)).to(dev)
+        from bevlane.dataset import AE2E_HIST_DIM                 # 32, or 256 with METEOR_AE2E_HIST=past64 (6.4 s @10 Hz)
+        self.ae_hist_mlp = nn.Sequential(nn.Linear(AE2E_HIST_DIM, 128), nn.ReLU(inplace=True), nn.Linear(128, self.ego_mlp[0].out_features)).to(dev)
         for m_ in (self.ae_ras_stem[2], self.ae_hist_mlp[2]):
             nn.init.zeros_(m_.weight); nn.init.zeros_(m_.bias)
         self.ae2e = True
@@ -1146,6 +1148,9 @@ class METEORite(nn.Module):
             bev_geo = P4.view(B, C_P, D, FW).to(f.dtype)
             bev = self.polar.lift(ctx, dlog, self.paint(s4) if self.gipm else None).to(f.dtype)
             extra = {"bev_lr": bev, "bev_geo": bev_geo} if self.polar.mode == 1 else {}   # distillation (liftkd) only for the depth-bin variant (same shape as P4)
+            # per-sample geometry (targets, polar -> Cartesian, decoding). With one reference-rig geometry, box / lane targets of
+            # samples from other rigs (most of the training data) did not line up with the image
+            self._pgeo = self.polar.batch_geometry(K[:, 0], T_cam_ego[:, 0], (h0, w0)) if POLAR_PERSAMPLE else None
             return self._finish_geo(bev, extra, v0, acc, B, N, f, s2, dlog, None, gfeat=None)   # the LiDAR raster (Cartesian grid) cannot be added
         # per-sample (cell -> (depth bin, column)) map; bilinear == the baked taps
         pts = lift_cell_centres()
@@ -1211,15 +1216,19 @@ class METEORite(nn.Module):
         lane, hm, reg, st, rk, tj = self._outs(m, gfeat)
         if self.polar is not None:                                  # polar -> Cartesian (lane on the 0.2 m grid, others 0.4 m); lane outside the FOV = background
             bg = torch.full((lane.shape[1],), -20.0, device=lane.device); bg[0] = 20.0
-            lane = self.polar.to_cart(lane, "lane", fill=bg)
+            pg = getattr(self, "_pgeo", None)
+            lane = self.polar.to_cart(lane, "lane", fill=bg, geo=pg)
             neg = torch.full((1,), -10.0, device=lane.device)              # logit outputs (stationary / risk) outside the FOV: strongly negative (0 would give p=0.5 and blow up focal loss)
-            st = self.polar.to_cart(st, "lift", fill=neg); rk = self.polar.to_cart(rk, "lift", fill=neg)
-            tj = self.polar.to_cart(tj, "lift")
+            st = self.polar.to_cart(st, "lift", fill=neg, geo=pg); rk = self.polar.to_cart(rk, "lift", fill=neg, geo=pg)
+            tj = self.polar.to_cart(tj, "lift", geo=pg)
             extra = dict(extra, hm_polar=hm, reg_polar=reg)                 # boxes are trained on the polar grid (the box loss uses polar.det_loss)
+            if pg is not None:
+                extra.update(polar_kf=pg["kf"], polar_tce=pg["tce"])          # per-sample geometry for det_loss in the trainer
+            pgk = None if pg is None else (pg["kf"], pg["tce"])
             if self.training:
-                hm = self.polar.to_cart(hm, "lift", fill=neg.expand(hm.shape[1])); reg = self.polar.to_cart(reg, "lift")   # shape matching only (not used by the loss)
+                hm = self.polar.to_cart(hm, "lift", fill=neg.expand(hm.shape[1]), geo=pg); reg = self.polar.to_cart(reg, "lift", geo=pg)   # shape matching only (not used by the loss)
             else:                                                            # eval: decode in polar, then redraw on the Cartesian map (compatible with eval_unified decode_boxes)
-                bl = self.polar.decode(hm, reg)
+                bl = self.polar.decode(hm, reg, geos=pgk)
                 hm, reg = self.polar.render_cart(bl, hm.shape[0], hm.device, hm.dtype)
         if getattr(self, "occ_on", False):
             extra["occ"] = self._occ(m)

@@ -249,7 +249,8 @@ def losses(net, out, batch, dev, args):
             abx = ab.clone(); abx[..., 5] = torch.remainder(2.0 * ab[..., 5] + math.pi, 2 * math.pi) - math.pi
         _pl = getattr(getattr(net, "module", net), "polar", None)
         if _pl is not None and "hm_polar" in out:       # polar BEV: boxes are trained on polar-grid targets (reg resampled to Cartesian loses meaning)
-            ls["box"] = args.box_w * _pl.det_loss(out["hm_polar"][sel], out["reg_polar"][sel], abx[sel], an[sel])
+            _pg = (out["polar_kf"][sel], out["polar_tce"][sel]) if "polar_kf" in out else None   # per-sample rig geometry
+            ls["box"] = args.box_w * _pl.det_loss(out["hm_polar"][sel], out["reg_polar"][sel], abx[sel], an[sel], geos=_pg)
         else:
             ls["box"] = args.box_w * DON.boxdet_loss(
                 net, out["hm"].float()[sel], out["reg"].float()[sel], abx[sel], an[sel])
@@ -262,6 +263,22 @@ def losses(net, out, batch, dev, args):
                                                    out["kd_hm"], _teacher_reg_yaw2(out["kd_reg"]) if args.yaw2 else out["kd_reg"], args.kd_box_rmin)
     ego_gt = batch[I_EGO].to(dev)
     ls["ego"] = args.ego_w * DON.ego_loss(net, out["ego"].float(), ego_gt)
+    if "pk_mask" in out and float(out["pk_mask"].sum()) > 0:      # privileged-information distillation (--priv-kd-*)
+        w_ = out["pk_mask"]; nw = w_.sum()
+        if args.priv_kd_feat_w > 0:
+            def _fkd(a_, b_):
+                d_ = ((a_ - b_) ** 2).flatten(1).mean(1) / (b_.flatten(1).var(1) + 1e-6)
+                return (d_ * w_).sum() / nw
+            ls["pkd_feat"] = args.priv_kd_feat_w * (_fkd(out["st_bev"], out["pk_bev"]) + _fkd(out["st_l1"], out["pk_l1"]))
+        if args.priv_kd_ego_w > 0:
+            Kq = EGO_K
+            se, te = out["ego"].float(), out["pk_ego"]
+            wp = F.smooth_l1_loss(se[:, :12 * Kq], te[:, :12 * Kq], reduction="none").mean(1)
+            tau = args.priv_kd_tau
+            kl = F.kl_div(F.log_softmax(se[:, 12 * Kq:13 * Kq] / tau, 1), F.softmax(te[:, 12 * Kq:13 * Kq] / tau, 1), reduction="none").sum(1) * tau * tau
+            ls["pkd_ego"] = args.priv_kd_ego_w * ((wp + kl) * w_).sum() / nw
+    elif "pk_mask" in out:                                                    # batch without a map: zero (no need to match graphs across ranks; grads are zero-filled in the reduce)
+        ls["pkd_feat"] = out["ego"].sum() * 0.0
     if args.occ_w > 0 and "occ" in out:      # OCC head (same loss as the METEOR line)
         oc = out["occ"].float(); B_ = oc.shape[0]
         ls["occ"] = args.occ_w * DON.occ_loss(core, oc.view(B_, M.OCC_C, M.OCC_Z, *oc.shape[-2:]), batch[I_OCC].to(dev))
@@ -289,7 +306,7 @@ def losses(net, out, batch, dev, args):
 
 
 def _set_ae2e(net, batch, dev):
-    """AutoE2E-equivalent inputs: attach the last two dataset items (ego history [B,32], map/route raster [B,10,200,125]) to the net."""
+    """Route / map conditioning inputs: attach the last two dataset items (ego history [B,32|256], map/route raster [B,10,200,125]) to the net."""
     m_ = net.module if hasattr(net, "module") else net
     m_._ae_hist = batch[-2].to(dev, non_blocking=True).float(); m_._ae_ras = batch[-1].to(dev, non_blocking=True).float()
 
@@ -337,7 +354,16 @@ def main():
     ap.add_argument("--mined-oversample", type=int, default=4)
     ap.add_argument("--eps-wta", type=float, default=0.1)
     ap.add_argument("--ae2e-lr-mult", type=float, default=20.0)
-    ap.add_argument("--ae2e", type=int, default=0, help="AutoE2E-equivalent variant: add ego-motion history + map/route raster inputs (dataset.ae2e_inputs, METEOR_AE2E=1)")
+    # Privileged-information distillation ("HD map at training time only"): the teacher is a frozen --ae2e checkpoint that
+    #   sees the map / route raster and the ego history; the student sees images + v0 only (--ae2e 0). The student's BEV
+    #   features (fused BEV and the ego trunk l1) and its ego output (candidate waypoints and selection scores) are pulled
+    #   towards the teacher, on samples that have a map only. The dataset appends the teacher inputs with METEOR_AE2E=1
+    #   (they are not given to the student).
+    ap.add_argument("--priv-kd-ckpt", default="", help="teacher checkpoint for privileged-information distillation (trained with --ae2e 1)")
+    ap.add_argument("--priv-kd-feat-w", type=float, default=0.0, help="weight of the BEV feature distillation (fused BEV + ego trunk)")
+    ap.add_argument("--priv-kd-ego-w", type=float, default=0.0, help="weight of the ego output distillation (candidate waypoints smooth-L1 + selection-score KL)")
+    ap.add_argument("--priv-kd-tau", type=float, default=1.0, help="temperature of the selection-score KL")
+    ap.add_argument("--ae2e", type=int, default=0, help="route / map conditioned variant: add ego-motion history + HD-map / route raster inputs (dataset.ae2e_inputs, METEOR_AE2E=1)")
     ap.add_argument("--ego-acc", type=int, default=0, help="add the current acceleration (GT acc, CAN-equivalent) as an ego_mlp input")
     ap.add_argument("--qat", type=int, default=0, help="fake-quant training: step at which to enable it (0 = off); observe only before that")
     ap.add_argument("--sparse-24", action="store_true", help="2:4 mask training (SP24_DENSE layers stay dense)")
@@ -618,6 +644,18 @@ def main():
             p_.requires_grad_(False)
         if rank == 0:
             print(f"[kd-box] teacher {args.kd_box_ckpt} (w {args.kd_box_w}, r >= {args.kd_box_rmin} m)", flush=True)
+    priv = None
+    if args.priv_kd_ckpt and (args.priv_kd_feat_w > 0 or args.priv_kd_ego_w > 0):
+        assert os.environ.get("METEOR_AE2E") == "1" and not args.ae2e, "the dataset appends the teacher inputs with METEOR_AE2E=1; the student uses --ae2e 0"
+        import bevlane.model as _MD
+        _y2 = getattr(_MD, "_YAW2", 0)                                    # load_mite_eval resets _YAW2 for evaluation -> restore it so the student's box encoding is unchanged
+        priv = M.load_mite_eval(args.priv_kd_ckpt, device=str(dev), verbose=rank == 0).net.eval()
+        _MD._YAW2 = _y2
+        assert getattr(priv, "ae2e", False), "the teacher must be a --ae2e checkpoint (with map / route inputs)"
+        for p_ in priv.parameters():
+            p_.requires_grad_(False)
+        if rank == 0:
+            print(f"[priv-kd] teacher {args.priv_kd_ckpt} feat_w {args.priv_kd_feat_w} ego_w {args.priv_kd_ego_w} tau {args.priv_kd_tau}", flush=True)
     # no DDP wrapper: forward_geo is our own entry point, so gradients are synced
     # manually after backward (all ranks build the same graph; None grads skip equally)
     if args.ae2e and args.ae2e_lr_mult != 1.0:
@@ -661,6 +699,14 @@ def main():
             with torch.autocast("cuda", torch.bfloat16):
                 out = net.forward_geo(batch[I_IMG].to(dev), batch[I_K].to(dev),
                                       batch[I_T].to(dev), e[:, 12], lidar=lidar, acc=e[:, 17] if args.ego_acc else None)   # input acceleration is the causal e[17] (e[13] looks ahead and is for targets only)
+            if priv is not None:
+                with torch.no_grad(), torch.autocast("cuda", torch.bfloat16):
+                    _set_ae2e(priv, batch, dev)
+                    pt = priv.forward_geo(batch[I_IMG].to(dev), batch[I_K].to(dev), batch[I_T].to(dev), e[:, 12])
+                has_map = (batch[-1][:, :8].flatten(1).amax(1) > 0).to(dev)          # distil only samples that have an HD map
+                out["pk_mask"] = has_map.float()
+                out["pk_ego"], out["pk_bev"], out["pk_l1"] = pt["ego"].float(), priv._fused_bev.float(), priv._l1.float()
+                out["st_bev"], out["st_l1"] = net._fused_bev.float(), net._l1.float()
             if teacher is not None:
                 with torch.no_grad(), torch.autocast("cuda", torch.bfloat16):
                     to = teacher(batch[I_IMG].to(dev), batch[I_K].to(dev), batch[I_T].to(dev), e[:, 12])

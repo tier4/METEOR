@@ -101,6 +101,29 @@ DEMO_PALETTE[8] = 0
 DEMO_PALETTE[10] = (255, 215, 0)    # predicted vehicle box (gold)
 DEMO_PALETTE[11] = (255, 0, 255)    # predicted VRU box (magenta)
 
+
+def project_bev_seg(img, pred, K, Tce, cw, ch, W0=768, H0=432, max_m=50.0, step=2):
+    """Overlay the predicted BEV classes on a camera image assuming flat ground (z=0): each pixel's ray is intersected
+    with the ground and looked up in the BEV grid (every step pixels, nearest-neighbour upscaling).
+    K is in W0 x H0 pixels, Tce is ego -> camera (same convention as draw_path_ribbon). Slopes and kerbs shift it."""
+    from bevlane.model import BEV_XF, BEV_XR, BEV_YH
+    vv, uu = np.mgrid[0:ch:step, 0:cw:step].astype(np.float64)
+    d = np.stack([(uu * W0 / cw - K[0, 2]) / K[0, 0], (vv * H0 / ch - K[1, 2]) / K[1, 1], np.ones_like(uu)], -1)
+    R, t = Tce[:3, :3], Tce[:3, 3]
+    o = -R.T @ t; r = d @ R                                   # ray in ego coordinates (R^T d)
+    lam = -o[2] / np.where(np.abs(r[..., 2]) < 1e-6, -1e-6, r[..., 2])
+    gx, gy = o[0] + lam * r[..., 0], o[1] + lam * r[..., 1]
+    H, W = pred.shape
+    res = (BEV_XF + BEV_XR) / H
+    row = np.floor((BEV_XF - gx) / res).astype(np.int64); col = np.floor((BEV_YH - gy) / (2 * BEV_YH / W)).astype(np.int64)
+    ok = (lam > 0) & (np.hypot(gx, gy) < max_m) & (row >= 0) & (row < H) & (col >= 0) & (col < W)
+    cls = np.zeros(gx.shape, np.int64); cls[ok] = pred[row[ok], col[ok]]
+    cls = cv2.resize(cls.astype(np.uint8), (cw, ch), interpolation=cv2.INTER_NEAREST)
+    col_img = DEMO_PALETTE[cls][:, :, ::-1]
+    a = np.where(cls == 1, 0.30, np.where(cls > 1, 0.65, 0.0))[..., None]   # road faint, lines / crosswalks strong
+    a[(DEMO_PALETTE[cls].sum(-1) == 0)] = 0.0                # classes blanked in the palette (sidewalk, parking) are not drawn
+    return (img * (1 - a) + col_img * a).astype(np.uint8)
+
 SEG2D_PAL = np.zeros((256, 3), np.uint8)
 SEG2D_PAL[:11] = [(90, 90, 90),     # road
                   (255, 255, 255),  # lane/marking
@@ -338,6 +361,10 @@ def main():
     ap.add_argument("--no-agent-traj", action="store_true", help="do not draw the other agents' forecast trajectories")
     ap.add_argument("--no-2d-boxes", action="store_true", help="do not draw 2D boxes on the camera images (--unk2d BEV points remain)")
     ap.add_argument("--no-risk", action="store_true", help="do not overlay the risk map")
+    ap.add_argument("--show-ae-map", action="store_true", help="route / map conditioned METEOR2 checkpoints: show the input raster (HD map + route corridor + destination) "
+                                                                 "to the right of the predicted BEV, same extent (widens the video)")
+    ap.add_argument("--bev-proj", action="store_true", help="project the predicted BEV classes onto the camera images (flat-ground assumption)")
+    ap.add_argument("--no-occ", action="store_true", help="do not draw the predicted OCC voxel inset")
     ap.add_argument("--show-ped-path", action="store_true",
                     help="draw predicted futures for VRU/pedestrians too")
     ap.add_argument("--unk2d", action="store_true",
@@ -771,6 +798,8 @@ def main():
         (int(infer_hw.split("x")[0]), int(infer_hw.split("x")[1]))
 
     VW, VH = 1920, 1080
+    if args.show_ae_map:                     # extra column for the input map, as wide as the BEV (the BEV column is 412 px)
+        VW = 1920 + 420
     # left = RGB (top) over Depth (below), same 2x4 grid; right = BEV portrait.
     CAM8 = ["CAM_FRONT_LEFT", "CAM_FRONT_WIDE", "CAM_FRONT_RIGHT", "CAM_FRONT_NARROW",
             "CAM_BACK_LEFT", "CAM_BACK_WIDE", "CAM_BACK_RIGHT", "CAM_BACK_NARROW"]
@@ -804,7 +833,13 @@ def main():
         if blank:
             print(f"[cams] blank: {sorted(blank)}", flush=True)
         for i in range(len(ds)):
-            imgs, K, T, _ = ds[i]
+            _b = ds[i]
+            imgs, K, T, _ = _b[:4]
+            if args.mite_ckpt and getattr(_mite.net, "ae2e", False):
+                # route / map conditioned checkpoint: pass the ego history and the map / route raster that the dataset
+                # appends with METEOR_AE2E=1 (as in kitscenes_eval)
+                assert os.environ.get("METEOR_AE2E") == "1", "demo of a route / map conditioned ckpt needs METEOR_AE2E=1 (and METEOR_AE2E_ROUTE=lanelet)"
+                _mite.net._ae_hist = _b[-2][None].cuda().float(); _mite.net._ae_ras = _b[-1][None].cuda().float()
             # with native-resolution input (img_scale != 1), overlays on camera images (boxes, path, unk2d) use the 768x432-based K
             K_draw = K.clone(); K_draw[:, :2] /= float(getattr(ds, 'img_scale', 1) or 1)
             # run the model at its training resolution (avoid OOD instability
@@ -1228,6 +1263,8 @@ def main():
                 occ_pred = torch.where(conf > thr, cls,
                                        torch.zeros_like(cls)) \
                     .cpu().numpy().astype(np.uint8)
+                if not ((occ_pred != 0) & (occ_pred != 8)).any():   # an OCC head that predicts nothing (untrained) is not drawn at all
+                    occ_pred = None
             boxes2d = None
             if args.model in ("v17", "v18", "v19", "v20", "v21", "v22", "v23", "v25", "v26", "v27", "v28", "v29", "v30", "v31", "v32", "v33", "v34", "v35", "v36", "v37", "v38", "v39", "v40", "v41", "v42", "v43", "v44", "v45", "v46", "v47", "v48", "v49", "v51", "v52", "v52r50", "v53", "v54", "v55", "v56", "v63b") and len(out) >= 7:
                 if isinstance(out[5], (list, tuple)):   # v19 multi-scale
@@ -1315,6 +1352,8 @@ def main():
                 if p:
                     img = cv2.resize(cv2.imread(os.path.join(args.root, s, p)),
                                      (cw, ch))
+                    if args.bev_proj and chn not in blank:
+                        img = project_bev_seg(img, pred, K_draw[CAMS.index(chn)].numpy(), T[CAMS.index(chn)].numpy(), cw, ch)
                     if seg2d_pred is not None:
                         sc = SEG2D_PAL[seg2d_pred[CAMS.index(chn)]]
                         sc = cv2.resize(sc, (cw, ch),
@@ -1349,7 +1388,7 @@ def main():
                 # depth directly under the same camera cell
                 ci = CAMS.index(chn)
                 if chn in blank:
-                    if occ_pred is not None:      # OCC takes the free cell
+                    if occ_pred is not None and not args.no_occ:      # OCC takes the free cell
                         dc = cv2.resize(cube_render(occ_pred, W=900, H=760),
                                         (cw, ch))
                         label(dc, "pred OCC voxel +-24m", (220, 220, 220))
@@ -1675,7 +1714,29 @@ def main():
                             cv2.FONT_HERSHEY_SIMPLEX, 0.6, (80, 220, 255), 2,
                             cv2.LINE_AA)
             bx = min(bx0, VW - BW2)                          # flush to right edge
+            if args.show_ae_map:
+                bx = bx0                                     # predicted BEV right of the camera grid, input map further right
             frame[40:40 + BH2, bx:bx + BW2] = bev
+            _ras = getattr(_mite.net, "_ae_ras", None) if (args.show_ae_map and args.mite_ckpt) else None
+            if _ras is not None:
+                # crop the input raster [10,200,125] @0.8 m (rows x +80..-80, cols y +50..-50) to the predicted BEV's +60..-_XB x +-25 m
+                _r = _ras[0].float().cpu().numpy() > 0.5
+                _r0, _r1 = int(round((80.0 - 60.0) / 0.8)), int(round((80.0 + _XB) / 0.8))
+                _c0, _c1 = int(round((50.0 - 25.0) / 0.8)), int(round((50.0 + 25.0) / 0.8))
+                _cls = np.zeros(_r.shape[1:], np.int64)
+                for _k in range(8):                          # road first, crosswalks / lanes on top (GT png classes 1..8)
+                    _cls[_r[_k]] = _k + 1
+                _cls = _cls[_r0:_r1, _c0:_c1]
+                _mp = draw_ego_and_grid(DEMO_PALETTE[_cls][:, :, ::-1].copy(), BH2, BW2, xh_m=60.0, yh_m=25.0)
+                _rt = cv2.resize(_r[8, _r0:_r1, _c0:_c1].astype(np.uint8), (BW2, BH2), interpolation=cv2.INTER_NEAREST) > 0
+                _mp[_rt] = (0.55 * _mp[_rt] + 0.45 * np.array([60, 200, 60])).astype(np.uint8)       # route corridor (green)
+                _ds = cv2.resize(_r[9, _r0:_r1, _c0:_c1].astype(np.uint8), (BW2, BH2), interpolation=cv2.INTER_NEAREST) > 0
+                _mp[_ds] = (40, 40, 230)                                                               # destination (red)
+                cv2.putText(_mp, "INPUT: HD map + route", (6, 24), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 255), 2, cv2.LINE_AA)
+                cv2.putText(_mp, "green = route corridor" + ("" if _rt.any() else " (no route)") + ", red = destination", (6, 46),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.45, (60, 200, 60), 1, cv2.LINE_AA)
+                _mx = bx + BW2 + 8
+                frame[40:40 + BH2, _mx:_mx + BW2] = _mp
             if _front_rgb is not None:
                 # BEV from 60 m ahead to 6 m behind the ego (front sensing range) fills the right half
                 _ego_row = int(BH2 * 60.0 / _SPAN); _bf = bev[:min(BH2, _ego_row + int(BH2 * 6.0 / _SPAN))]
@@ -1693,7 +1754,7 @@ def main():
                     vw.write(frame); n += 1
                 continue
 
-            if occ_pred is not None and not blank:
+            if occ_pred is not None and not blank and not args.no_occ:
                 iso = cube_render(occ_pred, W=900, H=760)
                 iso = cv2.resize(iso, (426, 360))
                 oy0 = VH - 368
@@ -1706,6 +1767,8 @@ def main():
                      + (["SDMAP"] if args.sdmap else []))
             mode_tag = ("+".join(_mods) + " ON") if _mods \
                 else ("LIDAR ON" if args.lidar else "camera-only")
+            if args.mite_ckpt and getattr(_mite.net, "ae2e", False):   # route / map conditioned ckpt: map, route and ego history are inputs too
+                mode_tag = "camera + route/map + ego-history"
             if args.seg_fuse:
                 mode_tag += "  |  seg-EMA<=45m"
             cv2.putText(frame, f"{scene.split('+0900_')[-1]}  f{f['frame']:03d}  |  "

@@ -95,6 +95,27 @@ class PolarLift(nn.Module):
         self.geo_info = {"mode": self.mode, "R": self.R, "fx": fx, "cx": cx, "fy": fy, "cy": cy, "valid_frac": out}
         return self.geo_info
 
+    def batch_geometry(self, Kc, T, img_hw):
+        """Per-sample geometry (torch, no grad). Kc [B,3,3] (in img_hw pixels), T [B,4,4] (cam <- ego).
+        Returns a dict: kf [B,4], tce [B,4,4], grid_lift/valid_lift, grid_lane/valid_lane (for to_cart).
+        Why: with a single reference-rig geometry for all targets, samples from rigs with a different focal length had
+        their far box targets (beyond ~20 m) off the vehicles in the image, and the polar -> Cartesian lanes were shifted."""
+        with torch.no_grad():
+            h0, w0 = img_hw
+            sx = M.IMG_W / float(w0); sy = M.IMG_H / float(h0)
+            Kc = Kc.float(); T = T.float()
+            kf = torch.stack([Kc[:, 0, 0] * sx, Kc[:, 0, 2] * sx, Kc[:, 1, 1] * sy, Kc[:, 1, 2] * sy], 1)
+            out = {"kf": kf, "tce": T}
+            for kind, (H, W, res) in {"lift": (M.LH, M.LW, M.LIFT_RES), "lane": (2 * M.LH, 2 * M.LW, M.LIFT_RES / 2)}.items():
+                xs = M.BEV_XF - (torch.arange(H, device=T.device, dtype=torch.float32) + 0.5) * res
+                ys = M.BEV_YH - (torch.arange(W, device=T.device, dtype=torch.float32) + 0.5) * res
+                gx, gy = torch.meshgrid(xs, ys, indexing="ij")
+                u, r, valid = self.ground_to_polar(gx.reshape(1, -1), gy.reshape(1, -1), geo=(kf, T))   # [B, H*W]
+                B = kf.shape[0]
+                out[f"grid_{kind}"] = torch.stack([u / (M.FW - 1) * 2 - 1, r / (self.R - 1) * 2 - 1], -1).view(B, H, W, 2)
+                out[f"valid_{kind}"] = valid.float().view(B, 1, H, W)
+        return out
+
     def _ground_to_polar_np(self, x, y):
         """numpy: ego-frame ground point (x forward, y left) -> (feature column u, polar row r, valid)"""
         fx, cx, fy, cy = self.Kf.tolist(); T = self.Tce.cpu().numpy().astype(np.float64)
@@ -109,23 +130,32 @@ class PolarLift(nn.Module):
         valid = (Z > M.D_MIN) & (u >= 0) & (u <= M.FW - 1) & (r >= 0) & (r <= self.R - 1)
         return u, r, valid
 
-    def ground_to_polar(self, x, y):
-        """torch: ego-frame ground points [N] -> (u, r, valid) [N] (training only, image-row modes)."""
-        fx, cx, fy, cy = self.Kf
-        T = self.Tce.to(x.dtype)
-        X = T[0, 0] * x + T[0, 1] * y + T[0, 3]; Y = T[1, 0] * x + T[1, 1] * y + T[1, 3]; Z = T[2, 0] * x + T[2, 1] * y + T[2, 3]
+    def ground_to_polar(self, x, y, geo=None):
+        """torch: ego-frame ground points [N] -> (u, r, valid) [N] (training only, image-row modes).
+        geo = None (reference-rig buffers) | (kf [4], tce [4,4]) for one sample | (kf [B,4], tce [B,4,4]) with x, y [1|B, N] -> [B, N]."""
+        kf, T = (self.Kf, self.Tce) if geo is None else geo
+        kf = kf.to(x.dtype); T = T.to(x.dtype)
+        if kf.dim() == 2:                                                             # batched: coefficients as [B,1], broadcast to [B,N]
+            kf = kf.unsqueeze(-1).unbind(1); T = T.unsqueeze(-1)
+            t_ = lambda i, j: T[:, i, j]
+        else:
+            kf = kf.unbind(0); t_ = lambda i, j: T[i, j]
+        fx, cx, fy, cy = kf
+        X = t_(0, 0) * x + t_(0, 1) * y + t_(0, 3); Y = t_(1, 0) * x + t_(1, 1) * y + t_(1, 3); Z = t_(2, 0) * x + t_(2, 1) * y + t_(2, 3)
         Zs = Z.clamp(min=M.D_MIN)
         u = ((fx * X / Zs + cx) + 0.5) / M.FS - 0.5
         r = (((fy * Y / Zs + cy) + 0.5) / M.FS - 0.5) / self.rdiv
         valid = (Z > M.D_MIN) & (u >= 0) & (u <= M.FW - 1) & (r >= 0) & (r <= self.R - 1)
         return u, r, valid
 
-    def polar_to_ground(self, u, r):
-        """torch: polar cell (u, r) [N] -> intersection (x, y) [N] with the ground plane (ego z=0). Image-row modes (pixel -> ray -> plane)."""
-        fx, cx, fy, cy = self.Kf
+    def polar_to_ground(self, u, r, geo=None):
+        """torch: polar cell (u, r) [N] -> intersection (x, y) [N] with the ground plane (ego z=0). Image-row modes (pixel -> ray -> plane).
+        geo = None (reference rig) | (kf [4], tce [4,4]) for one sample."""
+        kf, T = (self.Kf, self.Tce) if geo is None else geo
+        fx, cx, fy, cy = kf.to(u.dtype)
         px = (u + 0.5) * M.FS - 0.5; py = (self.rdiv * r + 0.5) * M.FS - 0.5
         d = torch.stack([(px - cx) / fx, (py - cy) / fy, torch.ones_like(px)], -1)      # ray direction in the camera frame [N,3]
-        T = self.Tce.to(u.dtype); Rm = T[:3, :3]; t = T[:3, 3]
+        T = T.to(u.dtype); Rm = T[:3, :3]; t = T[:3, 3]
         # ego point p = R^T (lam d - t); p_z = 0 -> lam = (R^T t)_z / (R^T d)_z
         Rt = Rm.t(); dz = (d @ Rm)[:, 2]; tz = (Rt @ t)[2]                            # (R^T d)_z, (R^T t)_z (= -camera height, negative)
         dz = torch.where(dz.abs() < 1e-3, torch.full_like(dz, -1e-3), dz)             # rays hitting the ground have dz < 0; guard near-horizontal rays (small |dz|) that go to infinity
@@ -148,8 +178,10 @@ class PolarLift(nn.Module):
         return y.view(y.shape[0], self.C, self.D, self.U)
 
     # ---- polar -> Cartesian (dense outputs, training/evaluation only) ----
-    def to_cart(self, x, kind="lift", fill=None):
-        g = getattr(self, f"grid_{kind}"); v = getattr(self, f"valid_{kind}")
+    def to_cart(self, x, kind="lift", fill=None, geo=None):
+        """geo = dict from batch_geometry (per-sample grids) | None (reference-rig buffers)."""
+        g = getattr(self, f"grid_{kind}") if geo is None else geo[f"grid_{kind}"]
+        v = getattr(self, f"valid_{kind}") if geo is None else geo[f"valid_{kind}"]
         B = x.shape[0]
         y = F.grid_sample(x.float(), g.expand(B, -1, -1, -1), mode="bilinear", align_corners=True, padding_mode="zeros")
         if fill is not None:
@@ -159,8 +191,9 @@ class PolarLift(nn.Module):
         return y.to(x.dtype)
 
     # ---- boxes: targets, loss and decoding on the polar grid ----
-    def det_targets(self, boxes, nbox, device):
-        """boxes [B,K,6] (cls, xe, ye, l, w, yaw (already folded to 2*theta)), nbox [B] -> hm_t [B,2,R,U], reg_t [B,6,R,U], msk [B,1,R,U]"""
+    def det_targets(self, boxes, nbox, device, geos=None):
+        """boxes [B,K,6] (cls, xe, ye, l, w, yaw (already folded to 2*theta)), nbox [B] -> hm_t [B,2,R,U], reg_t [B,6,R,U], msk [B,1,R,U]
+        geos = (kf [B,4], tce [B,4,4]) per-sample geometry | None (reference rig)."""
         B = boxes.shape[0]; R, U = self.R, self.U
         hm = torch.zeros(B, 2, R, U, device=device); reg = torch.zeros(B, 6, R, U, device=device); msk = torch.zeros(B, 1, R, U, device=device)
         rr = torch.arange(R, device=device, dtype=torch.float32).view(-1, 1); cc = torch.arange(U, device=device, dtype=torch.float32).view(1, -1)
@@ -168,22 +201,23 @@ class PolarLift(nn.Module):
             n = int(nbox[bi])
             if n <= 0: continue
             bx = boxes[bi, :n].float()
-            u, r, ok = self.ground_to_polar(bx[:, 1], bx[:, 2])
+            g = None if geos is None else (geos[0][bi], geos[1][bi])
+            u, r, ok = self.ground_to_polar(bx[:, 1], bx[:, 2], geo=g)
             for k in range(n):
                 if not bool(ok[k]): continue
                 cls = 0 if float(bx[k, 0]) < 1.5 else 1                                 # as in model.build_det_targets: 1 = vehicle -> ch0, >= 2 (VRU) -> ch1
                 uk, rk = float(u[k]), float(r[k]); ci, ri = int(round(uk)), int(round(rk))
                 ci = min(max(ci, 0), U - 1); ri = min(max(ri, 0), R - 1)
                 # Gaussian radius: horizontally the box width in columns; vertically see sr below
-                _, (xq, yq) = None, self.polar_to_ground(torch.tensor([uk, uk + 1.0], device=device), torch.tensor([rk, rk], device=device))
+                _, (xq, yq) = None, self.polar_to_ground(torch.tensor([uk, uk + 1.0], device=device), torch.tensor([rk, rk], device=device), geo=g)
                 cell_w = float((xq[1] - xq[0]).abs() + (yq[1] - yq[0]).abs()) + 1e-3        # lateral width of one column [m]
                 su = max(1.0, 0.5 * float(bx[k, 4]) / cell_w / 2.0)
                 # row-direction width: half the row span between the box's front and rear ends (x +/- l/2); vehicles span
                 # dozens of image rows, and a fixed sigma_r of 1.5 produced multiple peaks for one vehicle
-                hl = 0.5 * float(bx[k, 3]); _, r2, _ = self.ground_to_polar(torch.tensor([float(bx[k, 1]) - hl, float(bx[k, 1]) + hl], device=device), torch.tensor([float(bx[k, 2])] * 2, device=device))
+                hl = 0.5 * float(bx[k, 3]); _, r2, _ = self.ground_to_polar(torch.tensor([float(bx[k, 1]) - hl, float(bx[k, 1]) + hl], device=device), torch.tensor([float(bx[k, 2])] * 2, device=device), geo=g)
                 sr = max(1.5, 0.5 * float((r2[0] - r2[1]).abs()))
-                g = torch.exp(-((rr - ri) ** 2) / (2 * sr ** 2) - ((cc - ci) ** 2) / (2 * su ** 2))
-                hm[bi, cls] = torch.maximum(hm[bi, cls], g)
+                gs = torch.exp(-((rr - ri) ** 2) / (2 * sr ** 2) - ((cc - ci) ** 2) / (2 * su ** 2))
+                hm[bi, cls] = torch.maximum(hm[bi, cls], gs)
                 yaw = float(bx[k, 5])
                 for dr_ in (-1, 0, 1):
                     for dc_ in (-1, 0, 1):
@@ -194,19 +228,28 @@ class PolarLift(nn.Module):
                 msk[bi, 0, ri, ci] = 1.0
         return hm, reg, msk
 
-    def det_loss(self, hm, reg, boxes, nbox):
-        """CenterNet-style focal loss + L1 on centre cells (polar version of model.boxdet_loss, plus a far-range positive weight)"""
-        hm_t, reg_t, msk = self.det_targets(boxes, nbox, hm.device)
+    def det_loss(self, hm, reg, boxes, nbox, geos=None):
+        """CenterNet-style focal loss + L1 on centre cells (polar version of model.boxdet_loss, plus a far-range positive weight). geos: see det_targets."""
+        hm_t, reg_t, msk = self.det_targets(boxes, nbox, hm.device, geos=geos)
         p = hm.float().sigmoid().clamp(1e-4, 1 - 1e-4)
         pos = (hm_t > 0.99).float(); neg_w = (1 - hm_t) ** 4
-        fw = self._far_weight(hm.device)                                              # up-weight far positives (recall beyond 30 m dropped otherwise)
+        fw = self._far_weight(hm.device, geos)                                        # up-weight far positives (recall beyond 30 m dropped otherwise)
         lpos = -(pos * fw * (1 - p) ** 2 * p.log()).sum(); lneg = -((1 - pos) * neg_w * p ** 2 * (1 - p).log()).sum()
         npos = pos.sum().clamp(min=1.0)
         lreg = ((reg.float() - reg_t).abs() * msk * fw).sum() / npos
         return (lpos + lneg) / npos + lreg
 
-    def _far_weight(self, device):
-        """Positive weight [1,1,R,U] by the cell's ground distance: x2.5 beyond 40 m, x1.5 for 25-40 m (like BOX_FAR_W in model.boxdet_loss). Built once and cached."""
+    def _far_weight(self, device, geos=None):
+        """Positive weight [1|B,1,R,U] by the cell's ground distance: x2.5 beyond 40 m, x1.5 for 25-40 m (like BOX_FAR_W in model.boxdet_loss).
+        Cached once for the reference rig; built per sample when geos is given."""
+        if geos is not None:
+            rr = torch.arange(self.R, device=device, dtype=torch.float32).view(-1, 1).expand(self.R, self.U).reshape(-1)
+            cc = torch.arange(self.U, device=device, dtype=torch.float32).view(1, -1).expand(self.R, self.U).reshape(-1)
+            ws = []
+            for bi in range(geos[0].shape[0]):
+                x, y = self.polar_to_ground(cc, rr, geo=(geos[0][bi], geos[1][bi])); d = torch.sqrt(x * x + y * y).clamp(max=200.0)
+                ws.append(torch.where(d > 40.0, 2.5, torch.where(d > 25.0, 1.5, 1.0)).view(1, self.R, self.U))
+            return torch.stack(ws)
         w = getattr(self, "_fw", None)
         if w is None or w.device != device:
             rr = torch.arange(self.R, device=device, dtype=torch.float32).view(-1, 1).expand(self.R, self.U).reshape(-1)
@@ -217,8 +260,9 @@ class PolarLift(nn.Module):
         return w
 
     @torch.no_grad()
-    def decode(self, hm, reg, th=None, topk=64):
-        """polar hm [B,2,R,U] / reg [B,6,R,U] -> per-batch list of (cls, score, xe, ye, l, w, yaw) (yaw = atan2 of sin/cos, halved if YAW2)"""
+    def decode(self, hm, reg, th=None, topk=64, geos=None):
+        """polar hm [B,2,R,U] / reg [B,6,R,U] -> per-batch list of (cls, score, xe, ye, l, w, yaw) (yaw = atan2 of sin/cos, halved if YAW2)
+        geos: see det_targets (inverse geometry from each sample's rig)."""
         th = self.det_th if th is None else th
         p = hm.float().sigmoid(); pm = F.max_pool2d(p, (11, 5), 1, (5, 2)); p = p * (pm == p)   # NMS wider along rows (+/-5 rows, +/-2 columns): vehicles appear elongated along rows
         B, C, R, U = p.shape; out = []
@@ -227,7 +271,7 @@ class PolarLift(nn.Module):
             if len(sc) == 0: out.append([]); continue
             cls = idx // (R * U); rc = idx % (R * U); ri = (rc // U).float(); ci = (rc % U).float()
             o = reg[bi, :, (rc // U), (rc % U)].float()                                    # [6, n]
-            x, y = self.polar_to_ground(ci + o[1], ri + o[0])
+            x, y = self.polar_to_ground(ci + o[1], ri + o[0], geo=None if geos is None else (geos[0][bi], geos[1][bi]))
             l, w = o[2].exp(), o[3].exp(); yaw = torch.atan2(o[4], o[5]) * (0.5 if M.YAW2 else 1.0)
             cand = sorted([(int(cls[j]), float(sc[j]), float(x[j]), float(y[j]), float(l[j]), float(w[j]), float(yaw[j])) for j in range(len(sc))], key=lambda b: -b[1])
             kept = []                                                                       # Cartesian duplicate suppression: drop lower-score boxes of the same class within 2.5 m

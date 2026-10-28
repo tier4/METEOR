@@ -28,10 +28,28 @@ def anchor_of(v0):
     return np.array([[v0 * 0.5 * (k + 1), 0.0] for k in range(6)], np.float32)
 
 
+# METEOR_VLA_YAW_FIX (degrees, default 0.7): the VLA waypoint targets were dumped from the raw ego_motion
+# (pose frame), which sits ~0.7 deg right of the calibration frame that METEOR's E2E head is trained in
+# (--yaw-fix-deg 0.7, see bevlane/apply_yaw_fix.py). Rotate the VLA path into METEOR's frame so the two
+# paths are comparable on screen (2026-09-13). Set to 0 for a VLA trained on yaw-fixed targets.
+_YAW_FIX = float(os.environ.get("METEOR_VLA_YAW_FIX", "0.7"))
+
+
+def to_meteor_frame(wp):
+    if not _YAW_FIX or wp is None:
+        return wp
+    th = np.radians(_YAW_FIX); c, s = np.cos(th), np.sin(th)
+    return np.stack([c * wp[:, 0] - s * wp[:, 1], s * wp[:, 0] + c * wp[:, 1]], 1).astype(np.float32)
+
+
 def derive_cmd(gt, v0):
     x6, y6 = float(gt[5, 0]), float(gt[5, 1])
     if v0 < 1.5 and x6 < 3.0:
         return "stop"
+    # METEOR_VLA_TURN_VMAX (m/s): models trained with VLA_TURN_VMAX treat lateral motion at speed as a road
+    # curve, not a turn -- mirror that definition when deriving the route command
+    if v0 >= float(os.environ.get("METEOR_VLA_TURN_VMAX", "1e9")):
+        return "keep_lane"
     if y6 > 2.0:
         return "turn_left"
     if y6 < -2.0:
@@ -111,6 +129,7 @@ class VLALive:
                     wp = np.array(json.loads(m.group(1)), np.float32).reshape(6, 2) + anchor_of(v0)
                 except Exception:
                     wp = None
+        wp = to_meteor_frame(wp)
         return {"cmd_in": cmd, "v0": float(v0), "wp_reg": None if wp is None else wp.tolist(), "json": js, "raw": txt}
 
 

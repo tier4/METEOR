@@ -2,9 +2,11 @@
 """F3 probe: temporal BEV fusion vs single-frame, cache-trained (2026-10-08).
 
 Loads the dump_f3_cache.py scene files and trains a small bounded-residual head
-on the baseline-selected candidate (H2 contract), in one of two arms:
-  --arm single : conv head on the current pooled BEV only (control)
+on the baseline-selected candidate (H2 contract), in one of three arms:
+  --arm single : conv head on the current pooled BEV only (control; the arm used at inference, bevlane/f3_refine.py)
   --arm fuse   : conv head on [current, ego-motion-warped previous] BEV
+  --arm stack  : conv head on [current, previous] BEV without ego-motion alignment (perception-only temporal input;
+                 --gap N takes the frame N frames earlier)
 Gate: fuse improves path ADE >= 10 % vs the baseline selection
 AND p0 (0.5 s point) unchanged; `fuse` must also beat `single` (the temporal
 part itself, not just BEV conditioning).
@@ -23,7 +25,7 @@ from bevlane.model import make_warp_theta            # noqa: E402
 EGO_K = 3
 
 
-def load(cache, val_every=10):
+def load(cache, val_every=10, gap=1):
     tr = {k: [] for k in ("bev", "prev", "rel", "cand", "gt", "v0", "acc", "brk")}
     va = {k: [] for k in tr}
     files = sorted(glob.glob(os.path.join(cache, "*.npz")))
@@ -31,17 +33,19 @@ def load(cache, val_every=10):
         z = np.load(f)
         bev = z["bev"]                               # [T,96,64,40] fp16
         T = len(bev)
-        if T < 2:
+        if T < gap + 1:
             continue
+        # --gap: prev = the frame gap frames earlier (only pairs with consecutive frame numbers; gaps are dropped). gap=1 = previous behaviour
+        ok = (z["frame"][gap:] - z["frame"][:-gap]) == gap
         dst = va if i % val_every == 0 else tr
-        dst["bev"].append(bev[1:])
-        dst["prev"].append(bev[:-1])
-        dst["rel"].append(z["rel"][1:])
-        dst["cand"].append(z["cand"][1:])
-        dst["gt"].append(z["gt"][1:])
-        dst["v0"].append(z["v0"][1:])
+        dst["bev"].append(bev[gap:][ok])
+        dst["prev"].append(bev[:-gap][ok])
+        dst["rel"].append(z["rel"][gap:][ok])        # relative pose of adjacent frames (warp for fuse; only meaningful with gap=1)
+        dst["cand"].append(z["cand"][gap:][ok])
+        dst["gt"].append(z["gt"][gap:][ok])
+        dst["v0"].append(z["v0"][gap:][ok])
         for k_ in ("acc", "brk"):                 # older caches lack these keys: fill with zeros
-            dst[k_].append(z[k_][1:] if k_ in z.files else np.zeros(T - 1, np.float32))
+            dst[k_].append(z[k_][gap:][ok] if k_ in z.files else np.zeros(int(ok.sum()), np.float32))
     out = []
     for d in (tr, va):
         cat = {k: np.concatenate(v) for k, v in d.items()}
@@ -139,6 +143,8 @@ def batch_feat(arm, b, dev):
     if arm == "single":
         return cur
     prev = b["prev"].to(dev).float()
+    if arm == "stack":                               # perception-only temporal input: concatenate without ego-motion (odometry) alignment
+        return torch.cat([cur, prev], 1)
     theta = make_warp_theta(b["rel"].to(dev).float())
     grid = F.affine_grid(theta, prev.shape, align_corners=False)
     warped = F.grid_sample(prev, grid, align_corners=False)
@@ -171,7 +177,8 @@ def evaluate(head, arm, D, dev, bs=512):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--cache", required=True)
-    ap.add_argument("--arm", choices=["single", "fuse"], required=True)
+    ap.add_argument("--arm", choices=["single", "fuse", "stack"], required=True)
+    ap.add_argument("--gap", type=int, default=1, help="distance of the previous frame for stack/fuse (in frames)")
     ap.add_argument("--out", required=True)
     ap.add_argument("--epochs", type=int, default=15)
     ap.add_argument("--bs", type=int, default=256)
@@ -184,7 +191,7 @@ def main():
     global ACC_SEL
     ACC_SEL = a.acc_sel
     dev = "cuda"
-    tr, va, nf = load(a.cache)
+    tr, va, nf = load(a.cache, gap=a.gap)
     print(f"[f3:{a.arm}] scenes={nf} train={len(tr['cand'])} val={len(va['cand'])} feat={tuple(tr['bev'].shape[1:])}", flush=True)
     n_ext = len([x for x in a.extra.split(",") if x])
     cin = 96 if a.arm == "single" else 192
@@ -212,7 +219,7 @@ def main():
               f"({time.time()-t0:.0f}s)", flush=True)
         if ev["new"] < best:
             best = ev["new"]
-            torch.save({"head": head.state_dict(), "arm": a.arm, "val": ev, "extra": n_ext, "npu": a.npu,
+            torch.save({"head": head.state_dict(), "arm": a.arm, "gap": a.gap, "val": ev, "extra": n_ext, "npu": a.npu,
                         "bound": a.bound, "feat": tuple(tr["bev"].shape[1:])}, os.path.join(a.out, "best.pt"))
             json.dump(ev, open(os.path.join(a.out, "best.json"), "w"))
     print(f"[f3:{a.arm}] done best={best:.4f}", flush=True)
