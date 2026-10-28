@@ -61,7 +61,11 @@ INIT=<METEOR2 checkpoint> VARIANT=full GPUS=0,1,2,3 EP=12 HR=/data/kitscenes_hr 
 
 The route is a **lane-level corridor**: the scene's driven trajectory is matched to Lanelet2 lanelets with an HMM
 (`bevlane/route_corridor.py`), the visited lanelets' centrelines are drawn 3.5 m wide, and the destination is the last
-pose of the scene. Scenes whose match fails the quality gate get no route. The map / route raster and the history
+pose of the scene. Scenes whose match fails the quality gate get no route. In addition,
+`tools/kitscenes/route_unmatched_scenes.txt` lists the scenes whose lane-level route match fails a stricter matcher
+quality gate; their route channels are left empty so results are comparable with the published benchmark protocol.
+`finetune.sh` uses this list by default (`METEOR_RMAP_ROUTE_DENY`; `ROUTE_DENY=` disables it), and evaluation
+must use the same list. The map / route raster and the history
 enter the network through zero-initialised adapters (`--route-map 1`), so the fine-tune starts from the camera-only
 function. Report a **fixed epoch decided before training (the final epoch)**, not the best epoch on val.
 
@@ -69,6 +73,7 @@ function. Report a **fixed epoch decided before training (the final epoch)**, no
 
 ```bash
 METEOR_RMAP_ROUTE=lanelet METEOR_RMAP_HIST=past64 METEOR_ABSENT_CAMS=6 \
+METEOR_RMAP_ROUTE_DENY=tools/kitscenes/route_unmatched_scenes.txt \
 python3 bevlane/kitscenes_eval.py full=out/kits_ft/ckpt_kits_full/last.pt \
     --val-list out/kitscenes/scenes_val.txt --hr-root /data/kitscenes_hr --set kf202
 # no-HD-map checkpoint: add METEOR_RMAP_NOMAP=1; camera-only checkpoint: the conditioning env is ignored

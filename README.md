@@ -280,7 +280,8 @@ Trajectory errors in metres; the ground truth is the recorded 10 Hz future of ea
 - The reported epoch is **fixed in advance (the final epoch)**, not picked on val.
 - The **ego history uses only past samples** (64 steps at 10 Hz before the keyframe).
 - The route is a lane-level corridor of Lanelet2 lanelets rebuilt from the recorded drive (a navigation
-  oracle); the destination is the end of the sequence.
+  oracle); the destination is the end of the sequence. Scenes listed in
+  `tools/kitscenes/route_unmatched_scenes.txt` get no route (see [docs/KITSCENES.md](docs/KITSCENES.md)).
 - **3D detection AP** is BEV centre-distance AP (match within 3 m for vehicles, 1.5 m for pedestrians).
   KITScenes has no 3D box annotations, so it is measured against **LiDAR auto-labels** of the val split and is
   a reference number, not a score against human annotations.
@@ -419,6 +420,7 @@ python3 tools/kitscenes/download_kitscenes.py --root /data/kitscenes --index <ar
 KITS_DL=/data/kitscenes HR=/data/kitscenes_hr bash tools/kitscenes/convert_all.sh
 INIT=<METEOR2 ckpt> VARIANT=full HR=/data/kitscenes_hr bash tools/kitscenes/finetune.sh     # full | nomap | camonly
 METEOR_RMAP_ROUTE=lanelet METEOR_RMAP_HIST=past64 METEOR_ABSENT_CAMS=6 \
+METEOR_RMAP_ROUTE_DENY=tools/kitscenes/route_unmatched_scenes.txt \
 python3 bevlane/kitscenes_eval.py full=out/kits_ft/ckpt_kits_full/last.pt --hr-root /data/kitscenes_hr
 ```
 

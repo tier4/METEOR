@@ -8,7 +8,8 @@
 #   VARIANT=nomap    as full, but the HD-map channels are empty: route + ego history only      (METEOR_RMAP_NOMAP=1)
 #   VARIANT=camonly  images + ego speed only (the plain METEOR2 interface)
 #   BOXES=1          also train 3D boxes on the KITScenes auto-labels (tools/kitscenes/kits_box_gt.py, METEOR_KITS_BOX=1)
-#   ROUTE_DENY=<f>   optional list of scenes treated as having no valid route
+#   ROUTE_DENY=<f>   scenes treated as having no valid route (default tools/kitscenes/route_unmatched_scenes.txt;
+#                    ROUTE_DENY= disables it)
 #   KD_BOX_CKPT=<f>  optional far-box distillation teacher (METEOR v52-line checkpoint)
 #
 # Training uses KITScenes train only; validation during training uses the first 60 val scenes. Six cameras: the
@@ -32,7 +33,8 @@ case "$VARIANT" in
   camonly) ;;
   *) echo "unknown VARIANT=$VARIANT (full | nomap | camonly)"; exit 1 ;;
 esac
-[ -n "${ROUTE_DENY:-}" ] && export METEOR_RMAP_ROUTE_DENY=$ROUTE_DENY
+ROUTE_DENY=${ROUTE_DENY-tools/kitscenes/route_unmatched_scenes.txt}
+[ -n "$ROUTE_DENY" ] && export METEOR_RMAP_ROUTE_DENY=$ROUTE_DENY
 [ "${BOXES:-0}" = 1 ] && export METEOR_KITS_BOX=1
 KD=""; [ -n "${KD_BOX_CKPT:-}" ] && KD="--kd-box-ckpt $KD_BOX_CKPT --kd-box-w 2.0 --kd-box-rmin 0"
 
