@@ -25,6 +25,7 @@ GPU stack down to a single camera on a low-power edge accelerator.**
 [![Author](https://img.shields.io/badge/authored_by-Claude_Fable_5-cc785c)]()
 [![License](https://img.shields.io/badge/license-Apache--2.0-blue)](LICENSE)
 
+<!-- TODO: refresh media (hero GIF: regenerate) -->
 <img src="docs/media/inference.gif" width="880" alt="METEOR multi-task inference"/>
 
 *The released model (v157, 2:4 sparse) on the published demo scenes — expressway, mountain
@@ -86,8 +87,8 @@ lift** — the one block whose operators decide whether a compiler accepts the g
 
 | | **METEOR** | **METEOR2** | **METEOR2 Nano** |
 |---|---|---|---|
-| Role | reference design | NPU-portable surround model | 1-camera, all-on-accelerator |
-| Cameras | 8 × 432×768, surround | 4–8 × 648×1152, surround | 1 front × 720×1280 |
+| Role | reference design | 8-camera surround model, NPU-portable; plus its KITScenes fine-tune | 1-camera, all-on-accelerator |
+| Cameras | 8 × 432×768, surround | 8 × 648×1152, surround (4–8 supported; 6 on KITScenes) | 1 front × 720×1280 |
 | Backbone | ResNet-34 + FPN | ResNet-18 + FPN-lite | ResNet-18 |
 | Camera → BEV lift | depth-gated geometric lift from intrinsics / extrinsics (fused CUDA plugin) | **learned low-rank block mapping**, distilled from the geometric lift — no Gather / ScatterND / GridSample | **Cartesian lift** (GPU) or **polar lift**: strided convolutions collapse each image column into range bins, no resampling at all |
 | BEV grid | Cartesian ±80 × ±50 m, 96 ch | Cartesian ±80 × ±50 m, 64 ch | Cartesian, or polar (azimuth × range) with boxes decoded to the ground plane |
@@ -111,6 +112,53 @@ pre-/post-processing hops to the host CPU.
 **Status.** The METEOR2 / METEOR2 Nano code is in this repository (see the layout below);
 **pretrained METEOR2 and METEOR2 Nano weights are coming soon.** The released METEOR weights
 (v157) are unchanged and remain fully supported by this code.
+
+### METEOR2 — the 8-camera surround model, and its KITScenes fine-tune
+
+METEOR2 is the surround member of the family: **8 cameras at 648×1152**, ResNet-18 + FPN-lite,
+and a **learned low-rank camera-to-BEV lift** distilled from METEOR's geometric lift, so the whole
+graph is standard ONNX operators with static shapes. The same weights family exists in two forms:
+
+- **METEOR2** — trained on the in-house Co-MLOps data with the auto-labels described below; the
+  planner contract is unchanged (images + ego speed in, K=3 trajectory hypotheses out). An optional
+  **F3 trajectory refinement head** (`bevlane/f3_refine.py`) adds a bounded residual to the selected
+  hypothesis from the pooled BEV; it runs in PyTorch and can be bundled into the NPU graph.
+- **METEOR2 (KITScenes fine-tune)** — the same checkpoint fine-tuned on the **public KITScenes train
+  split only** (6 ring cameras). It keeps the camera-only interface and can optionally take an HD map,
+  a lane-level navigation route and the ego-motion history through zero-initialised adapters (the
+  fine-tune starts from the camera-only function). Results are [below](#results-on-kitscenes-public-benchmark);
+  the full path is in [docs/KITSCENES.md](docs/KITSCENES.md). KITScenes is CC BY-NC, so **KITScenes
+  fine-tuned weights are research-only and are not released**; the code is.
+
+<div align="center">
+<!-- TODO: refresh media (new slot: METEOR2 on KITScenes)
+<img src="docs/media/meteor2_kitscenes.gif" width="880" alt="METEOR2 on KITScenes"/>
+-->
+</div>
+
+### METEOR2 Nano — one front camera, the whole network on the accelerator
+
+METEOR2 Nano keeps the METEOR2 heads and training stack and shrinks the input to **one front camera
+(720×1280)** on a **ResNet-18**. The BEV is supervised on the front sector only, and the lift comes in
+two forms for two targets:
+
+- **Cartesian lift on Jetson Orin Nano** — the familiar Cartesian BEV grid; 108 ms mixed INT8 / fp16,
+  84 ms with 2:4 sparsity + INT8.
+- **Polar lift for a low-power edge accelerator** — strided convolutions collapse each image column
+  into range bins, so the BEV lives on an azimuth × range grid with **no resampling at all**
+  (Conv / Pool / Concat only, ~220 nodes). Image in, BEV outputs and trajectory out run as **a single
+  compiled graph with nothing on the host** — 67.7 ms (14.8 FPS) on the device.
+- **3D boxes from the polar BEV** — boxes are trained and decoded on the polar grid and placed on the
+  ground plane through each sample's own camera geometry, then redrawn on the Cartesian map.
+- **Quantisation / sparsity-robust training** — fake-quant (INT8) and 2:4 structured-sparsity mask
+  training (`bevlane/robust_train.py`, `--qat` / `--sparse-24`), so the compiled INT8, 2:4 graph
+  behaves like the trained one.
+
+<div align="center">
+<!-- TODO: refresh media (new slot: METEOR2 Nano)
+<img src="docs/media/meteor2_nano.gif" width="880" alt="METEOR2 Nano, single front camera"/>
+-->
+</div>
 
 ### Optional inputs — one set of weights, every sensor configuration
 
@@ -220,7 +268,29 @@ not be comparable to public benchmarks. What the release does state:
   difference into an apparent 10 % regression);
 - latency and FPS on the target device are below.
 
-Evaluation on a public benchmark is on the roadmap.
+Public-benchmark numbers are reported on KITScenes, next.
+
+## Results on KITScenes (public benchmark)
+
+METEOR2 fine-tuned on the KITScenes train split and evaluated on the **KITScenes val split, 202
+keyframes** (`bevlane/kitscenes_eval.py`; protocol in [docs/KITSCENES.md](docs/KITSCENES.md)).
+Trajectory errors in metres; the ground truth is the recorded 10 Hz future of each keyframe.
+
+| Model (6 cameras) | Inputs | ADE@1s | ADE@2s | ADE@3s | FDE@3s | 3D AP vehicle | 3D AP pedestrian |
+|---|---|---|---|---|---|---|---|
+| METEOR2 (KITScenes fine-tune) | images + ego speed + ego history + HD map + route | TBD | TBD | TBD | TBD | TBD | TBD |
+| METEOR2, no HD map | images + ego speed + ego history + route | TBD | TBD | TBD | TBD | TBD | TBD |
+| METEOR2, camera-only | images + ego speed | TBD | TBD | TBD | TBD | TBD | TBD |
+
+- **Pretraining** on in-house (Co-MLOps) data; **fine-tuning on KITScenes train only** (val is never trained on).
+- The reported epoch is **fixed in advance (the final epoch)**, not picked on val.
+- The **ego history uses only past samples** (64 steps at 10 Hz before the keyframe).
+- The route is a lane-level corridor of Lanelet2 lanelets rebuilt from the recorded drive (a navigation
+  oracle); the destination is the end of the sequence.
+- **3D detection AP** is BEV centre-distance AP (match within 3 m for vehicles, 1.5 m for pedestrians).
+  KITScenes has no 3D box annotations, so it is measured against **LiDAR auto-labels** of the val split and is
+  a reference number, not a score against human annotations.
+- KITScenes is CC BY-NC: these fine-tuned weights are research-only and are not released.
 
 ## Edge deployment: Jetson AGX Orin
 
@@ -344,10 +414,22 @@ python3 deploy/cpp/liftbench/plugin/make_plugin_onnx.py --onnx out/meteor_prod.o
 # 4) Local multi-task demo video straight from a checkpoint (PyTorch, no export)
 python3 bevlane/demo_rgbd_bev.py --model v52 --n-seg2d 21 --ckpt models/meteor_v157.pt \
   --show-seg2d --guard --seg-fuse --unk2d --scenes <SCENE ...> --out out/demo.mp4
+
+# 5) METEOR2 F3 trajectory refinement head: cache -> train -> closed-loop check (add --npu 1 for the NPU-graph head)
+python3 bevlane/dump_f3_cache.py <METEOR2 ckpt> scene_list.txt out/f3_cache
+python3 bevlane/train_f3.py --cache out/f3_cache --arm single --out out/f3_single
+METEOR_F3_HEAD=out/f3_single/best.pt python3 bevlane/closed_loop_eval.py --ckpt <METEOR2 ckpt> --list val.lst
+
+# 6) METEOR2 on KITScenes (public benchmark): download -> convert -> fine-tune -> evaluate (docs/KITSCENES.md)
+python3 tools/kitscenes/download_kitscenes.py --root /data/kitscenes --index <archive index csv> val train
+KITS_DL=/data/kitscenes HR=/data/kitscenes_hr bash tools/kitscenes/convert_all.sh
+INIT=<METEOR2 ckpt> VARIANT=full HR=/data/kitscenes_hr bash tools/kitscenes/finetune.sh     # full | nomap | camonly
+METEOR_AE2E_ROUTE=lanelet METEOR_AE2E_HIST=past64 METEOR_ABSENT_CAMS=6 \
+python3 bevlane/kitscenes_eval.py full=out/kits_ft/ckpt_kits_full/last.pt --hr-root /data/kitscenes_hr
 ```
 
 More recipes: [docs/TRAINING.md](docs/TRAINING.md) · [docs/DEMO.md](docs/DEMO.md) ·
-[docs/REPRODUCE.md](docs/REPRODUCE.md)
+[docs/REPRODUCE.md](docs/REPRODUCE.md) · [docs/KITSCENES.md](docs/KITSCENES.md)
 
 ## Repository layout
 
@@ -368,7 +450,10 @@ bevlane/                 training, GT generation, evaluation
   train_meteorite.py     METEOR2 trainer (geometric-lift distillation, QAT / 2:4 robustness via robust_train.py)
   polar_lift.py          METEOR2 Nano polar lift (Conv / Pool / Concat only)
   rowband_lift.py        row-band lift variant for Conv-only accelerators
-  train_f3.py            lightweight trajectory residual head for the NPU graph
+  train_f3.py            F3 trajectory refinement head (bounded residual on the selected hypothesis; --npu 1 for the NPU graph)
+  f3_refine.py           F3 head at inference (METEOR_F3_HEAD: closed_loop_eval, demo); dump_f3_cache.py builds its training cache
+  ae2e_route.py          lane-level route corridor from a Lanelet2 HD map (optional route / map inputs, KITScenes)
+  kitscenes_eval.py      KITScenes trajectory metrics: ADE@1/2/3s, FDE@3s on the 202 val keyframes
 deploy/                  export + TensorRT runtimes
   export_onnx.py         --no-hist / --depth-mean / --with-lidar / --uint8-in / --argmax-out
   runtime.py             Python TensorRT runtime (CUDA Graph, pinned zero-copy inputs, LiDAR)
@@ -380,8 +465,9 @@ deploy/                  export + TensorRT runtimes
   build_engine_fp16.py   plugin-free fp16 engine for any NVIDIA GPU (the workstation reproduction path)
   export_mite_ckpt.py    METEOR2 checkpoint -> ONNX (--npu npu: strict NPU graph; parity-checked against PyTorch)
   npu_lint.py            operator / shape lint of an ONNX graph against NPU-style constraints
+tools/kitscenes/         KITScenes: download, conversion to the bevlane layout, auto-label box GT, fine-tune launcher
 hf/                      Hugging Face release: model / dataset cards, publish_to_hf.py, onnx_smoke_test.py
-docs/                    architecture / data pipeline / training / demo / quickstart / reproduce
+docs/                    architecture / data pipeline / training / demo / quickstart / reproduce / KITScenes
 comlops-*.csv            2D taxonomies (21-class semantic, 10-class instance)
 out/                     created at run time for checkpoints, engines and videos (git-ignored)
 ```
@@ -422,6 +508,7 @@ If you use METEOR in your work, please cite it (see [CITATION.cff](CITATION.cff)
 | [DATA_PIPELINE.md](docs/DATA_PIPELINE.md) | the autolabel factory, taxonomies, quality gates |
 | [TRAINING.md](docs/TRAINING.md) | losses, curricula, rolling rounds, operational notes |
 | [DEMO.md](docs/DEMO.md) | demo tooling and video layouts |
+| [KITSCENES.md](docs/KITSCENES.md) | METEOR2 on KITScenes: conversion, fine-tune variants, evaluation protocol |
 
 ### Silent failures we learned to test for
 
@@ -441,7 +528,7 @@ against final epochs. The detection rules live in [docs/TRAINING.md](docs/TRAINI
 - Ship the LiDAR-capable export as the single engine, with LiDAR as a runtime switch (the host-side presence flag is in place).
 - A history-aware line trained from scratch (the temporal memory is unused today; a history-aware engine costs about +22 ms on the Orin) — one run is in progress.
 - Release the METEOR2 and METEOR2 Nano weights (code is already here).
-- Evaluation on a public benchmark, so accuracy can be reported in comparable terms.
+- Extend the public-benchmark evaluation beyond KITScenes (and to the METEOR line itself), so accuracy can be reported in comparable terms.
 - An Autoware (ROS 2) node around the released ONNX; today METEOR ships with its own Python and C++ runtimes.
 - VLA support: a vision-language-action layer on top of METEOR's BEV features for long-tail understanding, instruction following and explanations, with METEOR's driving-command input as the interface.
 
