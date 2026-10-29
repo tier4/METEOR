@@ -25,6 +25,11 @@ import sys
 os.environ.setdefault("METEOR_EVAL_MODEL", "v52")
 os.environ.setdefault("METEOR_ZERO_HIST", "1")
 os.environ["METEOR_RMAP"] = "1"                 # the dataset appends the conditioning inputs (ignored by plain checkpoints)
+# The "trace" route draws the recorded future trajectory itself; evaluation only allows the lane-level route.
+_route = os.environ.get("METEOR_RMAP_ROUTE") or os.environ.get("METEOR_AE2E_ROUTE") or "lanelet"
+if _route != "lanelet":
+    sys.exit(f"kitscenes_eval: METEOR_RMAP_ROUTE={_route} is not allowed (it encodes the future trajectory); use lanelet")
+os.environ["METEOR_RMAP_ROUTE"] = "lanelet"
 
 import numpy as np   # noqa: E402
 import torch         # noqa: E402
