@@ -25,15 +25,12 @@ GPU stack down to a single camera on a low-power edge accelerator.**
 [![Author](https://img.shields.io/badge/authored_by-Claude_Fable_5-cc785c)]()
 [![License](https://img.shields.io/badge/license-Apache--2.0-blue)](LICENSE)
 
-<!-- TODO: refresh media (hero GIF: regenerate) -->
-<img src="docs/media/inference.gif" width="880" alt="METEOR multi-task inference"/>
+<img src="docs/media/meteor2_inference.gif" width="880" alt="METEOR2 multi-task inference"/>
 
-*The released model (v157, 2:4 sparse) on the published demo scenes — expressway, mountain
-road, arterial, city — 8 anonymised DRS cameras in, everything out: 2D & 3D detection with
-parked/stopped flags, metric depth, BEV lane map, the ego-relevant traffic-light state, a
-near-range risk field, multimodal end-to-end driving (3 path hypotheses + confidences) under a
-deterministic guardrail, and unknown obstacles lifted from 2D detections into BEV (white dots).
-Full 88-second video: reproduce it with the commands in the Hugging Face section below.*
+*METEOR2 (8 cameras at 648×1152, images + ego speed only) on four of the published demo scenes,
+day and night, none of which is in its training set: metric depth for every camera, the BEV road /
+lane map with 3D boxes, and the planned ego trajectory. METEOR2 weights are coming soon; the
+published demo scenes are in the Hugging Face section below.*
 
 </div>
 
