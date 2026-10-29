@@ -270,13 +270,18 @@ METEOR2 fine-tuned on the KITScenes train split and evaluated on the **KITScenes
 keyframes** (`bevlane/kitscenes_eval.py`; protocol in [docs/KITSCENES.md](docs/KITSCENES.md)).
 Trajectory errors in metres; the ground truth is the recorded 10 Hz future of each keyframe.
 
-| Model (6 cameras) | Inputs | ADE@1s | ADE@2s | ADE@3s | FDE@3s |
+| Model | Inputs | ADE@1s | ADE@2s | ADE@3s | FDE@3s |
 |---|---|---|---|---|---|
-| METEOR2 (KITScenes fine-tune) | images + ego speed + ego history + HD map + route | TBD | TBD | TBD | TBD |
-| METEOR2, no HD map | images + ego speed + ego history + route | TBD | TBD | TBD | TBD |
-| METEOR2, camera-only | images + ego speed | TBD | TBD | TBD | TBD |
+| METEOR2 (KITScenes fine-tune) | images + ego speed + ego history + HD map + route | 0.091 | 0.264 | **0.542** | 1.488 |
+| METEOR2, no HD map | images + ego speed + ego history + route | 0.095 | 0.265 | 0.544 | **1.475** |
+| METEOR2, camera-only | images + ego speed | 0.140 | 0.403 | 0.795 | 2.109 |
 
-- **Pretraining** on in-house (Co-MLOps) data; **fine-tuning on KITScenes train only** (val is never trained on).
+The first two rows use the 6 ring cameras and the `full` (`EP=12`) / `nomap` (`EP=8`) recipes of
+`tools/kitscenes/finetune.sh`. The camera-only row also fills the narrow slot with the front-camera crop (7 camera slots) and
+comes from an earlier camera-only schedule: 4 epochs on KITScenes train mixed with in-house scenes, then 4 epochs
+on KITScenes train only. The `camonly` recipe of `finetune.sh` has not been re-run yet.
+
+- **Pretraining** on in-house (Co-MLOps) data; **fine-tuning on KITScenes train** (val is never trained on).
 - The reported epoch is **fixed in advance (the final epoch)**, not picked on val.
 - The **ego history uses only past samples** (64 steps at 10 Hz before the keyframe).
 - The route is a lane-level corridor of Lanelet2 lanelets rebuilt from the recorded drive (a navigation
