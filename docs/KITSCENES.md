@@ -46,13 +46,14 @@ these auto-labels**, so they are reference numbers, not scores against human ann
 
 ## 4. Fine-tune
 
-Three input configurations, all from the same METEOR2 checkpoint, all with the 6 ring cameras
+Four input configurations, all from the same METEOR2 checkpoint, all with the 6 ring cameras
 (`METEOR_ABSENT_CAMS=6` feeds a zero image in the narrow slot):
 
 | `VARIANT` | Inputs |
 |---|---|
 | `full` | images + ego speed + ego history (64 past steps at 10 Hz, strictly past samples) + HD map + lane-level route |
 | `nomap` | images + ego speed + ego history + route (HD-map channels empty) |
+| `past` | images + ego speed + ego history (no HD map, no route, no destination): only inputs available at the keyframe |
 | `camonly` | images + ego speed (the plain METEOR2 interface) |
 
 ```bash
@@ -67,7 +68,9 @@ quality gate; their route channels are left empty so results are comparable with
 `finetune.sh` uses this list by default (`METEOR_RMAP_ROUTE_DENY`; `ROUTE_DENY=` disables it), and evaluation
 must use the same list. The map / route raster and the history
 enter the network through zero-initialised adapters (`--route-map 1`), so the fine-tune starts from the camera-only
-function. Report a **fixed epoch decided before training (the final epoch)**, not the best epoch on val.
+function. The route and the destination are built from the recorded drive (the destination is the last
+pose of the sequence), i.e. they are a navigation oracle that carries future information, as in the published benchmark
+protocol; use `past` for a model whose inputs are all available at the keyframe. Report a **fixed epoch decided before training (the final epoch)**, not the best epoch on val.
 
 ## 5. Evaluate (trajectory)
 
@@ -76,7 +79,8 @@ METEOR_RMAP_ROUTE=lanelet METEOR_RMAP_HIST=past64 METEOR_ABSENT_CAMS=6 \
 METEOR_RMAP_ROUTE_DENY=tools/kitscenes/route_unmatched_scenes.txt \
 python3 bevlane/kitscenes_eval.py full=out/kits_ft/ckpt_kits_full/last.pt \
     --val-list out/kitscenes/scenes_val.txt --hr-root /data/kitscenes_hr --set kf202
-# no-HD-map checkpoint: add METEOR_RMAP_NOMAP=1; camera-only checkpoint: the conditioning env is ignored
+# no-HD-map checkpoint: add METEOR_RMAP_NOMAP=1; past-only: add METEOR_RMAP_NOMAP=1 METEOR_RMAP_NOROUTE=1;
+# camera-only checkpoint: the conditioning env is ignored. Only the lanelet route is accepted at evaluation.
 ```
 
 | Set | Definition |

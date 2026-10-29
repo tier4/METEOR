@@ -269,12 +269,14 @@ Trajectory errors in metres; the ground truth is the recorded 10 Hz future of ea
 
 | Model | Inputs | ADE@1s | ADE@2s | ADE@3s | FDE@3s |
 |---|---|---|---|---|---|
-| METEOR2 (KITScenes fine-tune) | images + ego speed + ego history + HD map + route | 0.091 | 0.264 | **0.542** | 1.488 |
-| METEOR2, no HD map | images + ego speed + ego history + route | 0.095 | 0.265 | 0.544 | **1.475** |
+| METEOR2 (KITScenes fine-tune) | images + ego speed + ego history + HD map + route | **0.091** | **0.264** | **0.542** | **1.488** |
+| METEOR2, past-only inputs | images + ego speed + ego history (no HD map, no route) | 0.099 | 0.287 | 0.596 | 1.648 |
 | METEOR2, camera-only | images + ego speed | 0.140 | 0.403 | 0.795 | 2.109 |
 
-The first two rows use the 6 ring cameras and the `full` (`EP=12`) / `nomap` (`EP=8`) recipes of
-`tools/kitscenes/finetune.sh`. The camera-only row also fills the narrow slot with the front-camera crop (7 camera slots) and
+The first two rows use the 6 ring cameras and the `full` (`EP=12`) / `past` (`EP=8`) recipes of
+`tools/kitscenes/finetune.sh`. The route and destination of the first row are built from the recorded drive (a
+navigation oracle, as in the KITScenes benchmark); the last two rows use **only inputs available at the keyframe**
+(current images, current speed, past ego motion). The camera-only row also fills the narrow slot with the front-camera crop (7 camera slots) and
 comes from an earlier camera-only schedule: 4 epochs on KITScenes train mixed with in-house scenes, then 4 epochs
 on KITScenes train only. The `camonly` recipe of `finetune.sh` has not been re-run yet.
 
