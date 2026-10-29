@@ -18,7 +18,7 @@ GPU stack down to a single camera on a low-power edge accelerator.**
 [![Params](https://img.shields.io/badge/params-54M_(refiner_incl.)-blue)]()
 [![Orin](https://img.shields.io/badge/AGX_Orin_INT8-67.4_ms_(2:4_sparse)_%7C_75.4_ms_(dense)-76B900)]()
 [![Family](https://img.shields.io/badge/family-METEOR_%7C_METEOR2_%7C_METEOR2_Nano-d0021b)](#one-family--scalability--portability)
-[![Targets](https://img.shields.io/badge/targets-GPU_%7C_automotive_NPU_%7C_edge_accelerator-d0021b)](#one-family--scalability--portability)
+[![Targets](https://img.shields.io/badge/targets-GPU_%7C_embedded_accelerators-d0021b)](#one-family--scalability--portability)
 [![Runtime](https://img.shields.io/badge/runtime-Python_%7C_C%2B%2B_(TensorRT_10)-informational)]()
 [![Labels](https://img.shields.io/badge/human_labels-0-success)]()
 [![Code](https://img.shields.io/badge/human_written_code-0-success)]()
@@ -84,7 +84,7 @@ lift** — the one block whose operators decide whether a compiler accepts the g
 
 | | **METEOR** | **METEOR2** | **METEOR2 Nano** |
 |---|---|---|---|
-| Role | reference design | 8-camera surround model, NPU-portable; plus its KITScenes fine-tune | 1-camera, all-on-accelerator |
+| Role | reference design | 8-camera surround model, accelerator-portable; plus its KITScenes fine-tune | 1-camera, all-on-accelerator |
 | Cameras | 8 × 432×768, surround | 8 × 648×1152, surround (4–8 supported; 6 on KITScenes) | 1 front × 720×1280 |
 | Backbone | ResNet-34 + FPN | ResNet-18 + FPN-lite | ResNet-18 |
 | Camera → BEV lift | depth-gated geometric lift from intrinsics / extrinsics (fused CUDA plugin) | **learned low-rank block mapping**, distilled from the geometric lift — no Gather / ScatterND / GridSample | **Cartesian lift** (GPU) or **polar lift**: strided convolutions collapse each image column into range bins, no resampling at all |
@@ -95,7 +95,7 @@ lift** — the one block whose operators decide whether a compiler accepts the g
 
 ```
 METEOR ─────────────── geometric lift + CUDA plugin ── Jetson AGX Orin            67–75 ms INT8
-  └─▶ METEOR2 ─┬────── low-rank learned lift ─┬─────── automotive NPU             compiles end-to-end, standard ops only
+  └─▶ METEOR2 ─┬────── low-rank learned lift ─┬─────── embedded accelerator       standard ops only
                │                              └─────── Jetson AGX Orin            ~92 ms INT8
                ├ ─ ─ ─ gather lift (planned) ───────── Jetson AGX Orin            to be measured
                └─▶ METEOR2 Nano ─┬ Cartesian lift ──── Jetson Orin Nano           108 ms mixed INT8 / fp16 (84 ms 2:4 + INT8)
@@ -119,7 +119,7 @@ graph is standard ONNX operators with static shapes. The same weights family exi
 - **METEOR2** — trained on the in-house Co-MLOps data with the auto-labels described below; the
   planner contract is unchanged (images + ego speed in, K=3 trajectory hypotheses out). An optional
   **F3 trajectory refinement head** (`bevlane/f3_refine.py`) adds a bounded residual to the selected
-  hypothesis from the pooled BEV; it runs in PyTorch and can be bundled into the NPU graph.
+  hypothesis from the pooled BEV; it runs in PyTorch and can be bundled into the accelerator graph.
 - **METEOR2 (KITScenes fine-tune)** — the same checkpoint fine-tuned on the **public KITScenes train
   split only** (6 ring cameras). It keeps the camera-only interface and can optionally take an HD map,
   a lane-level navigation route and the ego-motion history through zero-initialised adapters (the
@@ -337,7 +337,7 @@ released model and the demo scenes are published under the Autoware Foundation o
 |---|---|---|
 | **[AutowareFoundation/meteor](https://huggingface.co/AutowareFoundation/meteor)** (model) | `meteor_v157c3Z.onnx` — plain ONNX, camera-only, no custom ops; `meteor_v157.pt` — PyTorch checkpoint (final epoch) for fine-tuning / re-export; `meteor_v157.param.yaml` — camera order, resolution, BEV grid, output tensors; `lift_plugin_tables_r64/` — tables for the optional CUDA lift plugin; tag `v1.0` | Apache-2.0 |
 | **[AutowareFoundation/meteor-demo-scenes](https://huggingface.co/datasets/AutowareFoundation/meteor-demo-scenes)** (dataset) | six anonymised 8-camera scenes, one per road type — `highway_day`, `mountain_day`, `arterial_day`, `valday`, `valcurve`, `fast` — each with `manifest.json`, `img/`, `ego_motion.npz`, `lidar_bev/`; no ground truth; tag `v1.0` | CC-BY-4.0 |
-| METEOR2 / METEOR2 Nano (model) | checkpoints and plain ONNX for the NPU-portable and 1-camera generations | **coming soon** |
+| METEOR2 / METEOR2 Nano (model) | checkpoints and plain ONNX for the accelerator-portable and 1-camera generations | **coming soon** |
 
 ### Reproduce the released model end to end
 
@@ -412,7 +412,7 @@ python3 deploy/cpp/liftbench/plugin/make_plugin_onnx.py --onnx out/meteor_prod.o
 python3 bevlane/demo_rgbd_bev.py --model v52 --n-seg2d 21 --ckpt models/meteor_v157.pt \
   --show-seg2d --guard --seg-fuse --unk2d --scenes <SCENE ...> --out out/demo.mp4
 
-# 5) METEOR2 F3 trajectory refinement head: cache -> train -> closed-loop check (add --npu 1 for the NPU-graph head)
+# 5) METEOR2 F3 trajectory refinement head: cache -> train -> closed-loop check (add --npu 1 for the accelerator-graph head)
 python3 bevlane/dump_f3_cache.py <METEOR2 ckpt> scene_list.txt out/f3_cache
 python3 bevlane/train_f3.py --cache out/f3_cache --arm single --out out/f3_single
 METEOR_F3_HEAD=out/f3_single/best.pt python3 bevlane/closed_loop_eval.py --ckpt <METEOR2 ckpt> --list val.lst
@@ -444,11 +444,11 @@ bevlane/                 training, GT generation, evaluation
   demo_rgbd_bev.py       local 12-task demo renderer
   probe_*.py (45)        one-question diagnostic probes
   meteorite.py           METEOR2 / METEOR2 Nano network (internal name METEORite): low-rank learned lift,
-                         NPU export path (standard ONNX operators only, static shapes)
+                         accelerator export path (standard ONNX operators only, static shapes)
   train_meteorite.py     METEOR2 trainer (geometric-lift distillation, QAT / 2:4 robustness via robust_train.py)
   polar_lift.py          METEOR2 Nano polar lift (Conv / Pool / Concat only)
   rowband_lift.py        row-band lift variant for Conv-only accelerators
-  train_f3.py            F3 trajectory refinement head (bounded residual on the selected hypothesis; --npu 1 for the NPU graph)
+  train_f3.py            F3 trajectory refinement head (bounded residual on the selected hypothesis; --npu 1 for the accelerator graph)
   f3_refine.py           F3 head at inference (METEOR_F3_HEAD: closed_loop_eval, demo); dump_f3_cache.py builds its training cache
   route_corridor.py      lane-level route corridor from a Lanelet2 HD map (optional route / map inputs, KITScenes)
   kitscenes_eval.py      KITScenes trajectory metrics: ADE@1/2/3s, FDE@3s on the 202 val keyframes
@@ -461,8 +461,8 @@ deploy/                  export + TensorRT runtimes
                          render.cpp (parity with Python), liftbench/ (CUDA lift plugin)
   orin/                  Orin-side scripts (demo.sh, demo_cpp.sh, bench, health checks, job template)
   build_engine_fp16.py   plugin-free fp16 engine for any NVIDIA GPU (the workstation reproduction path)
-  export_mite_ckpt.py    METEOR2 checkpoint -> ONNX (--npu npu: strict NPU graph; parity-checked against PyTorch)
-  npu_lint.py            operator / shape lint of an ONNX graph against NPU-style constraints
+  export_mite_ckpt.py    METEOR2 checkpoint -> ONNX (--npu npu: strict accelerator graph; parity-checked against PyTorch)
+  npu_lint.py            operator / shape lint of an ONNX graph against accelerator-style constraints
 tools/kitscenes/         KITScenes: download, conversion to the bevlane layout, auto-label box GT, fine-tune launcher
 hf/                      Hugging Face release: model / dataset cards, publish_to_hf.py, onnx_smoke_test.py
 docs/                    architecture / data pipeline / training / demo / quickstart / reproduce / KITScenes
