@@ -81,6 +81,7 @@ python3 bevlane/kitscenes_eval.py full=out/kits_ft/ckpt_kits_full/last.pt \
     --val-list out/kitscenes/scenes_val.txt --hr-root /data/kitscenes_hr --set kf202
 # no-HD-map checkpoint: add METEOR_RMAP_NOMAP=1; past-only: add METEOR_RMAP_NOMAP=1 METEOR_RMAP_NOROUTE=1;
 # camera-only checkpoint: the conditioning env is ignored. Only the lanelet route is accepted at evaluation.
+# add --lidar to feed the LiDAR raster (lidar_bev/) as the optional BEV input.
 ```
 
 | Set | Definition |

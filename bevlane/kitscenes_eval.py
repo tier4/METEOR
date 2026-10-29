@@ -80,6 +80,7 @@ def main():
     ap.add_argument("--set", default="kf202", help="kf202 | dense | both (comma-separated)")
     ap.add_argument("--dump", default=os.environ.get("KITS_EVAL_DUMP", ""), help="save per-keyframe errors (30 points) to DIR/<name>__<set>.npz")
     ap.add_argument("--zero-ch", default="", help="ablation: zero these raster channels (e.g. 8,9 = no route / destination)")
+    ap.add_argument("--lidar", action="store_true", help="also feed the LiDAR pillar raster (lidar_bev/) as the optional BEV input")
     ap.add_argument("--device", default="cuda")
     a = ap.parse_args()
     sets = ["kf202", "dense"] if a.set == "both" else a.set.split(",")
@@ -89,7 +90,7 @@ def main():
     anchors = anchors_of(a.root, scenes)
     print({k: len(v) for k, v in anchors.items() if k in sets}, "(dense: even 10 Hz frames only)", flush=True)
     ds = BevLaneDataset(a.root, scenes, gt_key="gt", gt_optional=True, with_ego=True, with_boxdet=True, n_cams=M.N_CAM,
-                        hr_root=a.hr_root or None, img_scale=a.img_scale)
+                        hr_root=a.hr_root or None, img_scale=a.img_scale, with_lidarbev=a.lidar)
     byk = {(s, f["frame"]): i for i, (s, f) in enumerate(ds.items)}
     poses = {s: load_poses(a.root, s) for s in scenes}
     K = getattr(M, "EGO_K", 3)
@@ -109,9 +110,12 @@ def main():
                     net._rm_hist = b[-2][None].to(a.device).float(); net._rm_ras = b[-1][None].to(a.device).float()
                     for ch in zero_ch:
                         net._rm_ras[:, ch] = 0
+                lid = None
+                if a.lidar:                                   # the raster is the only [4, 400, 250] item of the sample
+                    lid = next((t[None].to(a.device).float() for t in b if torch.is_tensor(t) and tuple(t.shape) == (4, 400, 250)), None)
                 with torch.no_grad(), torch.autocast("cuda", torch.bfloat16):
                     o = net.forward_geo(b[0][None].to(a.device), b[1][None].to(a.device), b[2][None].to(a.device),
-                                        ego[12].view(1).to(a.device).float())
+                                        ego[12].view(1).to(a.device).float(), lidar=lid)
                 e = o["ego"].float()[0].cpu().numpy()
                 wps = e[:12 * K].reshape(K, 6, 2); k = int(e[12 * K:13 * K].argmax())
                 pos, yaw = poses[s]
