@@ -33,7 +33,7 @@ from bevlane.extract_gt import ROOT, load_scene_light  # noqa: E402
 CAMS = ["CAM_FRONT_NARROW", "CAM_BACK_NARROW"]
 
 cv2.setNumThreads(1)
-OUT = "out/bevlane"
+OUT = os.environ.get("METEOR_BEVLANE_OUT", "out/bevlane")   # output root switchable by env, like the other stages
 DH, DW = 108, 192          # stride-4 grid for 768x432 input
 MAX_DEPTH = 79.0
 SKY_D, EGO_D = 79.5, 2.0

@@ -194,6 +194,24 @@ void draw_path_ribbon(cv::Mat& img, const float* egoSel, const float* K9,
     for (int i = 0; i < 7; ++i) wps[i] = {g_ribbonWps[i][0], g_ribbonWps[i][1]};
   }
   double trav = std::hypot(wps[6][0] - wps[0][0], wps[6][1] - wps[0][1]);
+  {
+    // Near a stop the waypoints collapse onto the ego and their headings are
+    // noise: the ribbon swung sideways and slid off instead of retracting.
+    // Blend toward the ego's forward axis at the same arc length (viz_np.py):
+    // pure prediction >= 6 m travel, straight <= 1 m.
+    double a = std::min(std::max((trav - 1.0) / 5.0, 0.0), 1.0);
+    a = a * a * (3 - 2 * a);
+    if (a < 1.0) {
+      double arc = 0.0;
+      std::vector<std::array<double, 2>> orig = wps;
+      for (size_t i = 0; i < wps.size(); ++i) {
+        if (i > 0)
+          arc += std::hypot(orig[i][0] - orig[i - 1][0], orig[i][1] - orig[i - 1][1]);
+        wps[i] = {a * orig[i][0] + (1 - a) * arc, a * orig[i][1]};
+      }
+      trav = std::hypot(wps[6][0] - wps[0][0], wps[6][1] - wps[0][1]);
+    }
+  }
   double s = std::min(std::max(trav / 3.0, 0.0), 1.0);
   double dispLen = std::max(trav, 8.0 * s * s * (3 - 2 * s));
   if (dispLen < 0.6) return;

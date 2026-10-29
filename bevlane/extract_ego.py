@@ -61,11 +61,33 @@ def process_scene(args):
         t, x, y, yaw = pose_track(ordered, frames, egop)
         if len(t) < 5:
             return f"[skip] {scene}: too few poses"
-        # smoothed speed / accel / yaw-rate on the raw 10 Hz track
+        # Two speed tracks on the raw 10 Hz poses (fixes a future-information leak):
+        #   vs_causal -- backward difference + trailing box, PAST samples only. This feeds v0,
+        #     the model INPUT: np.gradient (central diff) + centered convolve referenced up to
+        #     3 samples (~0.3 s) of FUTURE positions, which deployment's live speed cannot see.
+        #   vs / acc / yr -- the original centrally smoothed track, kept for the SUPERVISION
+        #     targets (accel / steer / brake estimate the true current dynamics; labels may
+        #     use the future, inputs may not -- the same line the guide draws in §7.2).
         dt = np.gradient(t)
+        k = 5                                        # ~0.5 s box smoothing
+        dtb = np.maximum(np.diff(t), 1e-3)           # backward step lengths
+
+        def _bdiff(a):                               # causal derivative: (a[i]-a[i-1])/dt, a[0] repeated
+            d = np.empty_like(a)
+            d[1:] = np.diff(a) / dtb
+            d[0] = d[1]
+            return d
+
+        def _trail(a):                               # trailing box mean over the last k samples
+            c = np.cumsum(np.insert(a, 0, 0.0))
+            idx = np.arange(1, len(a) + 1)
+            lo = np.maximum(idx - k, 0)
+            return (c[idx] - c[lo]) / (idx - lo)
+
+        v_causal = np.hypot(_bdiff(x), _bdiff(y))
+        vs_causal = _trail(v_causal)
         vx, vy = np.gradient(x) / dt, np.gradient(y) / dt
         v = np.hypot(vx, vy)
-        k = 5                                        # ~0.5 s box smoothing
         ker = np.ones(k) / k
         vs = np.convolve(v, ker, "same")
         acc = np.convolve(np.gradient(vs) / dt, ker, "same")
@@ -99,7 +121,7 @@ def process_scene(args):
             # instantaneous signals need no future -> write for EVERY frame
             # (v0 conditions the model at inference; a bogus 0 at scene tails
             # makes it predict "hold" at speed)
-            v0[fj] = vs[i]
+            v0[fj] = vs_causal[i]                # input: past-only (see above)
             ac[fj] = acc[i]
             st[fj] = (np.arctan(WHEELBASE * yr[i] / vs[i])
                       if vs[i] > V_MIN_STEER else 0.0)
@@ -125,11 +147,20 @@ def process_scene(args):
                 continue
             i2 = pose_idx[ri2]
             gp[fj2] = (x[i2], y[i2], yaw[i2])
-        np.savez_compressed(os.path.join(out_dir, "ego_motion.npz"),
+        v0c = np.zeros(F, np.float32)            # audit copy of the old centrally smoothed speed
+        for fr3 in man["frames"]:
+            fj3 = fr3["frame"]; s3 = strided[fj3]; ri3 = tok2raw.get(s3["token"])
+            if ri3 is not None and ri3 in pose_idx:
+                v0c[fj3] = vs[pose_idx[ri3]]
+        # METEOR_EGO_OUT_NAME (2026-10-06): write to a side file (e.g. ego_motion_tfix.npz) without touching the
+        # manifest, so a regeneration can be validated and swapped in while a training round reads the originals.
+        _oname = os.environ.get("METEOR_EGO_OUT_NAME", "ego_motion.npz")
+        np.savez_compressed(os.path.join(out_dir, _oname),
                             wp=wp, v0=v0, acc=ac, steer=st, brake=br, valid=vd,
-                            pose=gp)
-        man["ego_motion"] = "ego_motion.npz"
-        json.dump(man, open(mf, "w"))
+                            pose=gp, v0_central=v0c)
+        if _oname == "ego_motion.npz":
+            man["ego_motion"] = "ego_motion.npz"
+            json.dump(man, open(mf, "w"))
         return f"[ok] {scene} valid={int(vd.sum())}/{F}"
     except Exception as e:
         return f"[fail] {scene}: {e}"

@@ -11,6 +11,11 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 
 def load_full(ckpt, device="cuda", mv="v52", verbose=True):
+    _peek = torch.load(ckpt, map_location="cpu", weights_only=False)
+    if isinstance(_peek, dict) and _peek.get("mite"):     # METEORite line: its own strict loader
+        from bevlane.meteorite import load_mite_eval
+        return load_mite_eval(ckpt, device=device, verbose=verbose)
+    del _peek
     from deploy.export_onnx import build
     from bevlane.model import enable_kinematic_anchor
     net = build(ckpt, mv=mv)

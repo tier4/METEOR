@@ -72,3 +72,4 @@ is complete. To try a single scene, point `--root` at it directly, e.g. `--root 
 | `METEOR_CUDAGRAPH` | 0 | run the engine through a CUDA Graph (used on Orin) |
 | `METEOR_LIDAR` | 0 | feed `lidar_bev/` to a LiDAR-input engine |
 | `METEOR_GPU_NAME` | (auto) | device name shown in the title bar |
+| `METEOR_VLA_JSONL` | (none) | overlay a per-frame JSONL of an external reasoner (trajectory `wp_reg`, `json.scene/hazards/rationale/command`) as a second path and a text strip (experimental) |

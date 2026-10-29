@@ -34,6 +34,11 @@ from bevlane.extract_gt import CAMS, ROOT, load_scene_light  # noqa: E402
 cv2.setNumThreads(1)
 OUT = os.environ.get("METEOR_BEVLANE_OUT", "out/bevlane")
 DH, DW = 108, 192          # stride-4 grid for 768x432 input
+# Finer depth targets: --grid H,W changes the grid (e.g. 180,320 = stride 4 at 720p, 360,640 = stride 2) and
+# --out-dir/--key save under another name (defaults stay depth_gt4 / depth4). K is scaled from the manifest
+# image size (img_hw, default 432x768) to the grid.
+OUT_DIR, OUT_KEY = "depth_gt4", "depth4"
+DENSIFY_MAX_SRC = int(os.environ.get("DEPTH_DENSIFY_MAX_SRC", "8000"))   # cap on LiDAR samples for road interpolation (108x192 stays below ~5k, i.e. unchanged)
 MAX_DEPTH = 79.0
 SKY_D, EGO_D = 79.5, 2.0
 
@@ -91,18 +96,56 @@ def ground_plane_depth(K4, T_ego_cam):
     return g.reshape(DH, DW).astype(np.float32)
 
 
+def _rle_sample(rle, hw_full, idx_cm):
+    """COCO RLE (column-major, compressed string) -> bool at the sampled full-res pixels idx_cm (column-major linear index).
+    Avoids decoding at full (4K) resolution: only the grid sample points are tested, by binary search over the
+    run boundaries (about 100x faster per camera)."""
+    cnt = np.asarray(_rle_counts(rle), dtype=np.int64)
+    cum = np.cumsum(cnt)                       # run i covers [cum[i-1], cum[i]); even i = background, odd i = foreground
+    k = np.searchsorted(cum, idx_cm, side="right")
+    return (k % 2) == 1
+
+
+def _rle_counts(rle):
+    """Decode the compressed LEB128-style COCO counts string to a list of run lengths (same scheme as pycocotools rleFrString)."""
+    s = rle["counts"]
+    if isinstance(s, (list, tuple)):
+        return list(s)
+    if isinstance(s, str):
+        s = s.encode()
+    out, i, n = [], 0, len(s)
+    while i < n:
+        x, k, more = 0, 0, True
+        while more:
+            c = s[i] - 48; i += 1
+            x |= (c & 0x1F) << (5 * k)
+            more = bool(c & 0x20); k += 1
+            if not more and (c & 0x10):
+                x |= -1 << (5 * k)
+        if len(out) > 2:
+            x += out[-2]
+        out.append(x)
+    return out
+
+
 def seg_map_small(anns, hw_full):
     """Segment-id map at (DH, DW); returns (seg int32, sky, ego, ground).
 
     Segments of road + road-painting categories are merged into one id so the
-    interpolation treats them as a single surface.
+    interpolation treats them as a single surface. Masks are not expanded to full resolution: only the
+    (DH, DW) nearest-neighbour sample points (the same points as cv2.resize INTER_NEAREST) are read from the RLE.
     """
-    seg = np.zeros(hw_full, np.int32)
+    H, W = hw_full
+    vs = np.minimum((np.arange(DH) * (H / DH)).astype(np.int64), H - 1)     # INTER_NEAREST: floor(y * H/DH)
+    us = np.minimum((np.arange(DW) * (W / DW)).astype(np.int64), W - 1)
+    V, U = np.meshgrid(vs, us, indexing="ij")
+    idx_cm = (U * H + V).reshape(-1)                                          # column-major linear index
+    small = np.zeros((DH, DW), np.int32)
     sky_ids, ego_ids, gnd_ids, rp_ids = set(), set(), set(), set()
     for i, (cname, m) in enumerate(anns, start=1):
         rle = {"size": m["size"], "counts": base64.b64decode(m["counts"])}
-        dec = cocomask.decode(rle)
-        seg[dec.astype(bool)] = i
+        inside = _rle_sample(rle, (H, W), idx_cm).reshape(DH, DW)
+        small[inside] = i
         if cname == "sky":
             sky_ids.add(i)
         elif cname == "ego_vehicle":
@@ -111,7 +154,6 @@ def seg_map_small(anns, hw_full):
             gnd_ids.add(i)
         if cname in ROADPAINT:
             rp_ids.add(i)
-    small = cv2.resize(seg, (DW, DH), interpolation=cv2.INTER_NEAREST)
     if rp_ids:
         small[np.isin(small, list(rp_ids))] = ROAD_MERGED_ID
     sky = np.isin(small, list(sky_ids)) if sky_ids else np.zeros_like(small, bool)
@@ -133,8 +175,11 @@ def densify(sparse, seg, sky, ego, gnd=None, gpl=None):
             src_m = (d > 0) & gnd
             tgt_m = invalid & gnd
             if src_m.sum() >= 16 and tgt_m.any():
+                sy, sx, sv = yy[src_m], xx[src_m], d[src_m]
+                if len(sv) > DENSIFY_MAX_SRC:          # speed: fine grids give tens of thousands of road samples -> subsample evenly to keep Delaunay cheap
+                    k = int(np.ceil(len(sv) / DENSIFY_MAX_SRC)); sy, sx, sv = sy[::k], sx[::k], sv[::k]
                 vals = griddata(
-                    np.stack([yy[src_m], xx[src_m]], 1), d[src_m],
+                    np.stack([sy, sx], 1), sv,
                     np.stack([yy[tgt_m], xx[tgt_m]], 1), method="linear")
                 out = d[tgt_m]
                 ok = np.isfinite(vals)
@@ -184,19 +229,22 @@ def process_scene(args):
         anns_by_sd = load_all_anns(sdir)
 
         cams = []
+        ih, iw = man.get("img_hw", (432, 768))
+        S = np.diag([DW / float(iw), DH / float(ih), 1.0])      # image-K -> grid-K (x and y scaled separately)
         for ch in CAMS:
             K = np.array(man["cams"][ch]["K"])
             T_ego_cam = np.array(man["cams"][ch]["T_ego_cam"])
             T_cam_ego = np.linalg.inv(T_ego_cam)
-            gpl = ground_plane_depth(K / 4.0, T_ego_cam)
-            cams.append((K / 4.0, T_cam_ego, gpl))
+            Kg = S @ K
+            gpl = ground_plane_depth(Kg, T_ego_cam)
+            cams.append((Kg, T_cam_ego, gpl))
 
-        os.makedirs(os.path.join(out_dir, "depth_gt4"), exist_ok=True)
+        os.makedirs(os.path.join(out_dir, OUT_DIR), exist_ok=True)
         for fr in man["frames"]:
             fi = fr["frame"]
-            path = os.path.join(out_dir, f"depth_gt4/{fi:04d}.npz")
+            path = os.path.join(out_dir, f"{OUT_DIR}/{fi:04d}.npz")
             if os.path.exists(path):
-                fr["depth4"] = f"depth_gt4/{fi:04d}.npz"
+                fr[OUT_KEY] = f"{OUT_DIR}/{fi:04d}.npz"
                 continue
             s = strided[fi]
             frame = frames[s["token"]]
@@ -216,9 +264,11 @@ def process_scene(args):
                 v = (K4[1, 1] * pc[m, 1] / z[m] + K4[1, 2]).astype(np.int32)
                 zm = z[m].astype(np.float32)
                 ok = (u >= 0) & (u < DW) & (v >= 0) & (v < DH)
-                d = np.full(DH * DW, np.inf, np.float32)
-                np.minimum.at(d, v[ok] * DW + u[ok], zm[ok])
-                d[np.isinf(d)] = 0.0
+                # speed: instead of np.minimum.at (~1 s), sort and take the per-cell minimum z (identical result)
+                idx = v[ok] * DW + u[ok]; zz = zm[ok]
+                o = np.lexsort((zz, idx)); idx_s, z_s = idx[o], zz[o]
+                first = np.ones(len(idx_s), bool); first[1:] = idx_s[1:] != idx_s[:-1]
+                d = np.zeros(DH * DW, np.float32); d[idx_s[first]] = z_s[first]
                 d = d.reshape(DH, DW)
                 sd = frame.get(ch)
                 anns = anns_by_sd.get(sd["token"], []) if sd else []
@@ -228,7 +278,7 @@ def process_scene(args):
                     d = densify(d, seg, sky, ego, gnd, gpl)
                 depth[ci] = d
             np.savez_compressed(path, depth=depth.astype(np.float16))
-            fr["depth4"] = f"depth_gt4/{fi:04d}.npz"
+            fr[OUT_KEY] = f"{OUT_DIR}/{fi:04d}.npz"
         json.dump(man, open(os.path.join(out_dir, "manifest.json"), "w"))
         return f"[ok] {scene}"
     except Exception as e:
@@ -240,7 +290,16 @@ def main():
     ap.add_argument("--stride", type=int, default=2)
     ap.add_argument("--workers", type=int, default=24)
     ap.add_argument("--scenes", default=None)
+    ap.add_argument("--grid", default="", help="grid H,W (e.g. 180,320 / 360,640); default 108,192")
+    ap.add_argument("--out-dir", default="", help="output directory name (default depth_gt4; e.g. depth_gt_hr)")
+    ap.add_argument("--key", default="", help="manifest key (default depth4; e.g. depth_hr)")
     args = ap.parse_args()
+    global DH, DW, OUT_DIR, OUT_KEY
+    if args.grid:
+        DH, DW = [int(v) for v in args.grid.split(",")]
+    if args.out_dir: OUT_DIR = args.out_dir
+    if args.key: OUT_KEY = args.key
+    print(f"grid {DH}x{DW} -> {OUT_DIR}/ (manifest key {OUT_KEY})", flush=True)
     if args.scenes:
         scenes = (open(args.scenes).read().split() if os.path.isfile(args.scenes)
                   else args.scenes.split(","))

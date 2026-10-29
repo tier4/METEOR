@@ -12,6 +12,8 @@ doubles as the reference for how to feed the graph:
 The engine variants with the LiDAR input additionally take
     lidar_bev  float32 [1, 4, 400, 250]     pillar raster (scene/lidar_bev/NNNN.npz)
     lidar_flag float32 [1]                  1.0 when lidar_bev is real, 0.0 otherwise
+Graphs exported after 2026-10-05 also take the route command of the planner
+    intent     float32 [1, 3]               Driving Command one-hot [straight, left, right]; zeros = no command
 
 Usage:
     python3 hf/onnx_smoke_test.py --onnx meteor_v157c3Z.onnx --root data/valday [--frame 0]
@@ -78,6 +80,12 @@ def main():
                next(i for i in s.get_inputs() if i.name == "lidar_bev").shape]
         feed["lidar_bev"] = np.zeros(shp, np.float32)
         feed["lidar_flag"] = np.array([0.0], np.float32)
+    for i in s.get_inputs():
+        # any optional input this test does not model (e.g. the v203 history
+        # five) is fed zeros -- by construction that is the disabled state
+        if i.name not in feed:
+            shp = [d if isinstance(d, int) else 1 for d in i.shape]
+            feed[i.name] = np.zeros(shp, np.float32)
     outs = s.run(None, feed)
     print(f"scene {name} frame {a.frame}  v0={float(feed['v0'][0]):.2f} m/s")
     ok = True

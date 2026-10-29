@@ -96,7 +96,7 @@ except Exception:                        # pragma: no cover
     except Exception:
         _TRT = False
 
-INPUTS = ["imgs", "K", "T_cam_ego", "v0", "hist_bev", "hist_theta", "lidar_bev", "lidar_flag"]
+INPUTS = ["imgs", "K", "T_cam_ego", "v0", "hist_bev", "hist_theta", "lidar_bev", "lidar_flag", "intent"]
 _ZERO_HIST = os.environ.get("METEOR_ZERO_HIST", "0") == "1"
 if _ZERO_HIST:
     print("[rt] METEOR_ZERO_HIST=1: history slots forced to zero (matches training condition)", flush=True)
@@ -104,7 +104,7 @@ OUTPUTS = ["lane", "depth", "seg2d", "hm", "reg",
            "hm2d_s0", "hm2d_s1", "hm2d_s2",
            "reg2d_s0", "reg2d_s1", "reg2d_s2",
            "ego", "occ", "traj", "stationary", "tl", "risk", "flow",
-           "lg_pts", "lg_meta", "lg_adj", "unk", "lane_logit", "depth_mean", "raw_bev"]
+           "lg_pts", "lg_meta", "lg_adj", "unk", "lane_logit", "depth_mean", "raw_bev", "bev_tok"]
 HIST_OFFS = (2, 6, 14)          # slots at t-0.4 / -1.2 / -2.8 s (5 Hz frames)
 MEAN = np.array([0.485, 0.456, 0.406], np.float32)
 STD = np.array([0.229, 0.224, 0.225], np.float32)
@@ -316,7 +316,8 @@ class MeteorRT:
         self._ring_t = [-1] * self._ring_n
         self._t = 0
 
-    def infer(self, imgs, K, T_cam_ego, v0, pose=None, out_slot=0, lidar_bev=None):
+    def infer(self, imgs, K, T_cam_ego, v0, pose=None, out_slot=0, lidar_bev=None,
+              hist=None, intent=None):
         """imgs [1,8,3,432,768] f32 (preprocess_images), K [1,8,3,3],
         T_cam_ego [1,8,4,4], v0 scalar, pose (x, y, yaw) or None.
 
@@ -379,6 +380,18 @@ class MeteorRT:
                                  else np.zeros(self.shapes["lidar_bev"], np.float32))
         if "lidar_flag" in self.shapes:         # host-side flag (avoids the 14.8 ms in-graph reduction)
             feed["lidar_flag"] = np.array([1.0 if lidar_bev is not None else 0.0], np.float32)
+        if "intent" in self.shapes:             # Driving Command one-hot [straight,left,right]; None = no command (zeros)
+            feed["intent"] = (np.asarray(intent, np.float32).reshape(1, 3) if intent is not None
+                              else np.zeros((1, 3), np.float32))
+        if hist is not None and "track_hist" in self.shapes:
+            # v203: object/ego history from TrackMemory.pack() (schema h1,
+            # unbatched -- the ravel copy below makes the [1,...] batch moot).
+            # Engines without the inputs skip this; a v203 engine WITHOUT hist
+            # keeps its zero-initialised buffers, and history_enable=0 is
+            # bit-identical to the ungrafted graph by construction.
+            for nm_ in ("track_hist", "track_mask", "ego_hist", "ego_mask",
+                        "history_enable"):
+                feed[nm_] = hist[nm_]
         for nm, v in feed.items():
             # Zero-copy input (2026-09-05): if imgs is one of the slots from
             # pinned_input_slots(), skip the CPU copy (measured 4.6 ms) and H2D

@@ -18,9 +18,12 @@ old default once, for this process.
 Verified on both: torch 2.1.1+cu121 (workstation) and torch 2.11.0+cu128 (training server), where
 the same checkpoint reproduces ADE 0.659 / ADEc 0.656 to three decimals.
 """
-import torch as _torch
+try:
+    import torch as _torch
+except ImportError:                       # torch-free host (Orin runtime uses
+    _torch = None                         # only history_schema from here)
 
-if not getattr(_torch.load, "_meteor_compat", False):
+if _torch is not None and not getattr(_torch.load, "_meteor_compat", False):
     _orig_load = _torch.load
 
     def _load(*a, **k):

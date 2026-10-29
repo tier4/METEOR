@@ -3,7 +3,8 @@
 
 Wraps the training model into a deployment graph:
   inputs : imgs [1,8,3,432,768], K [1,8,3,3], T_cam_ego [1,8,4,4], v0 [1],
-           hist_bev [1,3,96,800,500], hist_theta [1,3,2,3]
+           hist_bev [1,3,96,800,500], hist_theta [1,3,2,3],
+           intent [1,3] Driving Command one-hot [straight, left, right] (zeros = no command; 2026-10-05, --no-intent drops it)
   outputs: the 16 task tensors + raw_bev [1,96,800,500]
 
 raw_bev is fed back as the next frame's newest history slot (streaming
@@ -18,6 +19,7 @@ import sys
 
 import math
 import torch
+import torch.nn as nn
 import torch.nn.functional as F
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -122,7 +124,7 @@ class MeteorExport(torch.nn.Module):
 
     def __init__(self, net, drop_lg=False, drop=(), uint8_in=False,
                  argmax_out=False, lane_logits=False, no_hist=False,
-                 depth_mean=False):
+                 depth_mean=False, bev_tokens=False, hist_traj=False):
         super().__init__()
         self.net = net
         self.drop_lg = drop_lg
@@ -160,6 +162,16 @@ class MeteorExport(torch.nn.Module):
         self.argmax_out = argmax_out
         self.lane_logits = lane_logits
         self.depth_mean = depth_mean
+        # --bev-tokens: the fused BEV pooled to 25x16 (96 x 400 fp16) as an extra
+        # tail output -- the interface the METEOR-VLA reads (same pooling as the VLA training dump)
+        self.bev_tokens = bev_tokens
+        # --hist-traj (v203 Stage B): the grafted H2 residual head
+        # (net.histtraj, enable_hist_traj) refines ALL K ego candidates in-graph
+        # from 5 extra inputs (track_hist/track_mask/ego_hist/ego_mask/
+        # history_enable). Selection stays on the host, so refining every
+        # candidate keeps the interface unchanged. history_enable=0 zeroes the
+        # residual, so the ego output is bit-identical to the ungrafted graph.
+        self.hist_traj = hist_traj
         # Dropping an output makes the subgraph that only feeds it dead code,
         # which the exporter prunes -- the same mechanism --no-lanegraph uses,
         # and the reason that one is worth 10 ms. This generalises it so the
@@ -172,12 +184,25 @@ class MeteorExport(torch.nn.Module):
         self.register_buffer("base_grid", base.reshape(1, -1, 3))
 
     def forward(self, imgs, K, T_cam_ego, v0, hist_bev=None, hist_theta=None,
-                hist_bev1=None, hist_bev2=None, lidar_bev=None, lidar_flag=None):
+                hist_bev1=None, hist_bev2=None, lidar_bev=None, lidar_flag=None,
+                track_hist=None, track_mask=None, ego_hist=None, ego_mask=None,
+                history_enable=None, hist_intent=None, intent=None):
         net = self.net
         bg = self.base_grid
+        # intent [1,3] (2026-10-05): the Driving Command one-hot [straight, left, right] of the v37+ planner
+        # (zeros = no command, the trained dropout state). Until now the graph was exported WITHOUT it, so the
+        # exported planner could never be steered at a junction: the route command was dropped at conversion.
+        # It is the last positional argument so every older input layout (hist / lidar / hist-traj) is unchanged.
+        if intent is not None and hist_intent is None:
+            hist_intent = intent               # the H2 residual head takes the same route command
+        self._hist_in = ((track_hist, track_mask, ego_hist, ego_mask,
+                          history_enable, v0, hist_intent)
+                         if (self.hist_traj and track_hist is not None) else None)
         # --with-lidar (2026-09-08): optional input lidar_bev [1,4,400,250] is added to the BEV
         # through lidar_stem (same as the model's bev_extra; zero input == camera-only).
         _lb_kw = {"lidar_bev": lidar_bev} if lidar_bev is not None else {}
+        if intent is not None:
+            _lb_kw["intent"] = intent
         if lidar_bev is not None:
             # Orin measurement (2026-09-08): the model's bev_extra broadcasts flag [B,1,1,1] to
             # 800x500x96 before multiplying, costing 14.8 ms in a single Myelin ReplAbsSum node.
@@ -239,6 +264,27 @@ class MeteorExport(torch.nn.Module):
 
     def _finish(self, out, imgs, with_raw=True):
         net = self.net
+        if self._hist_in is not None:
+            # v203b Stage B: history-conditioned residual on every
+            # candidate's 12 waypoints (eager slot 7 = ego [B, 12K + K + 3]).
+            # The encoder runs once; the residual MLP runs per candidate.
+            # hist_intent [B,3] is a REQUIRED input when history is enabled:
+            # the head was trained with the route intent as context, and a
+            # zero intent is out-of-distribution (closed-loop error blows up),
+            # not a no-op. history_enable=0 still zeroes
+            # the whole residual, so the disabled path stays bit-exact.
+            th_, tm_, eh_, em_, hen_, v0_, it_ = self._hist_in
+            hh = net.histtraj
+            ego = out[7]
+            z = hh.enc(th_, tm_, eh_, em_, hen_)
+            it = (it_.to(ego.dtype) if it_ is not None
+                  else torch.zeros(ego.shape[0], 3, dtype=ego.dtype, device=ego.device))
+            k_ = (ego.shape[1] - 3) // 13          # 12K wp + K logits + 3 tail
+            parts = []
+            for k in range(k_):
+                new_wp, _ = hh.res(ego[:, 12 * k:12 * (k + 1)], it, v0_, z, hen_)
+                parts.append(new_wp)
+            out[7] = torch.cat(parts + [ego[:, 12 * k_:]], dim=1)
         _lane_logit = out[0] if self.lane_logits else None
         _depth_mean = None
         if self.depth_mean:
@@ -286,6 +332,8 @@ class MeteorExport(torch.nn.Module):
             tail = tail + (_lane_logit,)
         if _depth_mean is not None:
             tail = tail + (_depth_mean,)          # tail (after lane_logit)
+        if self.bev_tokens:
+            tail = tail + (F.adaptive_avg_pool2d(net._fused_bev, (25, 16)).half(),)   # bev_tok [B,96,25,16]
         return tuple(out) + tail
 
 
@@ -437,6 +485,25 @@ def build(ckpt, mv=None, seg_bias=""):
         from bevlane.model import enable_lane_branch
         enable_lane_branch(net)
         print("[build] lane_branch attached (ckpt carries branch weights)")
+    if "lift_sum_logs" in sd:
+        # L1 lift-sum: dense path only; the frustum/gather kernels and the Orin
+        # lift plugin implement the normalised lift, so this engine is PyTorch-eval only for now.
+        from bevlane.model import enable_lift_sum, lift_sum_heights_from_sd, lift_sum_tau_from_sd, lift_sum_post_from_sd
+        enable_lift_sum(net, 1.0, heights=lift_sum_heights_from_sd(sd), tau=lift_sum_tau_from_sd(sd), post=lift_sum_post_from_sd(sd), verbose=False)
+        print("[build] lift-sum attached (ckpt carries lift_sum_logs)")
+    if any(k.startswith("ctx.0.body.") for k in sd):
+        # ctx-v2 (v209): pre-lift context block in the ckpt
+        from bevlane.model import enable_ctx_v2
+        enable_ctx_v2(net, verbose=False)
+        print("[build] ctx-v2 pre-lift block attached (ckpt carries weights)")
+    if any(".body.0.weight" in k and (k.startswith("det_stem.") or ".out." in k
+                                      or k.startswith("dec.")) for k in sd):
+        # head-v2 (v205b): ckpt carries the _ResCtx context blocks;
+        # rebuild them before loading or the evals measure a different model
+        # (silent failure).
+        from bevlane.model import enable_head_v2
+        enable_head_v2(net, verbose=False)
+        print("[build] head-v2 context blocks attached (ckpt carries _ResCtx weights)")
     # v115 onwards: the ego global average pooling is replaced by a depthwise conv
     # (root fix for the INT8 collapse where the output reused the input's scale).
     # If the ckpt carries those weights, convert to the same form before loading.
@@ -465,6 +532,31 @@ def build(ckpt, mv=None, seg_bias=""):
         from bevlane.model import enable_delta_stat
         enable_delta_stat(net)
         print("[build] detected temporal-delta stat head -> stationary is output from the delta")
+    if any(k.startswith("stop_head.") for k in sd):
+        from bevlane.model import enable_stop_mode
+        enable_stop_mode(net)
+        print("[build] detected stop-mode head (v215) -> stop candidate overrides the modes when it fires")
+    if "vocab.anchors" in sd:
+        from bevlane.model import enable_vocab_planner
+        enable_vocab_planner(net, sd["vocab.anchors"], hidden=int(sd["vocab.cls.weight"].shape[1]))
+        print(f"[build] detected vocabulary planner (K={sd['vocab.anchors'].shape[0]}, v218) -> top-3 anchors are the modes")
+    if "tfplan.anchors" in sd:
+        from bevlane.model import enable_tf_planner
+        _d = int(sd["tfplan.q_emb.weight"].shape[1])
+        _nl = len({k.split(".")[2] for k in sd if k.startswith("tfplan.layers.")})
+        enable_tf_planner(net, sd["tfplan.anchors"], d=_d, layers=_nl)
+        print(f"[build] detected transformer planner (K={sd['tfplan.anchors'].shape[0]}, d={_d}, layers={_nl}, v221)")
+    if "ego_stem.0.weight" in sd and hasattr(net, "ego_stem") \
+            and sd["ego_stem.0.weight"].dim() == 4 \
+            and sd["ego_stem.0.weight"].shape[0] != net.ego_stem[0].out_channels:
+        # v220 enlarged ego head: rebuild at the checkpoint's width (same rule as ckpt_load)
+        from bevlane.model import build_ego_head
+        _mult = sd["ego_stem.0.weight"].shape[0] / 128.0
+        _xb = 1 if any(k.startswith("ego_stem.12.0.") for k in sd) else 0
+        _stem, _mlp = build_ego_head(_mult, _xb)
+        _mlp[-1] = nn.Linear(_mlp[-1].in_features, net.ego_mlp[-1].out_features)
+        net.ego_stem, net.ego_mlp = _stem, _mlp
+        print(f"[build] ego head rebuilt at mult={_mult:g} xblock={_xb} (v220)")
     if any(k.startswith("stat_head2.proj.") for k in sd):
         from bevlane.model import enable_quant_stat_head
         _cap = float((ck.get("args") or {}).get("stat_quant_head") or 8.0)
@@ -492,7 +584,7 @@ def build(ckpt, mv=None, seg_bias=""):
         # Decision-boundary calibration (probe_seg_bias confirmed fit/val splits agree).
         # Subtracting a constant from the logits = subtracting from the final 1x1 bias. Zero runtime cost.
         with torch.no_grad():
-            _b = net.dec.out[3].bias
+            _b = net.dec.out[-1].bias      # classifier 1x1 (head-v2 inserts _ResCtx before it; was out[3])
             for _part in seg_bias.split(","):
                 _c, _v = _part.split(":")
                 _b[int(_c)] -= float(_v)
@@ -537,6 +629,8 @@ def _out_names(args):
         names.append("lane_logit")
     if getattr(args, "depth_mean", False):
         names.append("depth_mean")
+    if getattr(args, "bev_tokens", False):
+        names.append("bev_tok")
     return names
 
 
@@ -597,8 +691,17 @@ def main():
                          "(indexing just becomes input splitting)")
     ap.add_argument("--with-lidar", action="store_true",
                     help="include the optional input lidar_bev [1,4,400,250] fp32 (no-hist only, 2026-09-08)")
+    ap.add_argument("--bev-tokens", action="store_true",
+                    help="append bev_tok [B,96,25,16] fp16 (fused BEV pooled to 25x16) -- the METEOR-VLA input")
     ap.add_argument("--depth-mean", action="store_true",
                     help="append the expected depth depth_mean [B,N,h,w] fp16 to the tail outputs (for unk2d, 2026-09-07)")
+    ap.add_argument("--hist-traj", default="",
+                    help="v203 Stage B: graft the H2 trajectory-residual head "
+                         "(enable_hist_traj ckpt) and export it in-graph with 5 "
+                         "extra inputs (track_hist [1,64,4,16], track_mask "
+                         "[1,64,4], ego_hist [1,4,6], ego_mask [1,4], "
+                         "history_enable [1,1]). history_enable=0 keeps every "
+                         "output bit-identical to the ungrafted graph.")
     ap.add_argument("--no-hist", action="store_true",
                     help="export without history inputs (history forced to zero = training condition). Equivalent graph "
                          "using only the first 96ch of the tgate/tfuse3 weights. The 3 grid_samples,"
@@ -606,12 +709,18 @@ def main():
     ap.add_argument("--gather-lift", action="store_true",
                     help="export the lift in gather form (needs --frustum). "
                          "Aimed at Orin, where ScatterND atomics dominate.")
+    ap.add_argument("--no-intent", action="store_true",
+                    help="export WITHOUT the intent [1,3] Driving Command input (pre-2026-10-05 interface; the "
+                         "planner then always runs in the no-command state)")
     ap.add_argument("--n-cams", type=int, default=8,
                     help="cameras in the exported graph. CAMS ends with "
                          "CAM_BACK_NARROW, so 7 drops exactly that one.")
     args = ap.parse_args()
 
     net = build(args.ckpt, mv=args.model, seg_bias=args.seg_bias)
+    if args.hist_traj:
+        from bevlane.model import enable_hist_traj
+        enable_hist_traj(net, args.hist_traj)
     if args.quant_stat_head > 0:
         from bevlane.model import enable_quant_stat_head
         enable_quant_stat_head(net, args.quant_stat_head)
@@ -623,7 +732,9 @@ def main():
                              argmax_out=args.argmax_out,
                              lane_logits=args.lane_logits,
                              depth_mean=args.depth_mean,
-                             no_hist=args.no_hist)).eval()
+                             no_hist=args.no_hist,
+                             bev_tokens=args.bev_tokens,
+                             hist_traj=bool(args.hist_traj))).eval()
     # The network is camera-count agnostic (verified: a 7-camera forward runs
     # and emits depth for 7), so dropping CAM_BACK_NARROW is purely an
     # input-side change worth 1/8 of the backbone and the depth tower.
@@ -667,9 +778,52 @@ def main():
         ex = (imgs, K, Tc, v0, _h0, th, _h0.clone(), _h0.clone())
         _in_names = ["imgs", "K", "T_cam_ego", "v0", "hist_bev0",
                      "hist_theta", "hist_bev1", "hist_bev2"]
+    if args.hist_traj:
+        # 5 extra trailing inputs (bevlane/history_schema shapes). The forward
+        # takes them positionally after lidar_flag, so pad the middle with
+        # Nones exactly like the --with-lidar path does.
+        from bevlane.history_schema import N_OBJ, N_T, N_F, EGO_T, EGO_F
+        _hin = (torch.zeros(1, N_OBJ, N_T, N_F), torch.zeros(1, N_OBJ, N_T),
+                torch.zeros(1, EGO_T, EGO_F), torch.zeros(1, EGO_T),
+                torch.zeros(1, 1), torch.zeros(1, 3))
+        assert not args.split_hist, "--hist-traj + --split-hist not wired"
+        _pad = len(ex)                      # tensors already present
+        ex = tuple(ex) + (None,) * (10 - _pad) + _hin
+        _in_names = _in_names + ["track_hist", "track_mask", "ego_hist",
+                                 "ego_mask", "history_enable", "hist_intent"]
+    if not args.no_intent:
+        # intent [1,3] is the LAST forward argument (index 16): pad whatever layout was built above with Nones.
+        # Needed in every variant (no-hist, LiDAR, split-hist, hist-traj) -- the planner is the same in all of them.
+        import inspect as _ins2
+        if "intent" not in _ins2.signature(net.forward).parameters:
+            raise SystemExit(f"--model {args.model}: this model generation has no intent input; export with --no-intent")
+        _N_ARGS = 16
+        assert len(ex) <= _N_ARGS, len(ex)
+        ex = tuple(ex) + (None,) * (_N_ARGS - len(ex)) + (torch.zeros(1, 3),)
+        _in_names = _in_names + ["intent"]
 
     with torch.no_grad():
         ref = dep(*ex)
+        if not args.no_intent:
+            # the exported graph must actually react to the command. ref holds hm2d/reg2d as tuples, so flatten
+            # it to line up with _out_names. ego = [12K waypoints | K mode logits | 3 tail]: report the waypoint
+            # shift in metres and the logit shift separately (the logits carry the trained MODE_BOOST, so they move
+            # by design; the waypoints are what the planner emits). All zeros = the intent input is dead weight.
+            _names = _out_names(args)
+            if "ego" in _names:
+                def _flat(r):
+                    f = []
+                    for x in r:
+                        f.extend(x if isinstance(x, tuple) else [x])
+                    return f
+                _e0 = _flat(ref)[_names.index("ego")].float()
+                _K = (_e0.shape[1] - 3) // 13
+                for _k, _nm in enumerate(["straight", "left", "right"]):
+                    _it = torch.zeros(1, 3); _it[0, _k] = 1.0
+                    _ek = _flat(dep(*(ex[:-1] + (_it,))))[_names.index("ego")].float()
+                    _d = (_ek - _e0).abs()
+                    print(f"[intent] {_nm:8s} vs no-command: waypoints max|diff| {float(_d[:, :12 * _K].max()):.3f} m, "
+                          f"mode logits max|diff| {float(_d[:, 12 * _K:13 * _K].max()):.2f}")
         with _PatchPool():
             alt = dep(*ex)
         dmax = max(float((x if not isinstance(x, tuple) else x[0]).float()
@@ -697,13 +851,21 @@ def main():
         import numpy as np
         import onnxruntime as ort
         s = ort.InferenceSession(args.out, providers=["CPUExecutionProvider"])
-        outs = s.run(None, {"imgs": imgs.numpy(), "K": K.numpy(),
-                            "T_cam_ego": Tc.numpy(), "v0": v0.numpy(),
-                            "hist_bev": pb.numpy(),
-                            "hist_theta": th.numpy()})
-        for nm, o, r in zip(OUT_NAMES, outs, ref):
-            d = float(np.abs(o - r.numpy()).max())
+        feed = {nm: t.numpy() for nm, t in zip(_in_names, [t for t in ex if t is not None])}
+        outs = s.run(None, feed)
+        _ref = []
+        for x in ref:                      # hm2d / reg2d are tuples of 3 scales in the eager output
+            _ref.extend(x if isinstance(x, tuple) else [x])
+        for nm, o, r in zip(_out_names(args), outs, _ref):
+            d = float(np.abs(o.astype(np.float32) - r.float().numpy()).max())
             print(f"  {nm:10s} max|diff|={d:.2e} {'OK' if d < 2e-3 else 'FAIL'}")
+        if not args.no_intent and "ego" in _out_names(args):
+            _ei = _out_names(args).index("ego")
+            for _k, _nm in enumerate(["straight", "left", "right"]):
+                f2 = dict(feed); f2["intent"] = np.zeros((1, 3), np.float32); f2["intent"][0, _k] = 1.0
+                _d = np.abs(s.run(None, f2)[_ei] - outs[_ei]); _K = (_d.shape[1] - 3) // 13
+                print(f"  [intent-onnx] {_nm:8s} vs no-command: waypoints max|diff| {_d[:, :12 * _K].max():.3f} m, "
+                      f"mode logits max|diff| {_d[:, 12 * _K:13 * _K].max():.2f}")
 
     if args.fp16:
         import onnx

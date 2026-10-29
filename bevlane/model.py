@@ -7,6 +7,12 @@ cameras, and decoded by a small BEV U-Net into semantic logits.
 import math
 
 import os
+
+# Agent-forecast loss weight of oncoming vehicles (GT yaw within 45 deg of facing the ego, cars only).
+# 2.5 = the VRU emphasis. On some datasets oncoming cars are only 1-2 % of the forecast targets and the
+# head learns an "everything flows forward" prior (most oncoming forecasts reversed vs the measured
+# motion) -> raise with METEOR_TRAJ_ONCOMING_W (e.g. 8).
+TRAJ_ONCOMING_W = float(os.environ.get("METEOR_TRAJ_ONCOMING_W", 2.5))
 import torch
 import torch.nn as nn
 
@@ -34,6 +40,16 @@ BEV_HALF = 30.0
 BEV_XF = float(os.environ.get("METEOR_BEV_XF", "80.0"))   # forward extent [m]
 BEV_XR = float(os.environ.get("METEOR_BEV_XR", "80.0"))   # rear extent [m]
 BEV_YH = float(os.environ.get("METEOR_BEV_YH", "50.0"))
+_YAW_BACK_W = float(os.environ.get("METEOR_YAW_BACK_W", "0"))
+_HM_RAD_MAX = float(os.environ.get("METEOR_HM_RAD_MAX", "4.0"))   # upper bound of the heatmap Gaussian radius (cells)
+# _YAW_BACK_W: box yaw extra weight for boxes facing ego.
+# METEOR_YAW2: box yaw regressed as (sin 2θ, cos 2θ), i.e. the axis only (π-periodic), as METEORite --yaw2
+# does. With auto-labelled data the front/back half of the yaw label can be largely wrong for oncoming cars
+# and flip frame to frame on parked cars; the π-periodic target makes those label errors vanish, reduces
+# axis jitter, and removes the "every car faces the flow" conditioning of the
+# trajectory head (it reads the detached sin/cos channels). decode_boxes returns θ' = atan2 / 2 in [-90°, 90°);
+# the direction of travel then comes from the agent forecast / tracking, not the box. Graph unchanged.
+_YAW2 = int(os.environ.get("METEOR_YAW2", "0"))
 # BEV feature channel width: the ctx conv's out_channels and therefore the
 # width of the post-lift BEV feature, the temporal history slots and every
 # BEV-side head input. Overridable so the R6 "ctx 96 -> 64" latency axis can
@@ -662,7 +678,8 @@ class DepthSegIPMNet(nn.Module):
                              ignore_index=255, weight=w, reduction="none")
         # side cameras (FL/FR/BL/BR = 1,2,4,5) x1.6: their precision lags
         camw = torch.ones(N, device=seg2d.device)
-        camw[[1, 2, 4, 5]] = 1.6
+        if N > 5:                        # side-camera reweighting; skip for Nano (n_cams=1)
+            camw[[1, 2, 4, 5]] = 1.6
         camw = camw.repeat(B).view(-1, 1, 1)
         valid = (seg_gt.flatten(0, 1) != 255).float()
         return (ce * camw).sum() / (valid * camw).sum().clamp(min=1)
@@ -698,7 +715,8 @@ class DepthSegIPMNetV14(DepthSegIPMNetS4):
             ConvBlock(256, 192), ConvBlock(192, 128),
             nn.Conv2d(128, self.D, 1))
 
-    def depth_loss(self, dlog, depth_gt, ent_w=0.0, far_w=0.0, band_bal=0.0):
+    def depth_loss(self, dlog, depth_gt, ent_w=0.0, far_w=0.0, band_bal=0.0,
+                   obj_mask=None, obj_w=1.0):
         """Depth CE + sharpening terms (ent_w / far_w added 2026-08-21).
 
         Measured: in the 30-60 m band the depth distribution's max prob is 0.07-0.085 and
@@ -766,6 +784,14 @@ class DepthSegIPMNetV14(DepthSegIPMNetS4):
             _mean = (_cnt * _inv).sum() / valid.sum().clamp(min=1).float()
             _inv = _inv / _mean.clamp(min=1e-6)
             wpx = wpx * _inv[_bi]
+        if obj_mask is not None and obj_w != 1.0:
+            # vehicle/VRU pixels: with the height-hypothesis lift only
+            # object-pixel depth decides where 3D boxes form; they are a few % of
+            # the valid pixels at 20-60 m, so the plain mean spends the loss on road.
+            _om = obj_mask.flatten(0, 1).to(wpx.dtype)
+            if _om.shape[-2:] != wpx.shape[-2:]:
+                _om = F.interpolate(_om[:, None], wpx.shape[-2:], mode="nearest")[:, 0]
+            wpx = wpx * (1.0 + (obj_w - 1.0) * _om)
         ce = (ce_px * wpx)[valid].mean() if valid.any() \
             else logits.sum() * 0.0
         # L1 on expected depth (metres) -> metric accuracy, sharper distributions
@@ -1057,6 +1083,8 @@ class DepthSegIPMNetV16(DepthSegIPMNetV14):
         so the index cache would thrash, and the dense path is already the
         gradient-tested one.
         """
+        if getattr(self, "lift_sum", False):
+            return self._project_bev_sum(dprob, ctx, K, T_cam_ego, B, N, H, W)
         if getattr(self, "frustum_lift", False) and not self.training:
             if getattr(self, "gather_lift", False):
                 return self._project_bev_frustum_gather(
@@ -1092,6 +1120,72 @@ class DepthSegIPMNetV16(DepthSegIPMNetV14):
         num = (ctx_s.view(B, N, Cc, G2) * wgt.view(B, N, 1, G2)).sum(1)
         den = wgt.view(B, N, 1, G2).sum(1).clamp(min=1e-4)
         return (num / den).view(B, Cc, BEV_H, BEV_W)
+
+    def _project_bev_sum(self, dprob, ctx, K, T_cam_ego, B, N, H, W):
+        """lift-sum (enable_lift_sum): bev = s * sum_cam ctx * p(bin(z)).
+
+        The dense path divides by sum_cam w, so wherever a single camera sees
+        the cell w cancels and the cell receives the raw ctx of the pixel it
+        projects to (ground-plane IPM): replacing dprob by a uniform or by the
+        LiDAR depth barely changed 20-40 m vehicle recall
+        (out/probe_depth_inert.py). Without the division the predicted depth
+        decides which cells along a ray receive the feature, as in LSS.
+        The bin is looked up by camera-z depth, the convention of the depth GT
+        (extract_depth_dense.py), not by ray length.
+        Dense path in train and eval alike: the frustum/gather kernels and the
+        Orin lift plugin implement the normalised form only.
+        """
+        Cc = ctx.shape[1]
+        G2 = self.bev_pts.shape[0]
+        Kf = K.reshape(B * N, 3, 3)
+        num = 0
+        den = 0
+        # L2 (enable_lift_sum heights=...): each cell is also projected at z = h
+        # above the ground plane; a car-body pixel then lands on its own cell,
+        # where its predicted depth matches, instead of streaking behind it.
+        for h in getattr(self, "lift_heights", (0.0,)):
+            pts = self.bev_pts
+            if h:
+                pts = pts.clone()
+                pts[:, 2] = h
+            pc = torch.matmul(T_cam_ego.reshape(B * N, 4, 4),
+                              pts.t().unsqueeze(0).expand(B * N, 4, G2))
+            x, y, z = pc[:, 0], pc[:, 1], pc[:, 2]
+            zc = z.clamp(min=0.5)
+            u = Kf[:, 0, 0].unsqueeze(-1) * x / zc + Kf[:, 0, 2].unsqueeze(-1)
+            v = Kf[:, 1, 1].unsqueeze(-1) * y / zc + Kf[:, 1, 2].unsqueeze(-1)
+            valid = ((z > 0.5) & (u >= 0) & (u < W) & (v >= 0) & (v < H)
+                     & (torch.sqrt(x * x + y * y + z * z) < 90.0))
+            gu = (u / (W - 1) * 2 - 1).clamp(-2, 2)
+            gv = (v / (H - 1) * 2 - 1).clamp(-2, 2)
+            grid = torch.stack([gu, gv], -1).unsqueeze(2)
+            ctx_s = F.grid_sample(ctx, grid, align_corners=False).squeeze(-1)
+            prob_s = F.grid_sample(dprob, grid, align_corners=False).squeeze(-1)
+            b = self._d2b(zc).clamp(0, self.D - 1 - 1e-4)
+            b0 = b.floor().long()
+            fr = (b - b0.float()).unsqueeze(1)
+            w0 = torch.gather(prob_s, 1, b0.unsqueeze(1))
+            w1 = torch.gather(prob_s, 1, (b0 + 1).clamp(max=self.D - 1).unsqueeze(1))
+            wgt = (w0 * (1 - fr) + w1 * fr) * valid.unsqueeze(1).to(prob_s.dtype)
+            num = num + (ctx_s.view(B, N, Cc, G2) * wgt.view(B, N, 1, G2)).sum(1)
+            den = den + wgt.view(B, N, 1, G2).sum(1)
+        tau = getattr(self, "lift_tau", 0.0)
+        if tau > 0:
+            # L1c: the unnormalised sum is heavy-tailed (bn-guard resets 6-9x vs
+            # 1-2x in the control, collapse by 4 ep); dividing by sum w + tau
+            # keeps |bev| <= |ctx| while low-probability cells still fade out.
+            num = num / (den + tau)
+        bev = (num * self.lift_sum_logs.exp().to(num.dtype)).view(B, Cc, BEV_H, BEV_W)
+        post = getattr(self, "lift_post", "none")
+        # S: tau cancels the height-hypothesis gain (L2c) yet the plain
+        # sum collapses by 4 ep (L1, l2obj20b). Both posts keep the cell-to-cell
+        # contrast that depth creates and only bound the scale.
+        if post == "gn":
+            bev = self.lift_gn(bev)
+        elif post == "tanh":
+            a = self.lift_tanh_a.to(bev.dtype)
+            bev = a * torch.tanh(bev / a)
+        return bev
 
     def _project_bev_frustum(self, dprob, ctx, K, T_cam_ego, B, N, H, W):
         Cc = ctx.shape[1]
@@ -1510,28 +1604,34 @@ class DepthSegIPMNetV16(DepthSegIPMNetV14):
                 ri, ci = int(r), int(c)
                 if not (0 <= ri < DET_H and 0 <= ci < DET_W):
                     continue
-                rad = min(max(2.0, 0.7 * max(l, w) / DET_RES / 2), 4.0)
+                rad = min(max(2.0, 0.7 * max(l, w) / DET_RES / 2), _HM_RAD_MAX)   # env METEOR_HM_RAD_MAX (default 4 cells = 1.6 m; 8 suppresses duplicate peaks on long vehicles)
                 g = torch.exp(-(((ys - r) ** 2).view(-1, 1)
                                 + ((xs - c) ** 2).view(1, -1)) / (2 * rad ** 2))
                 ch = 0 if cls < 1.5 else 1
                 hm[bi, ch] = torch.maximum(hm[bi, ch], g * gw)
                 ll, lw = math.log(max(l, .1)), math.log(max(w, .1))
                 sy, cy = math.sin(yaw), math.cos(yaw)
+                if _YAW2:                                    # axis only: (sin 2θ, cos 2θ); weights below keep using θ
+                    sy2, cy2 = math.sin(2.0 * yaw), math.cos(2.0 * yaw)
                 # crossing vehicles (lateral yaw) are rare and their yaw
                 # regresses toward the along-road prior -> weight by
                 # lateralness (mask doubles as the per-cell reg weight)
                 wy = 1.0 + 2.0 * abs(sy)
+                # METEOR_YAW_BACK_W: boxes facing the ego vehicle (cos yaw < 0: oncoming, parked nose-in) can be
+                # ~5 % of the vehicles; the L1 sin/cos regression then falls back to the forward majority and flips
+                # many truly oncoming cars even with correct labels. Default 0 = unchanged
+                wy *= 1.0 + _YAW_BACK_W * max(0.0, -cy)
                 for dr in (-1, 0, 1):
                     for dc in (-1, 0, 1):
                         r2, c2 = ri + dr, ci + dc
                         if dr == dc == 0                                 or not (0 <= r2 < DET_H and 0 <= c2 < DET_W):
                             continue
                         reg[bi, :, r2, c2] = torch.tensor(
-                            [r - r2, c - c2, ll, lw, sy, cy],
+                            [r - r2, c - c2, ll, lw, sy2 if _YAW2 else sy, cy2 if _YAW2 else cy],
                             device=device, dtype=dtype)
                         msk[bi, 0, r2, c2] = wy
                 centres.append((bi, ri, ci, wy,
-                                torch.tensor([r - ri, c - ci, ll, lw, sy, cy],
+                                torch.tensor([r - ri, c - ci, ll, lw, sy2 if _YAW2 else sy, cy2 if _YAW2 else cy],
                                              device=device, dtype=dtype)))
         for bi, ri, ci, wy, t in centres:
             reg[bi, :, ri, ci] = t
@@ -1691,6 +1791,8 @@ class DepthSegIPMNetV16(DepthSegIPMNetV14):
                 l = float(o[2].exp())
                 w = float(o[3].exp())
                 yaw = float(torch.atan2(o[4], o[5]))
+                if _YAW2:                                    # (sin 2θ, cos 2θ) -> axis θ' in [-90°, 90°)
+                    yaw = 0.5 * yaw
                 boxes.append((int(cls[j]), float(sc[j]), xe, ye, l, w, yaw))
             out.append(boxes)
         return out
@@ -1942,6 +2044,37 @@ class SegHeadED(nn.Module):
         return self.out(y0)
 
 
+def build_ego_head(mult=1.0, xblock=0):
+    """v19 E2E ego head builder (factored out for v220). mult widens every
+    stage, xblock adds ConvBlocks at the 50x32 stage. (1.0, 0) is the original v19
+    architecture bit-identically; (1.5, 1) is the v220 ~12M head. Used by the model
+    constructor (env METEOR_EGO_HEAD_MULT/_XBLOCK) and by ckpt_load's shape-detected
+    rebuild, so an enlarged checkpoint always evaluates with its own architecture."""
+    c1, c2, c3 = int(128 * mult), int(192 * mult), int(256 * mult)
+    h1, h2, h3 = int(512 * mult), int(512 * mult), int(256 * mult)
+    stem = [
+        nn.Conv2d(BEV_CH, c1, 3, stride=4, padding=1, bias=False),
+        nn.BatchNorm2d(c1), nn.ReLU(inplace=True),      # 200x125
+        ConvBlock(c1, c1),
+        nn.Conv2d(c1, c2, 3, stride=2, padding=1, bias=False),
+        nn.BatchNorm2d(c2), nn.ReLU(inplace=True),      # 100x63
+        ConvBlock(c2, c2),
+        nn.Conv2d(c2, c3, 3, stride=2, padding=1, bias=False),
+        nn.BatchNorm2d(c3), nn.ReLU(inplace=True),      # 50x32
+        ConvBlock(c3, c3)]
+    stem += [ConvBlock(c3, c3)] * int(xblock)
+    stem += [
+        nn.Conv2d(c3, c3, 3, stride=2, padding=1, bias=False),
+        nn.BatchNorm2d(c3), nn.ReLU(inplace=True),      # 25x16
+        nn.AdaptiveAvgPool2d(1)]
+    mlp = nn.Sequential(
+        nn.Linear(c3 + 1, h1), nn.ReLU(inplace=True),
+        nn.Linear(h1, h2), nn.ReLU(inplace=True),
+        nn.Linear(h2, h3), nn.ReLU(inplace=True),
+        nn.Linear(h3, EGO_OUT))
+    return nn.Sequential(*stem), mlp
+
+
 class DepthSegIPMNetV19(DepthSegIPMNetV18):
     """v19: capacity re-balance (user request: params up, FLOPs bounded).
 
@@ -1973,24 +2106,12 @@ class DepthSegIPMNetV19(DepthSegIPMNetV18):
         for m in (self.hm2d_head8, self.hm2d_head16):
             nn.init.constant_(m.bias, -2.19)
         # E2E: deeper pyramid + wider MLP (most important task)
-        self.ego_stem = nn.Sequential(
-            nn.Conv2d(BEV_CH, 128, 3, stride=4, padding=1, bias=False),
-            nn.BatchNorm2d(128), nn.ReLU(inplace=True),     # 200x125
-            ConvBlock(128, 128),
-            nn.Conv2d(128, 192, 3, stride=2, padding=1, bias=False),
-            nn.BatchNorm2d(192), nn.ReLU(inplace=True),     # 100x63
-            ConvBlock(192, 192),
-            nn.Conv2d(192, 256, 3, stride=2, padding=1, bias=False),
-            nn.BatchNorm2d(256), nn.ReLU(inplace=True),     # 50x32
-            ConvBlock(256, 256),
-            nn.Conv2d(256, 256, 3, stride=2, padding=1, bias=False),
-            nn.BatchNorm2d(256), nn.ReLU(inplace=True),     # 25x16
-            nn.AdaptiveAvgPool2d(1))
-        self.ego_mlp = nn.Sequential(
-            nn.Linear(256 + 1, 512), nn.ReLU(inplace=True),
-            nn.Linear(512, 512), nn.ReLU(inplace=True),
-            nn.Linear(512, 256), nn.ReLU(inplace=True),
-            nn.Linear(256, EGO_OUT))
+        # METEOR_EGO_HEAD_MULT widens every ego_stem/ego_mlp stage (v220);
+        # METEOR_EGO_HEAD_XBLOCK adds one ConvBlock at the 50x32 stage. Defaults keep
+        # the v19 architecture bit-identical, so existing checkpoints are unaffected.
+        _em = float(os.environ.get("METEOR_EGO_HEAD_MULT", "1"))
+        _xb = int(os.environ.get("METEOR_EGO_HEAD_XBLOCK", "0"))
+        self.ego_stem, self.ego_mlp = build_ego_head(_em, _xb)
 
     def det2d_forward(self, f, B, N):
         # When paint-det is enabled the s4 stage (det2d_stem + hm2d_head) was already
@@ -2192,7 +2313,7 @@ class DepthSegIPMNetV21(DepthSegIPMNetV20):
                 if float(cls) < 1.5 and \
                         abs((yaw_k + math.pi) % (2 * math.pi) - math.pi) \
                         > 2.36:
-                    w = 2.5
+                    w = TRAJ_ONCOMING_W
                 t[bi, :, ri, ci] = traj[bi, k].reshape(-1)
                 m[bi, :, ri, ci] = tvalid[bi, k].repeat_interleave(2) * w
         return t, m
@@ -2266,6 +2387,152 @@ class QuantRobustStatHead(nn.Module):
 
 
 
+class _ResCtx(nn.Module):
+    """Head-v2: zero-init residual context block.
+
+    dilated 3x3 x2 (d=2,4) + depthwise 7x7 + 1x1(zero) -- widens a head's
+    receptive field ~4x with TRT-safe ops only. The 1x1 is zero-initialised,
+    so attaching it is function-preserving and safe to graft onto a trained
+    checkpoint (v205 line: far-vehicle recall and thin-line seg both lack
+    context, det RF was ~3 m at the 0.4 m det grid)."""
+
+    def __init__(self, ch):
+        super().__init__()
+        # rev2: the depthwise 7x7 is memory-bound and runs poorly on GPU. Replaced by
+        # a dense 3x3 HDC stack (d=1,2,4): receptive field +-7 px (comparable to the old
+        # +-9 px), d=1 fills the dilation gridding holes, every layer maps to TensorCore/INT8.
+        self.body = nn.Sequential(
+            nn.Conv2d(ch, ch, 3, padding=1, bias=False),
+            nn.BatchNorm2d(ch), nn.ReLU(inplace=True),
+            nn.Conv2d(ch, ch, 3, padding=2, dilation=2, bias=False),
+            nn.BatchNorm2d(ch), nn.ReLU(inplace=True),
+            nn.Conv2d(ch, ch, 3, padding=4, dilation=4, bias=False),
+            nn.BatchNorm2d(ch), nn.ReLU(inplace=True))
+        self.out = nn.Conv2d(ch, ch, 1)
+        nn.init.zeros_(self.out.weight)
+        nn.init.zeros_(self.out.bias)
+
+    def forward(self, x):
+        return x + self.out(self.body(x))
+
+
+class _ResCtxSlim(nn.Module):
+    """ctx-v2 (v209): lightweight residual context for the per-camera features before the lift.
+    dense 3x3 (d=1) + 3x3 (d=2) + zero-init 1x1; it runs for all 8 cameras, so it is kept to
+    2 convs (+~80 GMAC). Without it ctx is a single 1x1 and the backbone output enters the lift
+    as is, which targets the hypothesis that far-range feature quality is the bottleneck."""
+
+    def __init__(self, ch):
+        super().__init__()
+        self.body = nn.Sequential(
+            nn.Conv2d(ch, ch, 3, padding=1, bias=False),
+            nn.BatchNorm2d(ch), nn.ReLU(inplace=True),
+            nn.Conv2d(ch, ch, 3, padding=2, dilation=2, bias=False),
+            nn.BatchNorm2d(ch), nn.ReLU(inplace=True))
+        self.out = nn.Conv2d(ch, ch, 1)
+        nn.init.zeros_(self.out.weight)
+        nn.init.zeros_(self.out.bias)
+
+    def forward(self, x):
+        return x + self.out(self.body(x))
+
+
+def enable_ctx_v2(net, verbose=True):
+    """v209: insert a zero-init residual context block before the ctx projection (1x1); bit-identical at attach time."""
+    if getattr(net, "_ctx_v2", False):
+        return net
+    ch = net.ctx.in_channels if not isinstance(net.ctx, nn.Sequential) else net.ctx[-1].in_channels
+    net.ctx = nn.Sequential(_ResCtxSlim(ch), *(list(net.ctx) if isinstance(net.ctx, nn.Sequential) else [net.ctx]))
+    net._ctx_v2 = True
+    net.ctx.to(next(net.parameters()).device)
+    if verbose:
+        print(f"[ctx-v2] pre-lift context block attached ({ch}ch, zero-init residual)", flush=True)
+    return net
+
+
+LIFT_POSTS = ("none", "gn", "tanh")
+
+
+def enable_lift_sum(net, s0=None, heights=None, tau=0.0, post="none", verbose=True):
+    """L1: depth places the feature (see _project_bev_sum).
+    Not function-preserving: the BEV scale changes, so fine-tune from the init
+    ckpt. s0 matches the initial BEV magnitude to the normalised lift
+    (out/calib_lift_sum.py); lift_sum_logs in a ckpt re-enables it on load.
+    heights (L2): lift hypotheses in metres above ground, stored in the
+    lift_heights_buf buffer so loaders rebuild the same set."""
+    if getattr(net, "lift_sum", False):
+        return net
+    if s0 is None:
+        s0 = float(os.environ.get("METEOR_LIFT_SUM_S0", "1.0"))
+    heights = tuple(float(h) for h in (heights or (0.0,)))
+    dev = next(net.parameters()).device
+    net.lift_sum_logs = nn.Parameter(torch.tensor(math.log(s0), device=dev))
+    net.register_buffer("lift_heights_buf", torch.tensor(heights, device=dev))
+    net.register_buffer("lift_tau_buf", torch.tensor(float(tau), device=dev))
+    net.register_buffer("lift_post_buf", torch.tensor(LIFT_POSTS.index(post), device=dev))
+    if post == "gn":
+        net.lift_gn = nn.GroupNorm(8, BEV_CH).to(dev)
+    elif post == "tanh":
+        net.register_buffer("lift_tanh_a", torch.tensor(4.0, device=dev))   # ~3x mean |IPM bev| (1.25)
+    net.lift_heights = heights
+    net.lift_tau = float(tau)
+    net.lift_post = post
+    net.lift_sum = True
+    if verbose:
+        print(f"[lift-sum] depth-placing lift enabled (s0={s0:.3f}, z-depth bins, "
+              f"heights={list(heights)}, tau={tau}, post={post})", flush=True)
+    return net
+
+
+def lift_sum_post_from_sd(sd):
+    p = sd.get("lift_post_buf")
+    return LIFT_POSTS[int(p)] if p is not None else "none"
+
+
+def lift_sum_heights_from_sd(sd):
+    h = sd.get("lift_heights_buf")
+    return tuple(float(x) for x in h.reshape(-1).tolist()) if h is not None else (0.0,)
+
+
+def lift_sum_tau_from_sd(sd):
+    t = sd.get("lift_tau_buf")
+    return float(t) if t is not None else 0.0
+
+
+def enable_head_v2(net, det=True, seg=True, verbose=True):
+    """v205 head upgrade: append _ResCtx to the det stem (400x250, 128ch) and
+    insert one before the seg decoder's final 1x1 (800x500, 128ch).
+    Zero-init residual => bit-identical at attach time."""
+    n = 0
+    if det and not getattr(net, "_head_v2_det", False):
+        # det_stem may be a plain Sequential or the v52 _DetStemED wrapper;
+        # appending after it works for both (output is always 128ch @ det grid)
+        net.det_stem = nn.Sequential(net.det_stem, _ResCtx(128))
+        net._head_v2_det = True
+        n += 1
+    if seg and not getattr(net, "_head_v2_seg", False):
+        # v52 LaneDecED keeps its final projection in .out; older decs are a
+        # plain Sequential. Insert before the terminal 1x1 in either case.
+        tgt = net.dec.out if hasattr(net.dec, "out") else net.dec
+        assert isinstance(tgt, nn.Sequential), "head-v2: seg tail is not Sequential"
+        mods = list(tgt)
+        blk = _ResCtx(mods[-1].in_channels)
+        mods.insert(len(mods) - 1, blk)
+        if hasattr(net.dec, "out"):
+            net.dec.out = nn.Sequential(*mods)
+        else:
+            net.dec = nn.Sequential(*mods)
+        net._head_v2_seg = True
+        n += 1
+    dev = next(net.parameters()).device
+    net.det_stem.to(dev)
+    net.dec.to(dev)
+    if verbose:
+        print(f"[head-v2] {n} _ResCtx blocks attached (det stem / seg dec, "
+              f"zero-init residual)", flush=True)
+    return net
+
+
 def enable_kinematic_anchor(net):
     """v139: add a gated constant-velocity straight-line term g_t*[v0*t,0] to the ego waypoints.
     Zero-initialized, function-preserving. After training it structurally removes the near-range speed bias."""
@@ -2275,6 +2542,27 @@ def enable_kinematic_anchor(net):
     dev = next(net.parameters()).device
     net.kin_gate = nn.Parameter(torch.zeros(6, device=dev))
     return net
+
+def enable_hist_traj(net, ckpt_path=None, verbose=True):
+    """v203: graft the cache-trained H2 trajectory-residual head
+    (train_h2) onto the model as net.histtraj.
+    The head is bounded (tanh) and gated by history_enable: with
+    history_enable=0 it returns the input trajectory EXACTLY, so a
+    zero-history export stays bit-compatible with the ungrafted model."""
+    from bevlane.history_encoder import HistoryTrajHead
+    bound, sd, meta = 2.0, None, ""
+    if ckpt_path:
+        _ck = torch.load(ckpt_path, map_location="cpu", weights_only=False)
+        bound = float(_ck.get("args", {}).get("bound", 2.0))
+        sd = _ck["head"]; meta = f" ep={_ck.get('ep')} val={_ck.get('val')}"
+    net.histtraj = HistoryTrajHead(bound_m=bound)
+    if sd is not None:
+        net.histtraj.load_state_dict(sd)
+    net.histtraj.to(next(net.parameters()).device).eval()
+    if verbose:
+        print(f"[hist-traj] grafted bound={bound}m ckpt={ckpt_path}{meta}", flush=True)
+    return net.histtraj
+
 
 def enable_semantic_ego(net, ch=64):
     """INT8-hardening of ego (2026-08-25): feed ego_stem "semantic outputs" instead.
@@ -2524,6 +2812,300 @@ def enable_lane_sdf(net, ch=48):
         nn.Conv2d(ch, 1, 1)).to(dev)
     net._lane_sdf_pred = None
     return net
+
+
+def _stop_anchor(v0, decel=2.5, hold_v=1.0):
+    """[B] ego speed (m/s) -> [B,6,2] stop path at 0.5..3.0 s: hold position below hold_v (the 'creep while
+    stopped' misses), else constant deceleration to rest straight ahead."""
+    t = torch.arange(1, 7, device=v0.device, dtype=torch.float32) * 0.5          # [6]
+    v = v0.float().clamp(min=0).view(-1, 1)                                       # [B,1]
+    ts = v / decel
+    tt = torch.minimum(t.view(1, -1), ts)
+    x = v * tt - 0.5 * decel * tt * tt
+    x = torch.where(v < hold_v, torch.zeros_like(x), x)
+    return torch.stack([x, torch.zeros_like(x)], -1)                              # [B,6,2]
+
+
+def _stop_mode_hook(net, args, kwargs, output):
+    out = list(output)
+    e = out[7]
+    v0 = kwargs.get("v0", args[3] if len(args) > 3 else None)
+    B = e.shape[0]
+    v = (v0.view(-1).float() if v0 is not None else torch.zeros(B, device=e.device))
+    g = F.adaptive_avg_pool2d(net._fused_bev, 1).flatten(1).float()
+    logit = net.stop_head(torch.cat([g, (v / 10.0).view(-1, 1)], 1))             # [B,1]
+    net._stop_logit = logit
+    if net.training:
+        # in the returned graph (DDP), numerically unchanged
+        out[7] = e + 0.0 * logit.sum().to(e.dtype)
+    elif os.environ.get("METEOR_STOP_MODE_OFF", "0") != "1":
+        thr, decel, hold_v = net._stop_cfg
+        stop = (torch.sigmoid(logit) > thr).view(-1, 1)                           # [B,1]
+        anc = _stop_anchor(v, decel, hold_v).reshape(B, 12).repeat(1, 3).to(e.dtype)   # all 3 modes
+        e2 = e.clone()
+        e2[:, :36] = torch.where(stop, anc, e[:, :36])
+        out[7] = e2
+    return tuple(out)
+
+
+def enable_stop_mode(net, thr=0.5, decel=2.5, hold_v=1.0):
+    """Dedicated STOP candidate (v215). 96 % of v211's missed stops had no stopping path among the
+    3 learned modes (68 % creep while stopped, 32 % not decelerating to rest), and threshold / brake / vprof
+    gating only moved along the same ROC. A stop-classifier head on the pooled fused BEV (+ v0) decides
+    'stop'; when it fires, every mode is replaced by a deterministic stop path (_stop_anchor). The 42-d
+    output layout is unchanged, so closed-loop eval, the demo, ONNX export and the Orin runtime use it as is.
+    Trained by stop_mode_loss (GT stops = last 0.5 s segment under 0.5 m/s). METEOR_STOP_MODE_OFF=1 disables
+    the override for A/B. Call BEFORE the DDP wrap and before loading a checkpoint that has stop_head.*."""
+    import torch.nn as nn
+    if getattr(net, "stop_head", None) is not None:
+        return net
+    dev = next(net.parameters()).device
+    net.stop_head = nn.Sequential(nn.Linear(BEV_CH + 1, 64), nn.ReLU(inplace=True), nn.Linear(64, 1)).to(dev)
+    nn.init.zeros_(net.stop_head[2].weight)
+    nn.init.constant_(net.stop_head[2].bias, -3.0)      # starts as 'never stop' = function-preserving
+    net._stop_cfg = (thr, decel, hold_v)
+    net._stop_logit = None
+    net.register_forward_hook(_stop_mode_hook, with_kwargs=True)
+    return net
+
+
+def stop_mode_loss(net, ego_gt, pos_w=2.0):
+    """BCE of the stop head vs GT 'comes to rest' (last 0.5 s segment < 0.5 m/s), valid frames only."""
+    wp = ego_gt[:, :12].view(-1, 6, 2).float()
+    v_last = (wp[:, 5] - wp[:, 4]).norm(dim=1) / 0.5
+    y = (v_last < 0.5).float().view(-1, 1)
+    valid = ego_gt[:, 16:17].float()
+    lg = net._stop_logit.float()
+    w = valid * (1.0 + (pos_w - 1.0) * y)
+    l = F.binary_cross_entropy_with_logits(lg, y, reduction="none")
+    return (l * w).sum() / w.sum().clamp(min=1)
+
+
+class VocabPlanner(nn.Module):
+    """Trajectory-vocabulary planner head (v218). K anchor trajectories (k-means of the GT ego
+    futures, out/vocab256.npy) are scored by a classifier and refined by a per-anchor residual; the three
+    best-scoring anchors are emitted in the existing 42-d ego layout (3 modes x 12 waypoints + 3 logits +
+    3 aux), so every consumer (closed-loop eval, demo, ONNX export, Orin) is unchanged.  Motivation: 96 % of
+    v211's missed stops had no stopping candidate among the 3 regressed modes while GT stops are 0.7 % of the
+    data; a vocabulary of 256 anchors covers the GT closely and holds ~21-28 stop anchors."""
+    def __init__(self, anchors, in_dim, hidden=512):
+        super().__init__()
+        self.register_buffer("anchors", torch.as_tensor(anchors, dtype=torch.float32).reshape(-1, 6, 2))
+        K = self.anchors.shape[0]
+        self.mlp = nn.Sequential(nn.Linear(in_dim, hidden), nn.ReLU(inplace=True),
+                                 nn.Linear(hidden, hidden), nn.ReLU(inplace=True))
+        self.cls = nn.Linear(hidden, K)
+        self.res = nn.Linear(hidden, K * 12)
+        nn.init.zeros_(self.res.weight)
+        nn.init.zeros_(self.res.bias)
+        # 0 = replace (top-3 anchors are the modes), 1 = augment (old best mode + top-2 anchors); saved in the ckpt
+        self.register_buffer("mode_flag", torch.zeros(()))
+
+    def forward(self, x):
+        h = self.mlp(x)
+        return self.cls(h), self.res(h).view(-1, self.anchors.shape[0], 6, 2)
+
+
+def _vocab_hook(net, args, kwargs, output):
+    out = list(output)
+    e = out[7]
+    B = e.shape[0]
+    v0 = kwargs.get("v0", args[3] if len(args) > 3 else None)
+    intent = kwargs.get("intent")
+    v = v0.view(-1).float() if v0 is not None else torch.zeros(B, device=e.device)
+    it = intent.view(B, 3).float() if intent is not None else torch.zeros(B, 3, device=e.device)
+    fb = net._fused_bev
+    g = F.adaptive_avg_pool2d(fb, 1).flatten(1).float()
+    tok = F.adaptive_avg_pool2d(fb, (25, 16)).flatten(2).transpose(1, 2)
+    qa, _ = net.ego_attn(net.ego_q.weight.unsqueeze(0).expand(B, -1, -1).to(tok.dtype), tok, tok)
+    x = torch.cat([g, qa.flatten(1).float(), e.detach().float(), (v / 10.0).view(-1, 1), it], 1)
+    logits, res = net.vocab(x)
+    net._vocab = (logits, res)
+    net._ego_pre = e
+    if os.environ.get("METEOR_VOCAB_OFF", "0") == "1":
+        return tuple(out)
+    if os.environ.get("METEOR_VOCAB_MODE", "replace") == "augment" or float(net.vocab.mode_flag) > 0.5:
+        # augment (v218b option): keep the old head's best mode as mode 0 (scored with the vocabulary logit of its
+        # nearest anchor, so the three logits share one scale) and add the two best other anchors. Never worse
+        # than the old head when the classifier prefers its mode; adds stop candidates the old head lacks.
+        with torch.no_grad():
+            ol = e[:, 36:39].float()
+            kb = ol.argmax(1)                                                       # [B]
+            old_best = e[:, :36].float().view(B, 3, 6, 2)[torch.arange(B, device=e.device), kb]   # [B,6,2]
+            dd = (net.vocab.anchors[None] - old_best[:, None]).abs().sum((2, 3))    # [B,K]
+            i_old = dd.argmin(1)                                                    # [B]
+        lg2 = logits.float().clone()
+        lg2[torch.arange(B, device=e.device), i_old] = -1e4                        # exclude the old mode's anchor
+        top2 = lg2.topk(2, dim=1).indices                                           # [B,2]
+        anc = net.vocab.anchors[top2]
+        rs = res.gather(1, top2[:, :, None, None].expand(-1, -1, 6, 2))
+        e2 = e.clone()
+        e2[:, :12] = old_best.reshape(B, 12).to(e.dtype)
+        e2[:, 12:36] = (anc + rs).reshape(B, 24).to(e.dtype)
+        e2[:, 36] = logits.gather(1, i_old[:, None])[:, 0].to(e.dtype)
+        e2[:, 37:39] = logits.gather(1, top2).to(e.dtype)
+        out[7] = e2
+        return tuple(out)
+    top = logits.topk(3, dim=1).indices                                            # [B,3]
+    anc = net.vocab.anchors[top]                                                   # [B,3,6,2]
+    rs = res.gather(1, top[:, :, None, None].expand(-1, -1, 6, 2))
+    e2 = e.clone()
+    e2[:, :36] = (anc + rs).reshape(B, 36).to(e.dtype)
+    e2[:, 36:39] = logits.gather(1, top).to(e.dtype)
+    out[7] = e2
+    return tuple(out)
+
+
+def enable_vocab_planner(net, anchors, hidden=512):
+    """Attach the vocabulary planner (VocabPlanner) as a forward hook; `anchors` [K,6,2] (array / tensor).
+    Call BEFORE the DDP wrap and before loading a checkpoint that has vocab.* (ckpt_load / demo / export
+    detect the 'vocab.anchors' key and call this with the stored anchors)."""
+    if getattr(net, "vocab", None) is not None:
+        return net
+    dev = next(net.parameters()).device
+    net.vocab = VocabPlanner(anchors, in_dim=4 * BEV_CH + 42 + 4, hidden=hidden).to(dev)
+    net._vocab = None
+    net._ego_pre = None
+    net.register_forward_hook(_vocab_hook, with_kwargs=True)
+    return net
+
+
+def vocab_loss(net, ego_gt, stop_w=1.0, fde_w=0.5, smooth=0.05):
+    """Classification to the GT-nearest anchor (label-smoothed CE) + L1 of that anchor's refined path, valid
+    frames only; rows whose GT comes to rest from motion (v0 > 1 m/s, 3 s displacement < 1.5 m) weighted stop_w."""
+    logits, res = net._vocab
+    anchors = net.vocab.anchors                                                    # [K,6,2]
+    gt = ego_gt[:, :12].view(-1, 6, 2).float()
+    valid = ego_gt[:, 16].float()
+    v0 = ego_gt[:, 12].float()
+    lw = getattr(net, "EGO_LONG_W", 1.0)
+    _n = (lw + 4.0) / 2.4
+    with torch.no_grad():
+        err = (anchors[None] - gt[:, None]).abs()                                   # [B,K,6,2]
+        d = (lw * err[..., 0] + 4.0 * err[..., 1]).mean(2) / _n                      # [B,K]
+        idx = d.argmin(1)
+        stop = ((v0 > 1.0) & (gt[:, -1].norm(dim=1) < 1.5)).float()
+    ce = F.cross_entropy(logits.float(), idx, reduction="none", label_smoothing=smooth)
+    pred = anchors[idx] + res[torch.arange(len(idx), device=idx.device), idx]       # [B,6,2]
+    e2 = (pred.float() - gt).abs()
+    reg = (lw * e2[..., 0] + 4.0 * e2[..., 1]).mean(1) / _n
+    fde = (lw * e2[:, -1, 0] + 4.0 * e2[:, -1, 1]) / _n
+    w = valid * (1.0 + (stop_w - 1.0) * stop)
+    return (w * (ce + reg + fde_w * fde)).sum() / w.sum().clamp(min=1.0)
+
+
+class TFPlanner(nn.Module):
+    """DETR-style transformer planner head (v221). K anchor trajectories (the v218
+    vocabulary, stop anchors included) seed K learnable queries; 2 pre-LN decoder layers of
+    self-attention + cross-attention over pooled BEV tokens + FFN; each query emits an
+    anchor-residual trajectory and a score. The hook puts the top-3 scored queries into the
+    existing 42-d ego layout (3 modes x 12 wp + 3 logits + 3 aux), so closed-loop eval, demo,
+    ONNX export and the Orin runtime are unchanged. Motivation: 96 % of v211's missed stops had
+    no stopping candidate among the 3 regressed modes, and the selection loss (gap to the oracle
+    mode) is the largest E2E residual -> fix candidate diversity and
+    selection structurally instead of by capacity."""
+    def __init__(self, anchors, d=256, nhead=8, layers=2, grid=(50, 32)):
+        super().__init__()
+        self.register_buffer("anchors", torch.as_tensor(anchors, dtype=torch.float32).reshape(-1, 6, 2))
+        K = self.anchors.shape[0]
+        self.grid = tuple(grid)
+        self.in_proj = nn.Conv2d(BEV_CH, d, 1)
+        self.pos = nn.Parameter(torch.randn(1, grid[0] * grid[1], d) * 0.02)
+        self.q_emb = nn.Embedding(K, d)
+        nn.init.normal_(self.q_emb.weight, std=0.02)
+        self.anc_proj = nn.Linear(12, d)
+        self.cond = nn.Linear(4, d)
+        self.layers = nn.ModuleList()
+        for _ in range(layers):
+            self.layers.append(nn.ModuleDict({
+                "ln1": nn.LayerNorm(d), "sa": nn.MultiheadAttention(d, nhead, batch_first=True),
+                "ln2": nn.LayerNorm(d), "ca": nn.MultiheadAttention(d, nhead, batch_first=True),
+                "ln3": nn.LayerNorm(d),
+                "ff": nn.Sequential(nn.Linear(d, 4 * d), nn.GELU(), nn.Linear(4 * d, d))}))
+        self.ln_f = nn.LayerNorm(d)
+        self.traj = nn.Linear(d, 12)
+        nn.init.zeros_(self.traj.weight); nn.init.zeros_(self.traj.bias)
+        self.score = nn.Linear(d, 1)
+        # 0 = replace (top-3 queries are the modes); reserved like VocabPlanner.mode_flag
+        self.register_buffer("mode_flag", torch.zeros(()))
+
+    def forward(self, fb, v0, intent):
+        B = fb.shape[0]
+        tok = self.in_proj(F.adaptive_avg_pool2d(fb.float(), self.grid))
+        tok = tok.flatten(2).transpose(1, 2) + self.pos                 # [B,G,d]
+        cond = self.cond(torch.cat([(v0.view(B, 1).float() / 10.0), intent.view(B, 3).float()], 1))
+        q = (self.q_emb.weight + self.anc_proj(self.anchors.flatten(1)))[None].expand(B, -1, -1)             + cond[:, None]
+        for L in self.layers:
+            h = L["ln1"](q); q = q + L["sa"](h, h, h, need_weights=False)[0]
+            h = L["ln2"](q); q = q + L["ca"](h, tok, tok, need_weights=False)[0]
+            q = q + L["ff"](L["ln3"](q))
+        q = self.ln_f(q)
+        return self.score(q)[..., 0], self.traj(q).view(B, -1, 6, 2)    # [B,K], [B,K,6,2]
+
+
+def _tfplan_hook(net, args, kwargs, output):
+    out = list(output)
+    e = out[7]
+    B = e.shape[0]
+    v0 = kwargs.get("v0", args[3] if len(args) > 3 else None)
+    intent = kwargs.get("intent")
+    v = v0.view(-1).float() if v0 is not None else torch.zeros(B, device=e.device)
+    it = intent.view(B, 3).float() if intent is not None else torch.zeros(B, 3, device=e.device)
+    scores, res = net.tfplan(net._fused_bev, v, it)
+    net._tfplan = (scores, res)
+    net._ego_pre = e
+    if os.environ.get("METEOR_TFPLAN_OFF", "0") == "1":
+        return tuple(out)
+    top = scores.topk(3, dim=1).indices                                 # [B,3]
+    anc = net.tfplan.anchors[top]                                       # [B,3,6,2]
+    rs = res.gather(1, top[:, :, None, None].expand(-1, -1, 6, 2))
+    e2 = e.clone()
+    e2[:, :36] = (anc + rs).reshape(B, 36).to(e.dtype)
+    e2[:, 36:39] = scores.gather(1, top).to(e.dtype)
+    out[7] = e2
+    return tuple(out)
+
+
+def enable_tf_planner(net, anchors, d=256, nhead=8, layers=2):
+    """Attach the transformer planner (TFPlanner) as a forward hook; call BEFORE the DDP wrap and
+    before loading a checkpoint that has tfplan.* (ckpt_load detects 'tfplan.anchors')."""
+    if getattr(net, "tfplan", None) is not None:
+        return net
+    dev = next(net.parameters()).device
+    net.tfplan = TFPlanner(anchors, d=d, nhead=nhead, layers=layers).to(dev)
+    net._tfplan = None
+    net._ego_pre = None
+    net.register_forward_hook(_tfplan_hook, with_kwargs=True)
+    return net
+
+
+def tfplan_loss(net, ego_gt, stop_w=1.0, fde_w=0.5, tau=0.3):
+    """Listwise oracle selection + WTA anchor-residual regression, valid frames only.
+    Target distribution = softmax(-d/tau) over the K queries where d is the lateral-weighted
+    waypoint error of (anchor + residual) to GT (the oracle teacher: mass on every good
+    candidate, not just the argmin). Regression on the best query; stop rows (comes to rest
+    from motion) weighted stop_w."""
+    scores, res = net._tfplan
+    anchors = net.tfplan.anchors                                        # [K,6,2]
+    gt = ego_gt[:, :12].view(-1, 6, 2).float()
+    valid = ego_gt[:, 16].float()
+    v0 = ego_gt[:, 12].float()
+    lw = getattr(net, "EGO_LONG_W", 1.0)
+    _n = (lw + 4.0) / 2.4
+    pred = anchors[None] + res.float()                                  # [B,K,6,2]
+    with torch.no_grad():
+        err = (pred - gt[:, None]).abs()
+        d = (lw * err[..., 0] + 4.0 * err[..., 1]).mean(2) / _n         # [B,K] metres
+        t = F.softmax(-d / tau, dim=1)
+        idx = d.argmin(1)
+        stop = ((v0 > 1.0) & (gt[:, -1].norm(dim=1) < 1.5)).float()
+    ce = -(t * F.log_softmax(scores.float(), dim=1)).sum(1)
+    sel = pred[torch.arange(len(idx), device=idx.device), idx]          # [B,6,2]
+    e2 = (sel - gt).abs()
+    reg = (lw * e2[..., 0] + 4.0 * e2[..., 1]).mean(1) / _n
+    fde = (lw * e2[:, -1, 0] + 4.0 * e2[:, -1, 1]) / _n
+    w = valid * (1.0 + (stop_w - 1.0) * stop)
+    return (w * (ce + reg + fde_w * fde)).sum() / w.sum().clamp(min=1.0)
 
 
 def make_warp_theta(rel):
@@ -2785,7 +3367,8 @@ class DepthSegIPMNetV27(DepthSegIPMNetV26):
         out = super().forward(imgs, K, T_cam_ego, v0, prev_bev, warp_theta)
         B, N = imgs.shape[:2]
         f = self._f_s4.view(B, N, -1, *self._f_s4.shape[-2:])
-        ff = torch.cat([f[:, 0], f[:, 6]], 1)   # FRONT_WIDE + FRONT_NARROW
+        _fn = 6 if f.shape[1] > 6 else 0         # Nano (n_cams=1): fall back to FRONT_WIDE twice
+        ff = torch.cat([f[:, 0], f[:, _fn]], 1)  # FRONT_WIDE + FRONT_NARROW
         return out + (self.tl_fc(self.tl_head(ff).flatten(1)),)
 
     def tl_loss(self, tl_pred, tl_gt):
@@ -2848,8 +3431,8 @@ class DepthSegIPMNetV29(DepthSegIPMNetV28):
      lg_adj [B,24,24])."""
     def __init__(self, *a, **k):
         super().__init__(*a, **k)
-        # 1. multimodal heads (WTA)
-        self.ego_mlp[-1] = nn.Linear(256, 12 * EGO_K + EGO_K + 3)
+        # 1. multimodal heads (WTA)  (in_features from the built head, not 256 — v220 widens it)
+        self.ego_mlp[-1] = nn.Linear(self.ego_mlp[-1].in_features, 12 * EGO_K + EGO_K + 3)
         self.traj_head = nn.Conv2d(256, TRAJ_H * 2 * EGO_K + EGO_K, 1)
         # 2. temporal memory queue replaces the single-frame tfuse
         del self.tfuse
@@ -3732,6 +4315,11 @@ class DepthSegIPMNetV38(DepthSegIPMNetV37):
         # P3: auxiliary speed profile (read by vprof_loss)
         g = F.adaptive_avg_pool2d(self._fused_bev, 1).flatten(1)
         self._vprof = self.vprof_head(g.float())
+        if self.training and os.environ.get("METEOR_VPROF_IN_GRAPH") == "1":
+            # DDP with find_unused_parameters marks vprof_head unused (its output lives on the module,
+            # not in the returned tuple) and then its loss gradient fires a second time. A 0-weighted
+            # term puts it in the returned graph; outputs are numerically unchanged.
+            out[7] = out[7] + 0.0 * self._vprof.sum().to(out[7].dtype)
         return tuple(out)
 
     def vprof_loss(self, ego_gt):

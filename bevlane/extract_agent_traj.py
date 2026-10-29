@@ -49,17 +49,27 @@ def process_scene(args):
         for s in ordered:
             pos_by_raw.append({inst: tr for inst, _, tr, _, _ in
                                boxes_by_sample.get(s["token"], [])})
+        # METEOR_TRAJ_TIME=1: look the futures up by LiDAR TIMESTAMP (t0 + 0.5 s * h, nearest raw
+        # sample within 0.11 s) instead of raw index + 5. Some drives drop about every 8th 10 Hz sample,
+        # so "5 raw samples" spans 0.6 s there and the agents' futures run 20 % fast.
+        # METEOR_TRAJ_OUT_DIR (default agent_traj): side directory for a validated swap; the manifest is only
+        # rewritten when writing the canonical directory.
+        _time_based = os.environ.get("METEOR_TRAJ_TIME", "0") == "1"
+        _tdir = os.environ.get("METEOR_TRAJ_OUT_DIR", "agent_traj")
+        t_raw = np.array([((frames.get(s["token"], {}).get("LIDAR_CONCAT") or {}).get("timestamp", np.nan)) * 1e-6
+                          for s in ordered], np.float64)
         cams = {}
         for ch in CAMS:
             if ch in man["cams"]:
                 cams[ch] = (np.array(man["cams"][ch]["K"]),
                             np.linalg.inv(np.array(man["cams"][ch]["T_ego_cam"])))
-        os.makedirs(os.path.join(out_dir, "agent_traj"), exist_ok=True)
+        os.makedirs(os.path.join(out_dir, _tdir), exist_ok=True)
         for fr in man["frames"]:
             fi = fr["frame"]
-            path = os.path.join(out_dir, f"agent_traj/{fi:04d}.npz")
+            path = os.path.join(out_dir, f"{_tdir}/{fi:04d}.npz")
             if os.path.exists(path):
-                fr["agent_traj"] = f"agent_traj/{fi:04d}.npz"
+                if _tdir == "agent_traj":
+                    fr["agent_traj"] = f"agent_traj/{fi:04d}.npz"
                 continue
             ri = fi * stride
             s = ordered[ri]
@@ -104,9 +114,17 @@ def process_scene(args):
                 yaw_b = np.arctan2(Rb[1, 0], Rb[0, 0]) - yaw_e
                 B[k] = (cls, xe, ye, size[1], size[0], yaw_b)
                 for h in range(HORIZON):
-                    rj = ri + RAW_STEP * (h + 1)
-                    if rj >= len(ordered):
-                        break
+                    if _time_based:
+                        _tgt = t_raw[ri] + 0.5 * (h + 1)
+                        if not np.isfinite(_tgt) or _tgt > np.nanmax(t_raw) + 0.11:
+                            break
+                        rj = int(np.nanargmin(np.abs(t_raw - _tgt)))
+                        if abs(t_raw[rj] - _tgt) > 0.11:
+                            continue
+                    else:
+                        rj = ri + RAW_STEP * (h + 1)
+                        if rj >= len(ordered):
+                            break
                     trf = pos_by_raw[rj].get(inst)
                     if trf is None:
                         continue
@@ -116,8 +134,10 @@ def process_scene(args):
                 k += 1
             np.savez_compressed(path, boxes=B, count=np.int64(k),
                                 traj=T, tvalid=V)
-            fr["agent_traj"] = f"agent_traj/{fi:04d}.npz"
-        json.dump(man, open(os.path.join(out_dir, "manifest.json"), "w"))
+            if _tdir == "agent_traj":
+                fr["agent_traj"] = f"agent_traj/{fi:04d}.npz"
+        if _tdir == "agent_traj":
+            json.dump(man, open(os.path.join(out_dir, "manifest.json"), "w"))
         return f"[ok] {scene}"
     except Exception as e:
         return f"[fail] {scene}: {e}"

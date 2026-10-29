@@ -134,7 +134,7 @@ _RIBBON_STATE = {"wps": None}
 
 def draw_path_ribbon(img, ego_pred, K, Tce, cw, ch, W0=768, H0=432,
                      half_w=0.9, color=(60, 255, 120), alpha=0.38,
-                     reset=False):
+                     reset=False, straighten=True):
     """Project the predicted trajectory as a vehicle-width ground ribbon
     (filled, semi-transparent) into a camera image.
 
@@ -152,6 +152,18 @@ def draw_path_ribbon(img, ego_pred, K, Tce, cw, ch, W0=768, H0=432,
         _RIBBON_STATE["wps"] = 0.55 * _RIBBON_STATE["wps"] + 0.45 * wps
     wps = _RIBBON_STATE["wps"].copy()
     trav = float(np.hypot(*(wps[-1] - wps[0])))
+    if straighten:
+        # Near a stop the waypoints collapse onto the ego and their headings are
+        # noise: the ribbon (and the last-heading extension below) swung sideways
+        # and slid off instead of retracting. Blend toward the ego's forward axis
+        # at the same arc length: pure prediction >= 6 m travel, straight <= 1 m.
+        a = min(max((trav - 1.0) / 5.0, 0.0), 1.0)
+        a = a * a * (3 - 2 * a)
+        if a < 1.0:
+            arc = np.concatenate([[0], np.cumsum(np.linalg.norm(np.diff(wps, axis=0), axis=1))])
+            straight = np.stack([arc, np.zeros_like(arc)], 1)
+            wps = a * wps + (1 - a) * straight
+            trav = float(np.hypot(*(wps[-1] - wps[0])))
     # RETRACT instead of fade: the displayed ribbon length shrinks smoothly
     # with the predicted travel; the tip slides down toward the hood and
     # finally disappears under it (constant opacity throughout)

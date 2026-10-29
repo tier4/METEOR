@@ -205,6 +205,33 @@ passes three device-side checks before it can become the default:
    that the EMA guard missed.
 Then `bench_rt.py` (median of N frames, CUDA Graph on) for the ledger.
 
+### 6.x Lane thinning under INT8 — open investigation
+
+On the Orin the INT8 engine of the 2:4-sparse model draws visibly thinner lane lines than its
+fp16 engine (laneline pixels −23…−56 % on the demo scenes), while the dense model stays within a
+few percent. Real TensorRT builds on a workstation (8.6) and on a data-centre GPU (10.16) from the
+same plain ONNX reproduce only a −5 % effect for the sparse model, and a PyTorch fake-INT8 proxy
+none at all, so the cause is being narrowed down with the tools listed in §8
+(`int8_lane_local.py`, `int8_lane_x86.py`, `probe_int8_lane.py`): calibration set, calibrator
+type, `--fp16-keep` bisection, and training-side levers.
+
+Bisection result (TensorRT 8.6, INT8 + `SPARSE_WEIGHTS`, nine demo scenes): the INT8+sparse engine collapses
+(no lane pixels at all) unless the first trunk stage (`stem`, `layer1`) is kept in fp16; keeping only `layer2`,
+`layer3/4`, the FPN or the BEV decoder does not help, keeping the whole trunk restores full agreement. The
+failure is therefore in the small-channel high-resolution sparse INT8 kernels of `layer1`. Deployment fix:
+`--fp16-keep layer1` (or `stem,layer1,layer2`) in the INT8 build; training fix: exclude those stages from 2:4
+pruning (`--sparse-exclude stem,layer1,layer2,...`), where sparsity gains little anyway.
+
+**Lift-plugin tables are rig-specific.** `make_plugin_onnx.py` bakes the projection (pair tables
+from `dump_lift.py`, derived from one scene's `K` / `T_cam_ego`) into the graph, and the engine then
+ignores the `K` / `T_cam_ego` inputs. An engine built with the plugin is therefore valid only for
+the camera rig the tables came from; scenes recorded by another vehicle (different intrinsics or
+mounting) are lifted with the wrong geometry and lane lines come out displaced and thin. For a
+multi-rig demo either build one engine per rig (tables per calibration) or use the plain ONNX
+(no plugin, +4…5 ms on the Orin), which reads `K` / `T_cam_ego` every frame. The 2026-09-10
+investigation traced most of the "thin lanes on the Orin" report to this: two of the demo scenes
+come from a second vehicle (intrinsics differ by up to 250 px, camera positions by 0.5 m).
+
 ## 7. 2:4 structured sparsity — what is done and what we learned
 
 Orin's Ampere tensor cores run 2:4 sparse kernels at up to 2× the dense
@@ -276,6 +303,9 @@ engine incl. `depth_mean`) — the largest single lever after the history bake-o
 | `cpp/liftbench/plugin/make_plugin_onnx.py` | inserts the CUDA lift plugin (`libmeteor_lift.so`) into the exported graph |
 | `runtime.py` | Python TensorRT runtime: history ring, CUDA Graph, pinned zero-copy inputs, LiDAR, decoders |
 | `orin_build_int8.py` | torch-free on-device INT8 calibration (real frames, companion engine for recurrent inputs, real LiDAR) |
+| `int8_lane_local.py` | workstation (TensorRT 8.6) fp16 / INT8 / INT8+sparse builder with `--fp16-keep` bisection, and a per-class BEV pixel probe on the demo scenes (INT8 lane-thinning investigation) |
+| `int8_lane_x86.py` | the same for TensorRT 10 on a data-centre GPU (cuda-python) |
+| `../bevlane/probe_int8_lane.py` | PyTorch fake-INT8 proxy (per-channel weights, per-tensor activations; absmax / percentile / KL calibration) for hosts without TensorRT |
 | `orin_realtime.py`, `orin_render.py`, `viz_np.py` | pipelined real-time demo + renderer (reference look) |
 | `infer_t4dataset.py` | raw t4dataset scene → engine → per-frame npz + video |
 | `build_and_bench.py`, `bench_engine.py`, `profile_engine.py`, `profile_layers.py` | workstation build / latency / per-layer profile |
