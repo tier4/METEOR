@@ -821,6 +821,9 @@ class BevLaneDataset(Dataset):
                                  )["lb"].astype(np.float32)
                 except Exception:
                     pass
+            if os.environ.get("METEOR_RADAR_ROOT"):     # radar fusion: 6 radar channels after the LiDAR raster (bevlane/radar_bev.py)
+                from bevlane import radar_bev as _RB
+                lb = np.concatenate([lb, _RB.load(s, f["frame"])], 0)
             out.append(torch.from_numpy(lb))
         if self.with_sdmap:
             # OSM SD-map prior [4,400,250] (road/centerline/inters/cross);

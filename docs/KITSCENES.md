@@ -32,6 +32,26 @@ lists are written to `out/kitscenes/scenes_<split>.txt`; `--check` writes `check
 the front camera) per scene. Scenes whose name starts with `KITS_` are treated as HD-map scenes
 (`METEOR_HDMAP_PREFIX`): no yaw-calibration correction, and map / route rasters are available.
 
+## 2a. (Optional) Radar points
+
+KITScenes has three radars (front / left / right). Their detections can be fed as an optional BEV input next to
+the LiDAR raster. Extract the radar files from the sequence archives, then write one point file per converted frame:
+
+```bash
+python3 tools/kitscenes/kits_radar_extract.py /data/kitscenes_radar_raw /data/kitscenes/data/*/*.tar
+python3 tools/kitscenes/kits_radar_to_bevlane.py --root out/bevlane --raw /data/kitscenes_radar_raw \
+    --out /data/kitscenes_radar --all
+```
+
+Each `<out>/<scene>/<frame>.npz` holds the points of 0.5 s of sweeps (5 sweeps at 10 Hz), motion-compensated into
+the ego frame of the converted frame: `pts [N, 8] = x, y, z, rcs, range_rate, vr_comp, dt, sensor`
+(`sensor`: 0 front / 1 left / 2 right). The scene manifests are not touched. At training / evaluation time
+`METEOR_RADAR_ROOT=/data/kitscenes_radar` makes the dataset rasterise the points into 6 channels on the 0.4 m LiDAR
+grid (`bevlane/radar_bev.py`) and append them to the LiDAR raster; `METEOR_RADAR_SENSORS` selects the units
+(e.g. `0` = front radar only). Training: `bevlane/train_meteorite.py --radar 1` builds the zero-initialised radar
+stem (`--radar-drop` = per-sample radar dropout, default 0.2; `--lidar-off 1` zeroes the LiDAR channels for a
+camera + radar model). `tools/kitscenes/finetune.sh` does not set these; add them to its trainer command line.
+
 ## 3. (Optional) 3D boxes from auto-labels
 
 KITScenes has no 3D box annotations. To train the box head, run an offline LiDAR 3D detector over the converted
@@ -81,7 +101,8 @@ python3 bevlane/kitscenes_eval.py full=out/kits_ft/ckpt_kits_full/last.pt \
     --val-list out/kitscenes/scenes_val.txt --hr-root /data/kitscenes_hr --set kf202
 # no-HD-map checkpoint: add METEOR_RMAP_NOMAP=1; past-only: add METEOR_RMAP_NOMAP=1 METEOR_RMAP_NOROUTE=1;
 # camera-only checkpoint: the conditioning env is ignored. Only the lanelet route is accepted at evaluation.
-# add --lidar to feed the LiDAR raster (lidar_bev/) as the optional BEV input.
+# add --lidar to feed the LiDAR raster (lidar_bev/) as the optional BEV input, and
+# --radar --radar-root /data/kitscenes_radar to feed the radar raster (LiDAR channels are zero without --lidar).
 ```
 
 | Set | Definition |
@@ -91,7 +112,8 @@ python3 bevlane/kitscenes_eval.py full=out/kits_ft/ckpt_kits_full/last.pt \
 
 Ground truth is the raw 10 Hz future (`poses10.txt`) in the ego frame of keyframe a. The prediction is the selected
 candidate of the ego head (6 points at 0.5 s), linearly interpolated to 30 points at 0.1 s. ADE@1s / 2s / 3s = mean
-L2 error over the first 10 / 20 / 30 points; FDE@3s = error at 3 s. `--dump DIR` saves per-keyframe errors.
+L2 error over the first 10 / 20 / 30 points; FDE@3s = error at 3 s. The script also prints the 6-point ADE@3s
+(mean L2 error of the six 0.5 s waypoints on the same keyframes). `--dump DIR` saves per-keyframe errors.
 
 ## 6. Demo
 

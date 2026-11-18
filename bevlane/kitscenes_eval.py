@@ -17,6 +17,10 @@ Inputs follow the checkpoint: a plain checkpoint sees images + ego speed only; a
 
 usage: python bevlane/kitscenes_eval.py NAME=CKPT [NAME=CKPT ...] --val-list out/kitscenes/scenes_val.txt
            [--root out/bevlane] [--hr-root <hr720 root>] [--img-scale 1.5] [--set kf202|dense|both] [--dump DIR]
+           [--lidar] [--radar --radar-root <radar root>]
+Optional BEV inputs: --lidar feeds the LiDAR pillar raster (4 channels), --radar appends the radar raster (6 channels,
+  bevlane/radar_bev.py, read from --radar-root / METEOR_RADAR_ROOT; METEOR_RADAR_SENSORS selects the units). With --radar
+  but without --lidar the LiDAR channels are zero. A checkpoint trained without --radar ignores the radar channels.
 """
 import argparse
 import os
@@ -81,16 +85,25 @@ def main():
     ap.add_argument("--dump", default=os.environ.get("KITS_EVAL_DUMP", ""), help="save per-keyframe errors (30 points) to DIR/<name>__<set>.npz")
     ap.add_argument("--zero-ch", default="", help="ablation: zero these raster channels (e.g. 8,9 = no route / destination)")
     ap.add_argument("--lidar", action="store_true", help="also feed the LiDAR pillar raster (lidar_bev/) as the optional BEV input")
+    ap.add_argument("--radar", action="store_true", help="also feed the radar raster (6 channels after the LiDAR raster; LiDAR channels are zero without --lidar)")
+    ap.add_argument("--radar-root", default=os.environ.get("METEOR_RADAR_ROOT", ""),
+                    help="radar point root written by tools/kitscenes/kits_radar_to_bevlane.py (<root>/<scene>/<frame>.npz)")
     ap.add_argument("--device", default="cuda")
     a = ap.parse_args()
     sets = ["kf202", "dense"] if a.set == "both" else a.set.split(",")
     zero_ch = [int(c) for c in a.zero_ch.split(",") if c]
+    if a.radar:
+        if not a.radar_root:
+            sys.exit("kitscenes_eval: --radar needs --radar-root (or METEOR_RADAR_ROOT)")
+        os.environ["METEOR_RADAR_ROOT"] = a.radar_root           # the dataset appends the radar raster to the LiDAR raster
+    else:
+        os.environ.pop("METEOR_RADAR_ROOT", None)
 
     scenes = [l.strip() for l in open(a.val_list) if l.strip()]
     anchors = anchors_of(a.root, scenes)
     print({k: len(v) for k, v in anchors.items() if k in sets}, "(dense: even 10 Hz frames only)", flush=True)
     ds = BevLaneDataset(a.root, scenes, gt_key="gt", gt_optional=True, with_ego=True, with_boxdet=True, n_cams=M.N_CAM,
-                        hr_root=a.hr_root or None, img_scale=a.img_scale, with_lidarbev=a.lidar)
+                        hr_root=a.hr_root or None, img_scale=a.img_scale, with_lidarbev=a.lidar or a.radar)
     byk = {(s, f["frame"]): i for i, (s, f) in enumerate(ds.items)}
     poses = {s: load_poses(a.root, s) for s in scenes}
     K = getattr(M, "EGO_K", 3)
@@ -111,8 +124,11 @@ def main():
                     for ch in zero_ch:
                         net._rm_ras[:, ch] = 0
                 lid = None
-                if a.lidar:                                   # the raster is the only [4, 400, 250] item of the sample
-                    lid = next((t[None].to(a.device).float() for t in b if torch.is_tensor(t) and tuple(t.shape) == (4, 400, 250)), None)
+                if a.lidar or a.radar:                        # the raster is the only [4 (+ 6 radar), 400, 250] item of the sample
+                    lid = next((t[None].to(a.device).float() for t in b
+                                if torch.is_tensor(t) and tuple(t.shape) == (10 if a.radar else 4, 400, 250)), None)
+                    if lid is not None and not a.lidar:       # radar only: the LiDAR channels are zero
+                        lid[:, :4] = 0
                 with torch.no_grad(), torch.autocast("cuda", torch.bfloat16):
                     o = net.forward_geo(b[0][None].to(a.device), b[1][None].to(a.device), b[2][None].to(a.device),
                                         ego[12].view(1).to(a.device).float(), lidar=lid)

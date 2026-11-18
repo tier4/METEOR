@@ -160,6 +160,7 @@ every configuration; training uses modality dropout so no mode decays.
 | Input | What it is | Status |
 |---|---|---|
 | **LiDAR** | pillar raster (4 ch @ 0.4 m) added as a residual into the BEV; a zero raster is bit-equal to camera-only. On the adverse holdouts (night / rain / snow / reflections / cracked road) feeding the sweep lifts vehicle recall from ≈0.5 to ≈0.92, road IoU by +0.05–0.08 and lane IoU by +0.07–0.10 in every condition | **runs on the Orin** (`--with-lidar` export, `METEOR_LIDAR=1`, host-side presence flag; +0.5 ms) |
+| **Radar** | 6-channel BEV raster built from the radar detections (point count, RCS, radial velocity, occupancy, recency @ 0.4 m), added through a zero-initialised stem next to the LiDAR raster; a zero raster is identical to no radar; trained with radar dropout | trained and evaluated on nuScenes and KITScenes ([results](#accuracy-as-sensors-are-added-nuscenes--kitscenes)) |
 | **SD map** (free OpenStreetMap) | road / centreline / intersections / crossings rasterised into the ego frame; zero input bit-equal to no map | trained; small road-IoU gain beyond 20 m near intersections; not used at deployment |
 | **Traffic-light recognition** (external) | per-camera box-level lamp states painted into a raster | no measurable effect on seg / planning yet |
 | **Pseudo-LiDAR** (predicted) | the network predicts the LiDAR raster from cameras and feeds it back through the LiDAR stem | trained; not used at deployment |
@@ -259,7 +260,7 @@ not be comparable to public benchmarks. What the release does state:
   difference into an apparent 10 % regression);
 - latency and FPS on the target device are below.
 
-Public-benchmark numbers are reported on KITScenes, next.
+Public-benchmark numbers are reported on KITScenes and nuScenes, next.
 
 ## Results on KITScenes (public benchmark)
 
@@ -290,6 +291,50 @@ on KITScenes train only. The `camonly` recipe of `finetune.sh` has not been re-r
   oracle); the destination is the end of the sequence. Scenes listed in
   `tools/kitscenes/route_unmatched_scenes.txt` get no route (see [docs/KITSCENES.md](docs/KITSCENES.md)).
 - Box metrics on KITScenes will be added together with the evaluation tool.
+
+## Accuracy as sensors are added (nuScenes / KITScenes)
+
+How much each additional input buys, measured on two public datasets. **Vehicle AP** = BEV vehicle AP in the front
+sector 0–80 m × ±25 m; **path ADE** = mean L2 error of the six waypoints over 3 s (0.5 s steps). Every row is one
+dedicated training for that configuration (3 epochs from the METEOR2 base checkpoint, no sensor dropout). Radar
+enters as the optional radar raster (`bevlane/radar_bev.py`, `--radar 1`), LiDAR as the LiDAR raster.
+
+**nuScenes** (5 radars, one 32-beam LiDAR) — 150 validation scenes, 3,600 frames; means of 6 runs, the HD-map and
+route rows are single runs:
+
+| Configuration | Vehicle AP | Path ADE [m] |
+|---|---|---|
+| 6 cameras | 0.520 | 0.832 |
+| + 1 front radar | 0.686 | 0.829 |
+| + 5 radars | 0.688 | 0.819 |
+| + LiDAR | 0.805 | 0.822 |
+| + LiDAR + 5 radars | 0.815 | 0.816 |
+| + LiDAR + radars + HD map | 0.841 | 0.815 |
+| + all above + route | 0.842 | 0.752 |
+
+**KITScenes** (3 radars, 7 LiDAR units merged) — 117 validation scenes, 2,808 frames; the camera and radar rows are
+means of 5 runs, the rows from LiDAR on are single runs. The last column is the same models on the yardstick of the
+table above (202 keyframes, 30 points at 0.1 s, ADE@3s; the camera / radar rows there are one run each):
+
+| Configuration | Vehicle AP | Path ADE [m] (6 points) | ADE@3s [m] (202 keyframes, 30 points) |
+|---|---|---|---|
+| 7 cameras | 0.589 | 0.771 | 0.645 |
+| + 1 radar | 0.709 | 0.766 | 0.650 |
+| + 3 radars | 0.707 | 0.768 | 0.640 |
+| + LiDAR | 0.863 | 0.746 | 0.633 |
+| + LiDAR + 3 radars | 0.864 | 0.753 | 0.632 |
+| + LiDAR + radars + HD map | 0.866 | 0.752 | 0.647 |
+| + all above + route | 0.863 | 0.694 | 0.574 |
+
+- One radar already lifts vehicle AP substantially, and LiDAR brings it above 0.8. With LiDAR on board, radar adds
+  0.01 or less.
+- The path error hardly changes with the sensors or with an HD map; it drops with a route input.
+- The route is built from the logged drive and therefore contains future information.
+- The two datasets are not meant to be compared with each other.
+- Both datasets are non-commercial (nuScenes: CC BY-NC-SA 4.0; KITScenes: CC BY-NC).
+- Tooling: the KITScenes radar conversion is in `tools/kitscenes/` ([docs/KITSCENES.md](docs/KITSCENES.md) §2a) and
+  `bevlane/kitscenes_eval.py --radar` gives the trajectory columns; the nuScenes conversion tooling and the vehicle-AP
+  evaluation tool are not yet in the repository.
 - KITScenes is CC BY-NC: these fine-tuned weights are research-only and are not released.
 
 ## Edge deployment: Jetson AGX Orin
@@ -439,7 +484,7 @@ bevlane/                 training, GT generation, evaluation
   model.py               model zoo (v52 = DepthSegIPMNetV52: 12 tasks, refiner, optional inputs)
   train.py               DDP trainer: levers --sparse-24/--sparse-ramp-steps/--sparse-exclude,
                          --ema-exclude, --dense-teacher, --depth-slim(-force), --hist-lr-mult, --val-hs
-  dataset.py             multi-task dataset (t4dataset + Cosmos, LiDAR raster, SD map, history)
+  dataset.py             multi-task dataset (t4dataset + Cosmos, LiDAR raster, radar raster, SD map, history)
   extract_*.py, make_consensus_gt.py, render_vector_gt.py   the autolabel factory stages
   probe_net.py           the ONLY correct way to build a model for probes (strict-checked)
   closed_loop_eval.py    closed-loop chain evaluation (the judge's primary metric)
@@ -454,7 +499,8 @@ bevlane/                 training, GT generation, evaluation
   train_f3.py            F3 trajectory refinement head (bounded residual on the selected hypothesis; --npu 1 for the accelerator graph)
   f3_refine.py           F3 head at inference (METEOR_F3_HEAD: closed_loop_eval, demo); dump_f3_cache.py builds its training cache
   route_corridor.py      lane-level route corridor from a Lanelet2 HD map (optional route / map inputs, KITScenes)
-  kitscenes_eval.py      KITScenes trajectory metrics: ADE@1/2/3s, FDE@3s on the 202 val keyframes
+  kitscenes_eval.py      KITScenes trajectory metrics: ADE@1/2/3s, FDE@3s on the 202 val keyframes (--lidar / --radar inputs)
+  radar_bev.py           radar detections -> 6-channel BEV raster (optional radar input, METEOR_RADAR_ROOT)
 deploy/                  export + TensorRT runtimes
   export_onnx.py         --no-hist / --depth-mean / --with-lidar / --uint8-in / --argmax-out
   runtime.py             Python TensorRT runtime (CUDA Graph, pinned zero-copy inputs, LiDAR)
@@ -466,7 +512,8 @@ deploy/                  export + TensorRT runtimes
   build_engine_fp16.py   plugin-free fp16 engine for any NVIDIA GPU (the workstation reproduction path)
   export_mite_ckpt.py    METEOR2 checkpoint -> ONNX (--npu npu: strict accelerator graph; parity-checked against PyTorch)
   npu_lint.py            operator / shape lint of an ONNX graph against accelerator-style constraints
-tools/kitscenes/         KITScenes: download, conversion to the bevlane layout, auto-label box GT, fine-tune launcher
+tools/kitscenes/         KITScenes: download, conversion to the bevlane layout, auto-label box GT, fine-tune launcher,
+                         radar points (kits_radar_extract.py, kits_radar_to_bevlane.py)
 hf/                      Hugging Face release: model / dataset cards, publish_to_hf.py, onnx_smoke_test.py
 docs/                    architecture / data pipeline / training / demo / quickstart / reproduce / KITScenes
 comlops-*.csv            2D taxonomies (21-class semantic, 10-class instance)
@@ -509,7 +556,7 @@ If you use METEOR in your work, please cite it (see [CITATION.cff](CITATION.cff)
 | [DATA_PIPELINE.md](docs/DATA_PIPELINE.md) | the autolabel factory, taxonomies, quality gates |
 | [TRAINING.md](docs/TRAINING.md) | losses, curricula, rolling rounds, operational notes |
 | [DEMO.md](docs/DEMO.md) | demo tooling and video layouts |
-| [KITSCENES.md](docs/KITSCENES.md) | METEOR2 on KITScenes: conversion, fine-tune variants, evaluation protocol |
+| [KITSCENES.md](docs/KITSCENES.md) | METEOR2 on KITScenes: conversion, radar points, fine-tune variants, evaluation protocol |
 
 ### Silent failures we learned to test for
 
@@ -529,7 +576,7 @@ against final epochs. The detection rules live in [docs/TRAINING.md](docs/TRAINI
 - Ship the LiDAR-capable export as the single engine, with LiDAR as a runtime switch (the host-side presence flag is in place).
 - A history-aware line trained from scratch (the temporal memory is unused today; a history-aware engine costs about +22 ms on the Orin) — one run is in progress.
 - Release the METEOR2 and METEOR2 Nano weights (code is already here).
-- Extend the public-benchmark evaluation beyond KITScenes (and to the METEOR line itself), so accuracy can be reported in comparable terms.
+- Public-benchmark evaluation: METEOR2 is now reported on KITScenes and nuScenes; still open are the METEOR line itself and releasing the nuScenes conversion and vehicle-AP evaluation tools, so accuracy can be reported in comparable terms.
 - An Autoware (ROS 2) node around the released ONNX; today METEOR ships with its own Python and C++ runtimes.
 - VLA support: a vision-language-action layer on top of METEOR's BEV features for long-tail understanding, instruction following and explanations, with METEOR's driving-command input as the interface.
 

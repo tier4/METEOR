@@ -390,6 +390,9 @@ def main():
     ap.add_argument("--limit-train", type=int, default=60000)
     ap.add_argument("--val-batches", type=int, default=200)
     ap.add_argument("--lidar-drop", type=float, default=0.3)
+    ap.add_argument("--radar", type=int, default=0, help="1: fuse the radar raster (METEOR_RADAR_ROOT, 6 channels) appended to the LiDAR input")
+    ap.add_argument("--radar-drop", type=float, default=0.2, help="with --radar 1: per-sample probability of dropping the radar raster (keeps the net usable without radar)")
+    ap.add_argument("--lidar-off", type=int, default=0, help="1: always zero the 4 LiDAR channels (camera + radar training)")
     ap.add_argument("--cam-drop", type=float, default=0.25)
     ap.add_argument("--yaw-fix-deg", type=float, default=0.7)
     ap.add_argument("--grad-clip", type=float, default=100.0)
@@ -491,6 +494,7 @@ def main():
     if args.feat_stride:                     # image-side heads and lift columns at 1/4 (FS=4)
         M.FS = args.feat_stride
     M.HEAD_V2 = int(args.head_v2)
+    M.RADAR_C = 6 if args.radar else 0
     M.EGO_GAP = int(getattr(args, "ego_gap", 0) or 0)   # ego/tl input via GAP (single-graph NPU export)
     if args.lr_blk_m > 0:
         args.lr_blk = int(round(args.lr_blk_m / (0.2 if args.bev2 else 0.4)))   # fixed physical size (ckpt args keep the resolved lr_blk)
@@ -693,7 +697,15 @@ def main():
             if args.lidar_drop > 0:
                 keep = (torch.rand(lidar.shape[0], 1, 1, 1, device=dev)
                         >= args.lidar_drop).float()
-                lidar = lidar * keep
+                if lidar.shape[1] > 4:                  # with radar: LiDAR and radar are dropped independently
+                    lidar = torch.cat([lidar[:, :4] * keep, lidar[:, 4:]], 1)
+                else:
+                    lidar = lidar * keep
+            if args.lidar_off and lidar.shape[1] >= 4:
+                lidar = torch.cat([torch.zeros_like(lidar[:, :4]), lidar[:, 4:]], 1)
+            if args.radar and lidar.shape[1] > 4 and args.radar_drop > 0:
+                rk = (torch.rand(lidar.shape[0], 1, 1, 1, device=dev) >= args.radar_drop).float()
+                lidar = torch.cat([lidar[:, :4], lidar[:, 4:] * rk], 1)
             if args.route_map:
                 _set_route_map(net, batch, dev)
             with torch.autocast("cuda", torch.bfloat16):
