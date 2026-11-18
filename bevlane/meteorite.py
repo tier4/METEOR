@@ -77,7 +77,8 @@ PAINT_CLS = ()
 #   2D   : a shared ResBlock(nc) before seg2d/hm2d/reg2d/ctx/depth (identity init)
 #   det  : use together with the existing DET_HEAD tower (--det-head 96)
 HEAD_V2 = 0
-EGO_GAP = 0        # single-graph NPU export: ego/tl input is GlobalAveragePool (BC1) instead of a fixed 5x4 pool + Flatten (2560), so Gemm/Flatten become 1x1 Convs
+RADAR_C = 0        # radar fusion: if > 0, the lidar input carries RADAR_C radar raster channels (bevlane/radar_bev.py) after its 4 LiDAR channels
+EGO_GAP = 0       # single-graph NPU export: ego/tl input is GlobalAveragePool (BC1) instead of a fixed 5x4 pool + Flatten (2560), so Gemm/Flatten become 1x1 Convs
 # "Simple is better for any NPU": no geometric table lookup (Gather); view transform and ground projection are learned
 # low-rank block maps (LIFT_LR=1). Operators: constant MatMul / Add / Concat / Reshape only. Only the camera assignment
 # is derived from the reference rig geometry.
@@ -844,6 +845,12 @@ class METEORite(nn.Module):
         # One bias-free conv -> Add after the view transform: zeros in = zeros out, so the host feeds a zero
         # raster when there is no LiDAR and the path is exactly off (no flag scalar in the graph; accelerator-safe).
         self.lidar_stem = nn.Conv2d(4, C_P, 3, 1, 1, bias=False)
+        # optional radar input: RADAR_C raster channels appended to the LiDAR raster. Bias-free and zero-initialised,
+        # so a fresh stem leaves the function unchanged and a zero raster is identical to no radar.
+        self.radar_stem = None
+        if RADAR_C:
+            self.radar_stem = nn.Conv2d(RADAR_C, C_P, 3, 1, 1, bias=False)
+            nn.init.zeros_(self.radar_stem.weight)
         self.cam_w = CAMW
         self.paint_cls = tuple(PAINT_CLS)
         if self.paint_cls:
@@ -997,6 +1004,13 @@ class METEORite(nn.Module):
         """nn.Linear as MatMul + Add (no Gemm in the graph)."""
         return torch.matmul(x, layer.weight.t()) + layer.bias
 
+    def _sensor_stem(self, lidar):
+        """Raster with 4 LiDAR channels (+ RADAR_C radar channels) -> term added to the BEV features.
+        Both stems are bias-free, so a zero input contributes nothing."""
+        if self.radar_stem is not None and lidar.shape[1] > 4:
+            return self.lidar_stem(lidar[:, :4]) + self.radar_stem(lidar[:, 4:4 + RADAR_C])
+        return self.lidar_stem(lidar[:, :4])
+
     def _heads(self, bev, lidar=None):
         """Everything after the view transform (shared between export forward and forward_geo)."""
         r_ = getattr(self, "_rm_ras", None) if getattr(self, "route_map", False) else None
@@ -1004,13 +1018,13 @@ class METEORite(nn.Module):
             bev = bev + F.interpolate(self.rm_ras_stem(r_.to(bev.dtype)), size=bev.shape[-2:], mode="bilinear", align_corners=False)
         if self.bev2:
             if lidar is not None:                                # LiDAR raster stays at 0.4 m -> x2 after the stem
-                bev = bev + self._up2(self.lidar_stem(lidar))
+                bev = bev + self._up2(self._sensor_stem(lidar))
             l0 = self.e0(bev); l1 = self.e1(l0); l2 = self.e2(l1)
             m4 = self.f4(l1 + self._up2(self.lat21(l2)))
             m2 = self.f2(l0 + self._up2(self.lat42(m4)))
             return (m2, m4), self.ego_stem(l2).flatten(1)
         if lidar is not None:
-            bev = bev + self.lidar_stem(lidar)
+            bev = bev + self._sensor_stem(lidar)
         l0 = self.b0(bev)
         l1 = self.b1(l0)
         m = self.fuse(l0 + self._up2(self.up_lat(l1)))
@@ -1471,7 +1485,7 @@ def export(net, path, opset=17, with_lidar=False):
     else:
         imgs = torch.zeros(1, N_CAM, 3, *(IN_HW or (IMG_H, IMG_W)), dtype=torch.float32 if net.float_input else torch.uint8)
         v0 = torch.zeros(1)
-    args = (imgs, v0) + ((torch.zeros(1, 4, *DET_HW),) if with_lidar else ())
+    args = (imgs, v0) + ((torch.zeros(1, 4 + RADAR_C, *DET_HW),) if with_lidar else ())   # 4 LiDAR + RADAR_C radar channels
     names = ["imgs", "v0"] + (["lidar_bev"] if with_lidar else [])
     f3 = getattr(net, "f3_npu", None)
     if f3 is not None and getattr(f3, "extra", 0):                              # F3 acc variant: third input "acc" [1,1] (causal acceleration m/s^2) / acc,brk variant "accbrk" [1,2] (acc, brk 0/1)
@@ -1570,7 +1584,9 @@ def load_mite_eval(path, device="cuda", verbose=True):
     global GLR_HALF, LR_ROWS_ONLY
     LR_ROWS_ONLY = int(a.get("lr_rows_only", 0) or 0); GLR_HALF = int(a.get("glr_half", 0) or 0)
     HEAD_V2 = int(a.get("head_v2", 0) or 0)
-    EGO_GAP = int(a.get("ego_gap", 0) or 0)                   # GAP ego/tl for single-graph NPU export
+    global RADAR_C
+    RADAR_C = 6 if int(a.get("radar", 0) or 0) else 0         # radar fusion ckpt
+    EGO_GAP = int(a.get("ego_gap", 0) or 0)                  # GAP ego/tl for single-graph NPU export
     DET_HEAD = int(a.get("det_head", 0) or 0)
     CAMW = int(a.get("cam_w", 0) or 0)
     PAINT_CLS = tuple(int(c) for c in str(a.get("paint_seg", "") or "").split(",") if c.strip())
